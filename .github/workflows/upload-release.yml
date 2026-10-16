@@ -1,0 +1,85 @@
+name: Upload verified Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful Windows desktop build run ID from main
+        required: true
+        type: string
+      source_commit:
+        description: Exact source commit verified by that build
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify exact successful native build and unpublished release
+        shell: bash
+        run: |
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID" > build-run.json
+          jq -e --arg repo "$GH_REPO" --arg sha "$SOURCE_COMMIT" '
+            .conclusion == "success" and .head_sha == $sha and
+            .head_repository.full_name == $repo and .head_branch == "main" and
+            .event == "push" and .path == ".github/workflows/windows-build.yml"
+          ' build-run.json
+          gh release view v0.1.0 --json isDraft --jq '.isDraft' | grep -qx true
+      - uses: actions/download-artifact@v4
+        with:
+          name: QuickPrint-Windows-x64
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: release
+      - name: Verify packages and Windows reports
+        working-directory: release
+        shell: bash
+        run: |
+          sha256sum -c SHA256SUMS.txt
+          for report in windows-smoke-test.json windows-portable-smoke-test.json; do
+            jq -e '.ok and .packaged and .platform == "win32" and .arch == "x64" and .credentialRoundTrip == "passed" and .uiReady and .apiReady and .renderer.nodeDisabled' "$report"
+          done
+          jq -e '.builderPlatform == "win32" and .version == "0.1.0"' release-manifest.json
+      - name: Pin the PC setup prompt to the uploaded installer
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const installer = fs.readFileSync('release/QuickPrint-Setup-0.1.0-x64.exe');
+          const hash = crypto.createHash('sha256').update(installer).digest('hex');
+          const original = fs.readFileSync('SETUP-PC.md', 'utf8');
+          const pattern = /Expected installer SHA-256: `[a-f0-9]{64}`/;
+          if (!pattern.test(original)) throw new Error('The setup prompt does not contain a pinned installer hash.');
+          fs.writeFileSync('release/SETUP-PC.md', original.replace(pattern, 'Expected installer SHA-256: `' + hash + '`'));
+          const build = JSON.parse(fs.readFileSync('build-run.json', 'utf8'));
+          fs.writeFileSync('release/windows-build-provenance.json', JSON.stringify({
+            sourceCommit: build.head_sha, buildRunId: build.id, buildRunUrl: build.html_url,
+            conclusion: build.conclusion, installerSha256: hash, codeSigned: false
+          }, null, 2) + '\n');
+          NODE
+      - name: Upload assets to the existing draft release
+        shell: bash
+        run: |
+          gh release upload v0.1.0 \
+            release/QuickPrint-Setup-0.1.0-x64.exe \
+            release/QuickPrint-Portable-0.1.0-x64.exe \
+            release/QuickPrint-Setup-0.1.0-x64.exe.blockmap \
+            release/SHA256SUMS.txt release/release-manifest.json \
+            release/windows-smoke-test.json release/windows-portable-smoke-test.json \
+            release/windows-build-provenance.json release/SETUP-PC.md --clobber
+          gh release view v0.1.0 --json assets --jq '.assets[] | [.name, .size] | @tsv' >> "$GITHUB_STEP_SUMMARY"

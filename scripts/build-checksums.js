@@ -17,7 +17,9 @@ function filesUnder(directory) {
 const sources = filesUnder(path.join(project, 'src')).filter((file) => !file.endsWith('.test.js'));
 sources.push(path.join(project, 'assets/quickprint.png'));
 for (const file of sources) {
-  const relative = path.relative(project, file).split(path.sep).join('/');
+  // @electron/asar resolves archive components using the host path separator.
+  // Preserve backslashes on Windows instead of converting them to URL paths.
+  const relative = path.relative(project, file);
   if (!fs.readFileSync(file).equals(asar.extractFile(archivePath, relative))) {
     throw new Error(`Source changed during packaging: ${relative}. Run the build again after edits finish.`);
   }
