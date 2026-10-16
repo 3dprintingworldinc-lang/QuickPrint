@@ -24,5 +24,14 @@ child.on('error', (error) => { console.error(error.message); process.exitCode = 
 child.on('exit', (code) => {
   if (code !== 0) { process.exitCode = code || 1; return; }
   if (process.argv.includes('--dir')) return;
-  require('./build-checksums');
+  try {
+    require('./build-checksums');
+  } catch (error) {
+    console.error(error.stack || error.message);
+    if (process.env.GITHUB_ACTIONS === 'true') {
+      const message = String(error.message).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+      console.error(`::error title=Package verification failed::${message}`);
+    }
+    process.exitCode = 1;
+  }
 });
