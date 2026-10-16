@@ -1,0 +1,93 @@
+{
+  "name": "quickprint",
+  "version": "0.1.0",
+  "description": "Local Windows print-fleet workspace with modular intake and LAN printer adapters",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "3D Printing World",
+  "main": "src/desktop/main.js",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "electron .",
+    "serve": "node src/server.js",
+    "test": "node --test tests/*.test.js",
+    "test:ui": "playwright test",
+    "build:win": "node scripts/build-windows.js",
+    "build:checksums": "node scripts/build-checksums.js",
+    "smoke:desktop": "electron . --smoke-test"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "basic-ftp": "^5.0.5",
+    "express": "^5.1.0",
+    "imapflow": "^1.0.195",
+    "mailparser": "^3.7.4",
+    "mqtt": "^5.14.1",
+    "multer": "^2.0.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "electron": "44.7.2",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.3dprintingworld.quickprint",
+    "productName": "QuickPrint",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "dist",
+      "buildResources": "assets"
+    },
+    "files": [
+      "src/**/*",
+      "assets/quickprint.png",
+      "package.json",
+      "!**/*.test.js"
+    ],
+    "extraResources": [
+      {
+        "from": "docs",
+        "to": "documentation",
+        "filter": [
+          "**/*.md"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "assets/quickprint.ico",
+      "requestedExecutionLevel": "asInvoker",
+      "artifactName": "QuickPrint-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "QuickPrint",
+      "artifactName": "QuickPrint-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "QuickPrint-Portable-${version}-${arch}.${ext}"
+    }
+  }
+}

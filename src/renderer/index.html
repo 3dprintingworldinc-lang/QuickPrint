@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="quickprint-token" content="__QUICKPRINT_TOKEN__">
+    <meta name="color-scheme" content="light">
+    <title>QuickPrint · Your print floor, connected</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to workspace</a>
+    <div id="app" class="app-shell">
+      <aside class="sidebar" aria-label="Main navigation">
+        <a href="#overview" class="brand" aria-label="QuickPrint overview">
+          <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 36 40" fill="none"><path d="m18 3 14 8v17l-14 8-14-8V11L18 3Z" stroke="currentColor" stroke-width="2.5"/><path d="m4 11 14 8 14-8M18 19v17M11 7l14 8v8l-7 4" stroke="currentColor" stroke-width="2.5"/><path d="m23 30 9 5" stroke="currentColor" stroke-width="3.5" stroke-linecap="round"/></svg></span>
+          <span>Quick<span class="brand-light">Print</span><small>THE CONNECTED PRINT FLOOR</small></span>
+        </a>
+        <div class="workspace-label">WORKSPACE</div>
+        <nav id="navigation"></nav>
+        <div class="sidebar-bottom">
+          <div class="local-card"><span class="local-orbit"><span></span></span><div><strong>Local by design</strong><p>Your files. Your network.</p></div></div>
+          <div class="sidebar-footer"><span class="avatar">QP</span><div><strong id="sidebar-site">My print workspace</strong><small id="app-version">Desktop workspace</small></div><span class="status-dot green" aria-hidden="true"></span></div>
+        </div>
+      </aside>
+      <div class="workspace">
+        <header class="topbar">
+          <div class="breadcrumb"><span class="breadcrumb-icon" id="breadcrumb-icon"></span><span id="breadcrumb-title">Overview</span><span class="breadcrumb-slash">/</span><span class="breadcrumb-subtitle">Workspace</span></div>
+          <div class="topbar-actions"><span id="connection-status" class="connection-status"><span class="status-dot"></span>Connecting</span><button class="icon-button" data-action="refresh" title="Refresh workspace" aria-label="Refresh workspace"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.6-1L20 9M4 15l2.3 3A7 7 0 0 0 18 17"/></svg></button><span class="topbar-divider"></span><button class="button primary compact" data-action="upload"><span aria-hidden="true">＋</span> New job</button></div>
+        </header>
+        <div id="connection-error" class="connection-error" role="alert" hidden></div>
+        <main id="main" tabindex="-1"><div class="loading-state"><span class="spinner"></span><p>Opening your workspace…</p></div></main>
+        <footer class="workspace-footer"><span><span class="status-dot teal"></span>Built for the way you make.</span><span>QuickPrint <span id="footer-version"></span> <span class="footer-separator">·</span> Local workspace</span></footer>
+      </div>
+    </div>
+    <div id="modal-root"></div>
+    <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+  </body>
+</html>
