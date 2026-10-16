@@ -45,7 +45,8 @@
   let page = 'overview';
   let jobFilter = 'all';
   let jobSearch = '';
-  let isRefreshing = false;
+  let refreshQueue = Promise.resolve();
+  let pendingRefreshes = 0;
   let connected = false;
   let modalBusy = false;
   let lastFocus = null;
@@ -102,9 +103,20 @@
     return response.json();
   }
 
-  async function refresh({ silent = false } = {}) {
-    if (isRefreshing) return;
-    isRefreshing = true;
+  function refresh({ silent = false } = {}) {
+    // Background polling can share a pending refresh. An explicit refresh
+    // after a mutation must always fetch again: an in-flight response may
+    // have captured state before that mutation, even if it arrives later.
+    if (silent && pendingRefreshes > 0) return refreshQueue;
+    pendingRefreshes += 1;
+    refreshQueue = refreshQueue.catch(() => {}).then(async () => {
+      try { await fetchState({ silent }); }
+      finally { pendingRefreshes -= 1; }
+    });
+    return refreshQueue;
+  }
+
+  async function fetchState({ silent }) {
     try {
       state = await api('/api/state');
       state.jobs ||= []; state.printers ||= []; state.connectors ||= []; state.events ||= []; state.settings ||= {};
@@ -123,7 +135,7 @@
       $('#connection-error').textContent = `Unable to reach your local workspace. ${error.message}. Check that QuickPrint is running, then refresh.`;
       if (!state) $('#main').innerHTML = empty('network', 'Workspace unavailable', 'QuickPrint could not load its local service. Refresh to try the connection again.', '<button class="button primary" data-action="refresh">Try again</button>');
       if (!silent && state) toast(error.message, true);
-    } finally { isRefreshing = false; }
+    }
   }
 
   function renderNavigation() {

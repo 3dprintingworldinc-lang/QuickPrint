@@ -96,6 +96,46 @@ test('real file upload creates a review job, downloads its original, and can be 
   expect(errors).toEqual([]);
 });
 
+test('a mutation refresh waits for a fresh snapshot when an older response is in flight', async ({ page, workspace }) => {
+  // Hold a genuine server snapshot taken before submission. Other endpoints
+  // remain real. Releasing this old snapshot must not hide the new job.
+  let releaseSnapshot;
+  const snapshotGate = new Promise(resolve => { releaseSnapshot = resolve; });
+  let snapshotCaptured;
+  const captured = new Promise(resolve => { snapshotCaptured = resolve; });
+  let holdNextSnapshot = true;
+  let snapshotsRequested = 0;
+  await page.route('**/api/state', async route => {
+    snapshotsRequested += 1;
+    const response = await route.fetch();
+    if (holdNextSnapshot) {
+      holdNextSnapshot = false;
+      snapshotCaptured();
+      await snapshotGate;
+    }
+    await route.fulfill({ response });
+  });
+
+  try {
+    await page.locator('.topbar [data-action="refresh"]').click();
+    await captured;
+    await page.getByRole('button', { name: 'New job', exact: true }).click();
+    await page.locator('#upload-files').setInputFiles({
+      name: 'overlap.gcode', mimeType: 'text/plain', buffer: Buffer.from('G28\nG1 X1 Y1\n'),
+    });
+    await page.getByLabel('Job / order name').fill('Visible after overlapping refresh');
+    const uploadResponse = page.waitForResponse(response => response.url().endsWith('/api/jobs') && response.request().method() === 'POST');
+    await page.getByRole('button', { name: 'Add to queue', exact: true }).click();
+    expect((await uploadResponse).status()).toBe(201);
+    expect(workspace.service.snapshot().jobs).toHaveLength(1);
+    releaseSnapshot();
+    await expect(page.getByRole('button', { name: 'Visible after overlapping refresh', exact: true })).toBeVisible();
+    expect(snapshotsRequested).toBeGreaterThanOrEqual(2);
+  } finally {
+    releaseSnapshot();
+  }
+});
+
 test('prepared job requires explicit starts and operator acceptance for every requested copy', async ({ page, workspace }) => {
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
