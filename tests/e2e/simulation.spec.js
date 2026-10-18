@@ -45,7 +45,12 @@ const test = base.extend({
   },
 });
 
-test.use({ launchOptions: { executablePath, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] } });
+test.use({
+  // Windows hosted runners render in software. Honor the application's existing
+  // reduced-motion mode while still exercising the complete WebGL scene.
+  reducedMotion: 'reduce',
+  launchOptions: { executablePath, args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] },
+});
 test.setTimeout(60000);
 
 async function enter(page, workspace) {
@@ -98,11 +103,20 @@ test('real 3D rendering, orbit, selection and layout edits survive leaving and r
   await expect(scene).toHaveAttribute('data-webgl', 'available');
   await expect.poll(() => page.evaluate(() => window.__testScenes.at(-1).getDiagnostics().frames)).toBeGreaterThan(1);
   const diagnostics = await page.evaluate(() => window.__testScenes.at(-1).getDiagnostics());
-  expect(diagnostics).toMatchObject({ available: true, printers: 4, clearers: 0, view: 'perspective' });
+  expect(diagnostics).toMatchObject({ available: true, printers: 4, clearers: 0, view: 'perspective', reducedMotion: true });
   expect(diagnostics.drawCalls).toBeGreaterThan(50);
   expect(diagnostics.triangles).toBeGreaterThan(1000);
   const screenshot = await page.screenshot({ path: path.join(os.tmpdir(), 'quickprint-simulator-desktop.png'), fullPage: true });
   expect(screenshot.length).toBeGreaterThan(20000);
+  const idleFrames = await page.evaluate(async () => {
+    const scene = window.__testScenes.at(-1);
+    const before = scene.getDiagnostics().frames;
+    await new Promise(resolve => setTimeout(resolve, 700));
+    return scene.getDiagnostics().frames - before;
+  });
+  // A paused farm must leave time for ordinary form controls on software GPUs.
+  // Allow a late resize, but reject the old continuous render loop.
+  expect(idleFrames).toBeLessThanOrEqual(2);
 
   const beforeOrbit = await canvas.screenshot();
   const bounds = await canvas.boundingBox();

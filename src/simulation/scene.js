@@ -43,6 +43,16 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   } catch (error) {
     return noScene(container, onError, `WebGL could not start: ${error.message}`);
   }
+  // A software GPU is a valid WebGL renderer, but continuously submitting
+  // high-resolution shadow passes can starve the rest of a desktop app.
+  let softwareRenderer = false;
+  try {
+    const context = renderer.getContext();
+    const debug = context.getExtension('WEBGL_debug_renderer_info');
+    const description = debug ? context.getParameter(debug.UNMASKED_RENDERER_WEBGL) : context.getParameter(context.RENDERER);
+    softwareRenderer = /swiftshader|llvmpipe|softpipe|software|microsoft basic render/i.test(String(description));
+  } catch { /* Restricted graphics information keeps the standard profile. */ }
+  const targetFps = softwareRenderer ? 10 : 24;
 
   let disposed = false;
   let contextLost = false;
@@ -61,6 +71,11 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   let lastDraw = 0;
   let lastAnimationTick = 0;
   let animationSeconds = 0;
+  let needsRender = true;
+  let needsShadowRender = true;
+  let applyingSnapshot = false;
+  let snapshotKey = '';
+  let lastShadowDraw = 0;
   const motionPreference = window.matchMedia?.('(prefers-reduced-motion: reduce)');
   let reducedMotion = Boolean(motionPreference?.matches);
   const materialPool = new Set();
@@ -81,12 +96,13 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   scene.fog = new THREE.Fog(0x132730, 30, 100);
   const camera = new THREE.PerspectiveCamera(42, 1, 0.1, 180);
   const cameraTarget = new THREE.Vector3();
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.75));
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, softwareRenderer ? 1 : 1.5));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.3;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false;
   const canvas = renderer.domElement;
   canvas.className = 'sim-three-canvas';
   canvas.tabIndex = 0;
@@ -117,12 +133,14 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   controls.screenSpacePanning = false;
   controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
   controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+  function onControlsChange() { needsRender = true; }
+  controls.addEventListener('change', onControlsChange);
 
   scene.add(new THREE.HemisphereLight(0xd8edf4, 0x344445, 2.7));
   const keyLight = new THREE.DirectionalLight(0xfff2d9, 3.1);
   keyLight.position.set(4, 15, 8);
   keyLight.castShadow = true;
-  keyLight.shadow.mapSize.set(1536, 1536);
+  keyLight.shadow.mapSize.set(softwareRenderer ? 512 : 1536, softwareRenderer ? 512 : 1536);
   keyLight.shadow.camera.near = 0.5;
   keyLight.shadow.camera.far = 70;
   keyLight.shadow.bias = -0.0007;
@@ -415,6 +433,13 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
       selectedId = options.selectedPrinterId || options.selectedClearerId || null;
       selectedKind = options.selectedPrinterId ? 'printer' : 'clearer';
     }
+    // The UI polls paused workspaces too. Identical snapshots must not create
+    // graphics work just because a network response arrived.
+    const nextSnapshotKey = JSON.stringify([next?.scenario, next?.printers, next?.clearers, next?.timeMinutes, next?.running, selectedId, selectedKind, editing]);
+    if (nextSnapshotKey === snapshotKey) return;
+    snapshotKey = nextSnapshotKey;
+    applyingSnapshot = true;
+    needsShadowRender = true;
     const scenario = next?.scenario || {};
     roomWidth = Math.max(3, number(scenario.room?.width, 16));
     roomDepth = Math.max(3, number(scenario.room?.depth, 12));
@@ -470,6 +495,7 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
     if (!hadObjects && printers.size + clearers.size > 0) resetCamera();
     canvas.setAttribute('aria-label', `Interactive 3D farm with ${printers.size} printers and ${clearers.size} clearing robots. ${editing ? 'Layout editing enabled; select an object and use arrow keys to move by half a meter.' : 'Drag to orbit, scroll to zoom, or use the accessible fleet list.'}`);
     container.dataset.sceneReady = 'true';
+    applyingSnapshot = false;
     draw(performance.now(), true);
   }
 
@@ -578,25 +604,41 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   }
 
   function draw(now, force = false) {
+    if (force) needsRender = true;
     if (disposed || contextLost || !container.isConnected || !container.clientWidth || !container.clientHeight) return;
-    // 30 fps is enough for a supervisory scene and keeps software-rendered
-    // environments usable. The engine clock is independent of drawing.
-    if (!force && now - lastDraw < (reducedMotion ? 100 : 32)) return;
+    if (applyingSnapshot || !needsRender) return;
+    if (!force && now - lastDraw < (reducedMotion ? 100 : 1000 / targetFps)) return;
     lastDraw = now;
     controls.update();
     controls.target.x = clamp(controls.target.x, -roomWidth * 0.2, roomWidth * 1.2);
     controls.target.z = clamp(controls.target.z, -roomDepth * 0.2, roomDepth * 1.2);
     controls.target.y = clamp(controls.target.y, 0, 2.5);
     updateAnimations(now);
+    renderer.shadowMap.needsUpdate = needsShadowRender;
+    if (needsShadowRender) lastShadowDraw = now;
     renderer.render(scene, camera);
     updateLabels();
     frame++;
+    needsRender = false;
+    needsShadowRender = false;
   }
 
   function animate(now) {
     if (disposed) return;
     animationId = requestAnimationFrame(animate);
-    if (document.visibilityState !== 'hidden') draw(now);
+    if (document.visibilityState === 'hidden' || contextLost) return;
+    // OrbitControls emits change while damping settles, including when the
+    // simulation is paused. Once settled, a paused view submits no GPU frames.
+    controls.update();
+    const animated = !reducedMotion && snapshot?.running !== false && !editing
+      && [...printers.values()].some(value => ['printing', 'clearing'].includes(value.state?.state));
+    if (animated) {
+      needsRender = true;
+      // Shadow maps are independent of the camera and can be reused during
+      // orbiting. Animate moving-object shadows at no more than ten fps.
+      if (now - lastShadowDraw >= 100) needsShadowRender = true;
+    }
+    draw(now);
   }
 
   function resize() {
@@ -656,6 +698,7 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
   }
 
   function setEditable(value) {
+    if (editing !== Boolean(value)) needsRender = true;
     editing = Boolean(value);
     if (!editing && drag) cancelDrag();
     canvas.style.cursor = editing ? 'grab' : 'default';
@@ -709,12 +752,15 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
     const x = clamp(Math.round((scratch.x + drag.offset.x) * 2) / 2, edge, Math.floor((roomWidth - edge) * 2) / 2);
     const z = clamp(Math.round((scratch.z + drag.offset.z) * 2) / 2, edge, Math.floor((roomDepth - edge) * 2) / 2);
     drag.value.group.position.set(x, 0, z);
+    needsShadowRender = true;
     draw(performance.now(), true);
   }
 
   function cancelDrag() {
     if (!drag) return;
     drag.value.group.position.copy(drag.original);
+    needsShadowRender = true;
+    needsRender = true;
     if (canvas.hasPointerCapture?.(drag.pointerId)) canvas.releasePointerCapture(drag.pointerId);
     drag = null;
     controls.enabled = true;
@@ -755,6 +801,7 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
     const x = clamp(Math.round((value.group.position.x + (event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0)) * 2) / 2, edge, Math.floor((roomWidth - edge) * 2) / 2);
     const z = clamp(Math.round((value.group.position.z + (event.key === 'ArrowUp' ? -step : event.key === 'ArrowDown' ? step : 0)) * 2) / 2, edge, Math.floor((roomDepth - edge) * 2) / 2);
     value.group.position.set(x, 0, z);
+    needsShadowRender = true;
     onMove?.(value.id, { x, z }, value.kind);
     draw(performance.now(), true);
   }
@@ -763,8 +810,8 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
     container.dataset.webgl = 'lost';
     onError?.('The 3D graphics context was lost. Farm controls and the simulation are still available.');
   }
-  function onContextRestored() { contextLost = false; container.dataset.webgl = 'available'; resize(); }
-  function onMotionPreference(event) { reducedMotion = event.matches; }
+  function onContextRestored() { contextLost = false; needsShadowRender = true; container.dataset.webgl = 'available'; resize(); }
+  function onMotionPreference(event) { reducedMotion = event.matches; needsRender = true; }
 
   // Capture before OrbitControls so object dragging does not also orbit.
   canvas.addEventListener('pointerdown', onPointerDown, true);
@@ -797,6 +844,7 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
     canvas.removeEventListener('keydown', onKeyDown);
     canvas.removeEventListener('webglcontextlost', onContextLost);
     canvas.removeEventListener('webglcontextrestored', onContextRestored);
+    controls.removeEventListener('change', onControlsChange);
     controls.dispose();
     for (const texture of textures) texture.dispose();
     for (const value of geometryPool) value.dispose();
@@ -811,6 +859,6 @@ export function createFarmScene(container, { onSelect, onMove, onError } = {}) {
 
   return {
     update, setView, focus, resize, select, setEditable, resetCamera, dispose,
-    getDiagnostics: () => ({ available: !contextLost && !disposed, frames: frame, printers: printers.size, clearers: clearers.size, drawCalls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, editing, selectedId, view, reducedMotion }),
+    getDiagnostics: () => ({ available: !contextLost && !disposed, frames: frame, printers: printers.size, clearers: clearers.size, drawCalls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, editing, selectedId, view, reducedMotion, qualityProfile: softwareRenderer ? 'software' : 'standard', targetFps, pixelRatio: renderer.getPixelRatio(), renderOnDemand: true }),
   };
 }

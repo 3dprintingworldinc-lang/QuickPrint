@@ -64,6 +64,10 @@ progress, metrics and the event log; the dialog identifies this behavior. If 3D
 rendering is unavailable, the equipment list, editors and simulation controls
 remain usable.
 
+Paused scenes redraw only when something changes. Computers using software
+graphics automatically use lighter shadows and a lower animation rate so farm
+configuration remains responsive.
+
 ## Define the test workload
 
 Use **Add test job** to describe a part without uploading a model file. Set the
