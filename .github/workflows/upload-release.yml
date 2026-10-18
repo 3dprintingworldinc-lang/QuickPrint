@@ -72,12 +72,11 @@ jobs:
           ' "$VERIFICATION_DIR/artifacts.json"
           cat > "$VERIFICATION_DIR/verify-draft.sh" <<'BASH'
           set -euo pipefail
-          # GitHub's releases/tags endpoint excludes unpublished draft releases.
-          # The CLI resolves a draft by tag through the authenticated release list.
-          release_api=$(gh release view "$RELEASE_TAG" --json apiUrl --jq '.apiUrl')
-          release_id="${release_api##*/}"
-          [[ "$release_id" =~ ^[0-9]+$ ]]
-          gh api "repos/$GH_REPO/releases/$release_id" > "$VERIFICATION_DIR/release.json"
+          # GitHub's releases/tags endpoint excludes drafts. Resolve the draft
+          # through the authenticated REST list, independent of CLI view fields.
+          gh api "repos/$GH_REPO/releases?per_page=100" --paginate |
+            jq -s --arg tag "$RELEASE_TAG" 'add | map(select(.tag_name == $tag)) |
+              if length == 1 then .[0] else error("Expected exactly one release for this tag") end' > "$VERIFICATION_DIR/release.json"
           jq -e --arg tag "$RELEASE_TAG" '.draft == true and .tag_name == $tag' "$VERIFICATION_DIR/release.json"
           release_id=$(jq -r '.id' "$VERIFICATION_DIR/release.json")
           [[ "$release_id" =~ ^[0-9]+$ ]]

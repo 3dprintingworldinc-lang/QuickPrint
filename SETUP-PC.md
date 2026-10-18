@@ -11,7 +11,7 @@ Use these release assets:
 - Release: https://github.com/3dprintingworldinc-lang/QuickPrint/releases/tag/v0.2.0
 - Installer: https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.2.0/QuickPrint-Setup-0.2.0-x64.exe
 - Checksums: https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.2.0/SHA256SUMS.txt
-- Expected installer SHA-256: use the matching installer entry in SHA256SUMS.txt.
+- Expected installer SHA-256: `cc2dc104ce3e1ee0f3538878d48ed26071bb143f06c1a127e23ee5a2db397ca8`
 
 First verify that you are executing locally on Windows 10/11 x64, not in a cloud/Linux workspace. Inspect existing QuickPrint and PS AM Print installations, processes and configuration. Preserve PS AM Print, existing jobs and `%APPDATA%\QuickPrint`. Never overwrite an existing profile or stop active work to complete setup. QuickPrint has its own bundled runtime and needs no Node.js, Python or PS AM Print installation.
 
