@@ -31,7 +31,8 @@ flowchart LR
 | `src/connectors/` | Stable-file monitoring and read-only IMAP attachment ingestion with persistent checkpoints |
 | `src/slicing/` | Prepared-file inspection, configured slicer invocation, output checks, hashes and target-printer binding |
 | `src/adapters/` | Explicit registry of OctoPrint, Moonraker, Bambu LAN and standalone Duet protocol implementations |
-| `src/renderer/` | Overview, job workflow, fleet connections, inputs and settings UI |
+| `src/simulation/` | Independent deterministic virtual-farm engine, accelerated clock, scenario validation and simulation-only persistence |
+| `src/renderer/` | Overview, job workflow, fleet connections, inputs, settings and interactive 3D simulation UI |
 
 Adapters expose normalized status plus upload/start/pause/resume/cancel capabilities. Protocol-specific credentials and request formats stay within their implementations. Adding another printer protocol requires a reviewed source adapter and tests; QuickPrint does not execute plugin code received from printers or imported files. Reachability or a nominal model name does not establish capability.
 
@@ -46,6 +47,16 @@ Dispatch serializes access to the job and printer. It checks the prepared artifa
 Telemetry is associated with QuickPrint's own remote file/run identity. An unrelated print or an idle snapshot cannot silently complete a QuickPrint job. Printer completion and production acceptance remain separate. One run can contribute at most one accepted file-copy, and another run requires another explicit start. The job is complete only when accepted quantity satisfies its requested quantity.
 
 State is stored in versioned JSON under the supplied data directory with atomic replacement and a single-service lock. Original and prepared artifacts live in per-job folders. Connector checkpoints are separate atomic files within the same data directory. After restart, interrupted preparations and active/uncertain runs are brought back to a reviewable state rather than automatically dispatched.
+
+## Virtual-farm simulation
+
+The v0.2 source adds a separate simulation workspace. `SimulationEngine` owns validated scenario data and performs seeded, discrete-event scheduling without filesystem access, printer adapters or a production-service reference. Jobs are routed through material, nozzle, build-volume and zone constraints. Successful prints occupy their beds through cooling and clearing; a shared robot can clear only one printer at a time. Failure and offline transitions preserve occupied-bed holds.
+
+`SimulationService` owns the clock and serializes commands around the engine. It checkpoints to `simulation/state.json` beneath the existing data directory, restores paused and freezes for workspace backups. Simulation routes use the existing authenticated loopback administration API and are absent from the separate website-intake listener. Importing a scenario validates and replaces simulation configuration only; it does not create production jobs, printers or dispatch policies.
+
+The renderer provides scene selection, layout editing, configuration forms, routing explanations and result inspection. Three.js is bundled locally. The scene has an explicit disposal lifecycle, and the equipment list and editors remain usable when WebGL is unavailable. Equipment positions affect the visualization; elapsed durations and resource ownership come from the engine rather than rendered animation.
+
+Automatic clearing in the simulator represents assumed capacity and failure behavior. It neither implements physical auto-clear automation nor predicts mechanical reach, collisions, temperature or robot travel. The [simulation guide](SIMULATION.md) describes controls, limits and metric definitions.
 
 ## Local and network boundaries
 

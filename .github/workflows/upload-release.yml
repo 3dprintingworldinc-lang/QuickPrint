@@ -3,18 +3,35 @@ name: Upload verified Windows release
 on:
   workflow_dispatch:
     inputs:
+      release_tag:
+        description: Existing draft release tag, for example v0.2.0
+        required: true
+        type: string
+      version:
+        description: Exact application version, for example 0.2.0
+        required: true
+        type: string
+      release_branch:
+        description: Source branch of the verified build (main push or explicit workflow dispatch)
+        required: true
+        default: main
+        type: string
       build_run_id:
-        description: Successful Windows desktop build run ID from main
+        description: Successful native Windows desktop build run ID
         required: true
         type: string
       source_commit:
-        description: Exact source commit verified by that build
+        description: Exact 40-character source commit verified by that build and release tag
         required: true
         type: string
 
 permissions:
   actions: read
   contents: write
+
+concurrency:
+  group: upload-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
   upload:
@@ -23,63 +40,180 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_BRANCH: ${{ inputs.release_branch }}
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
       SOURCE_COMMIT: ${{ inputs.source_commit }}
+      VERIFICATION_DIR: ${{ runner.temp }}/quickprint-release
     steps:
-      - uses: actions/checkout@v4
       - name: Verify exact successful native build and unpublished release
         shell: bash
         run: |
+          set -euo pipefail
           [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
-          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID" > build-run.json
-          jq -e --arg repo "$GH_REPO" --arg sha "$SOURCE_COMMIT" '
-            .conclusion == "success" and .head_sha == $sha and
-            .head_repository.full_name == $repo and .head_branch == "main" and
-            .event == "push" and .path == ".github/workflows/windows-build.yml"
-          ' build-run.json
-          gh release view v0.1.0 --json isDraft --jq '.isDraft' | grep -qx true
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          [[ "$RELEASE_TAG" == "v$RELEASE_VERSION" ]]
+          git check-ref-format --branch "$RELEASE_BRANCH"
+          mkdir -p "$VERIFICATION_DIR"
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID" > "$VERIFICATION_DIR/build-run.json"
+          jq -e --arg repo "$GH_REPO" --arg sha "$SOURCE_COMMIT" --arg branch "$RELEASE_BRANCH" '
+            .status == "completed" and .conclusion == "success" and .head_sha == $sha and
+            .head_repository.full_name == $repo and .repository.full_name == $repo and
+            .path == ".github/workflows/windows-build.yml" and .head_branch == $branch and
+            ((.event == "push" and .head_branch == "main") or .event == "workflow_dispatch")
+          ' "$VERIFICATION_DIR/build-run.json"
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID/artifacts" > "$VERIFICATION_DIR/artifacts.json"
+          jq -e --arg sha "$SOURCE_COMMIT" '
+            [.artifacts[] | select(.name == "QuickPrint-Windows-x64")] |
+            length == 1 and .[0].expired == false and .[0].workflow_run.head_sha == $sha
+          ' "$VERIFICATION_DIR/artifacts.json"
+          cat > "$VERIFICATION_DIR/verify-draft.sh" <<'BASH'
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$VERIFICATION_DIR/release.json"
+          jq -e --arg tag "$RELEASE_TAG" '.draft == true and .tag_name == $tag' "$VERIFICATION_DIR/release.json"
+          release_id=$(jq -r '.id' "$VERIFICATION_DIR/release.json")
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          if [[ -f "$VERIFICATION_DIR/release-id" ]]; then
+            [[ "$release_id" == "$(cat "$VERIFICATION_DIR/release-id")" ]]
+          else
+            printf '%s\n' "$release_id" > "$VERIFICATION_DIR/release-id"
+          fi
+          gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" > "$VERIFICATION_DIR/tag-object.json"
+          for attempt in {1..10}; do
+            object_type=$(jq -r '.object.type' "$VERIFICATION_DIR/tag-object.json")
+            object_sha=$(jq -r '.object.sha' "$VERIFICATION_DIR/tag-object.json")
+            [[ "$object_sha" =~ ^[a-f0-9]{40}$ ]]
+            if [[ "$object_type" == commit ]]; then
+              [[ "$object_sha" == "$SOURCE_COMMIT" ]]
+              exit 0
+            fi
+            [[ "$object_type" == tag ]]
+            gh api "repos/$GH_REPO/git/tags/$object_sha" > "$VERIFICATION_DIR/tag-object.json"
+          done
+          echo 'Release tag has too many indirections.' >&2
+          exit 1
+          BASH
+          bash "$VERIFICATION_DIR/verify-draft.sh"
+      - name: Check out the exact verified source for the setup guide
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Verify checked-out application version
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+          [[ "$(node -p 'require("./package.json").version')" == "$RELEASE_VERSION" ]]
       - uses: actions/download-artifact@v4
         with:
           name: QuickPrint-Windows-x64
           run-id: ${{ inputs.build_run_id }}
+          repository: ${{ github.repository }}
           github-token: ${{ github.token }}
-          path: release
-      - name: Verify packages and Windows reports
-        working-directory: release
+          path: ${{ runner.temp }}/quickprint-release/assets
+      - name: Verify native packages, checksums and Windows simulation reports
         shell: bash
         run: |
-          sha256sum -c SHA256SUMS.txt
+          set -euo pipefail
+          cd "$VERIFICATION_DIR/assets"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const assert = require('node:assert/strict');
+          const version = process.env.RELEASE_VERSION;
+          const expected = [
+            `QuickPrint-Setup-${version}-x64.exe`,
+            `QuickPrint-Portable-${version}-x64.exe`,
+            `QuickPrint-Setup-${version}-x64.exe.blockmap`
+          ].sort();
+          const manifest = JSON.parse(fs.readFileSync('release-manifest.json', 'utf8'));
+          assert.equal(manifest.product, 'QuickPrint');
+          assert.equal(manifest.builderPlatform, 'win32');
+          assert.equal(manifest.target, 'Windows x64');
+          assert.equal(manifest.version, version);
+          assert.match(manifest.packagedApplicationSha256, /^[a-f0-9]{64}$/);
+          assert.ok(Number.isInteger(manifest.sourceFilesVerified) && manifest.sourceFilesVerified > 0);
+          assert.ok(Array.isArray(manifest.artifacts));
+          assert.deepEqual(manifest.artifacts.map(item => item.name).sort(), expected);
+          const lines = fs.readFileSync('SHA256SUMS.txt', 'utf8').trim().split(/\r?\n/);
+          assert.equal(lines.length, expected.length);
+          const checksums = new Map();
+          for (const line of lines) {
+            const match = /^([a-f0-9]{64}) {2}(QuickPrint-[A-Za-z0-9.-]+)$/.exec(line);
+            assert.ok(match && expected.includes(match[2]), 'Unexpected checksum entry.');
+            assert.ok(!checksums.has(match[2]), 'Duplicate checksum entry.');
+            checksums.set(match[2], match[1]);
+          }
+          for (const artifact of manifest.artifacts) {
+            const data = fs.readFileSync(artifact.name);
+            assert.ok(data.length > 0);
+            assert.equal(data.length, artifact.bytes);
+            const digest = crypto.createHash('sha256').update(data).digest('hex');
+            assert.equal(digest, artifact.sha256);
+            assert.equal(digest, checksums.get(artifact.name));
+            if (artifact.name.endsWith('.exe')) assert.equal(data.subarray(0, 2).toString(), 'MZ');
+          }
+          NODE
           for report in windows-smoke-test.json windows-portable-smoke-test.json; do
-            jq -e '.ok and .packaged and .platform == "win32" and .arch == "x64" and .credentialRoundTrip == "passed" and .uiReady and .apiReady and .renderer.nodeDisabled' "$report"
+            jq -e --arg version "$RELEASE_VERSION" '
+              .ok == true and .packaged == true and .version == $version and
+              .nativeVersion == $version and .platform == "win32" and .arch == "x64" and
+              .credentialRoundTrip == "passed" and .uiReady == true and .apiReady == true and
+              .health.ok == true and .health.version == $version and
+              .renderer.nodeDisabled == true and .renderer.bridge == true and
+              .simulation.apiReady == true and .simulation.bundleLoaded == true and
+              .simulation.uiReady == true and .simulation.renderMode == "webgl" and
+              .simulation.sceneRendered == true and .simulation.controlStepPassed == true and
+              .simulation.stepMinutes == 5 and .simulation.productionUnchanged == true and
+              .simulation.persisted == true and .simulation.diagnostics.available == true and
+              .simulation.diagnostics.frames > 0 and .simulation.diagnostics.drawCalls > 0 and
+              .simulation.diagnostics.triangles > 0 and .simulation.diagnostics.printers > 0
+            ' "$report"
           done
-          jq -e '.builderPlatform == "win32" and .version == "0.1.0"' release-manifest.json
-      - name: Pin the PC setup prompt to the uploaded installer
+      - name: Pin the verified source setup guide to the uploaded installer
         shell: bash
         run: |
           node <<'NODE'
           const fs = require('node:fs');
+          const path = require('node:path');
           const crypto = require('node:crypto');
-          const installer = fs.readFileSync('release/QuickPrint-Setup-0.1.0-x64.exe');
-          const hash = crypto.createHash('sha256').update(installer).digest('hex');
+          const assert = require('node:assert/strict');
+          const directory = path.join(process.env.VERIFICATION_DIR, 'assets');
+          const name = `QuickPrint-Setup-${process.env.RELEASE_VERSION}-x64.exe`;
+          const hash = crypto.createHash('sha256').update(fs.readFileSync(path.join(directory, name))).digest('hex');
           const original = fs.readFileSync('SETUP-PC.md', 'utf8');
-          const pattern = /Expected installer SHA-256: `[a-f0-9]{64}`/;
-          if (!pattern.test(original)) throw new Error('The setup prompt does not contain a pinned installer hash.');
-          fs.writeFileSync('release/SETUP-PC.md', original.replace(pattern, 'Expected installer SHA-256: `' + hash + '`'));
-          const build = JSON.parse(fs.readFileSync('build-run.json', 'utf8'));
-          fs.writeFileSync('release/windows-build-provenance.json', JSON.stringify({
-            sourceCommit: build.head_sha, buildRunId: build.id, buildRunUrl: build.html_url,
-            conclusion: build.conclusion, installerSha256: hash, codeSigned: false
+          const releaseUrl = `https://github.com/${process.env.GH_REPO}/releases`;
+          assert.ok(original.includes(`${releaseUrl}/tag/${process.env.RELEASE_TAG}`), 'The source setup guide must reference this release.');
+          assert.ok(original.includes(`${releaseUrl}/download/${process.env.RELEASE_TAG}/${name}`), 'The source setup guide must reference this installer.');
+          const pattern = /^- Expected installer SHA-256: (?:`[a-f0-9]{64}`|use the matching installer entry in SHA256SUMS\.txt\.)\r?$/gm;
+          assert.equal([...original.matchAll(pattern)].length, 1, 'The setup guide must contain exactly one recognized hash instruction.');
+          fs.writeFileSync(path.join(directory, 'SETUP-PC.md'), original.replace(pattern, '- Expected installer SHA-256: `' + hash + '`'));
+          const build = JSON.parse(fs.readFileSync(path.join(process.env.VERIFICATION_DIR, 'build-run.json'), 'utf8'));
+          const files = ['SETUP-PC.md', 'SHA256SUMS.txt', 'release-manifest.json', 'windows-smoke-test.json', 'windows-portable-smoke-test.json'];
+          fs.writeFileSync(path.join(directory, 'windows-build-provenance.json'), JSON.stringify({
+            releaseTag: process.env.RELEASE_TAG, version: process.env.RELEASE_VERSION,
+            sourceCommit: build.head_sha, sourceBranch: build.head_branch,
+            buildRunId: build.id, buildRunAttempt: build.run_attempt, buildRunUrl: build.html_url,
+            conclusion: build.conclusion, installerSha256: hash, codeSigned: false,
+            fileSha256: Object.fromEntries(files.map(file => [file, crypto.createHash('sha256').update(fs.readFileSync(path.join(directory, file))).digest('hex')]))
           }, null, 2) + '\n');
           NODE
-      - name: Upload assets to the existing draft release
+      - name: Upload new assets to the existing draft release
         shell: bash
         run: |
-          gh release upload v0.1.0 \
-            release/QuickPrint-Setup-0.1.0-x64.exe \
-            release/QuickPrint-Portable-0.1.0-x64.exe \
-            release/QuickPrint-Setup-0.1.0-x64.exe.blockmap \
-            release/SHA256SUMS.txt release/release-manifest.json \
-            release/windows-smoke-test.json release/windows-portable-smoke-test.json \
-            release/windows-build-provenance.json release/SETUP-PC.md --clobber
-          gh release view v0.1.0 --json assets --jq '.assets[] | [.name, .size] | @tsv' >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          # Recheck draft status, release identity and tag after downloading and verifying.
+          bash "$VERIFICATION_DIR/verify-draft.sh"
+          cd "$VERIFICATION_DIR/assets"
+          # Deliberately omit --clobber: existing assets are never overwritten.
+          gh release upload "$RELEASE_TAG" \
+            "QuickPrint-Setup-$RELEASE_VERSION-x64.exe" \
+            "QuickPrint-Portable-$RELEASE_VERSION-x64.exe" \
+            "QuickPrint-Setup-$RELEASE_VERSION-x64.exe.blockmap" \
+            SHA256SUMS.txt release-manifest.json \
+            windows-smoke-test.json windows-portable-smoke-test.json \
+            windows-build-provenance.json SETUP-PC.md
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, .size] | @tsv' >> "$GITHUB_STEP_SUMMARY"

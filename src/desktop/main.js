@@ -12,6 +12,14 @@ const smokeTest = process.argv.includes('--smoke-test');
 const option = (name) => process.argv.find((argument) => argument.startsWith(`${name}=`))?.slice(name.length + 1);
 let smokeDataDir;
 
+if (smokeTest) {
+  // Native CI runners need a real WebGL context without a physical GPU.
+  // These switches apply only to the isolated smoke process, never normal use.
+  app.commandLine.appendSwitch('use-gl', 'angle');
+  app.commandLine.appendSwitch('use-angle', 'swiftshader');
+  app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+}
+
 app.setName('QuickPrint');
 if (process.platform === 'win32') app.setAppUserModelId('com.3dprintingworld.quickprint');
 
@@ -98,6 +106,98 @@ async function writeSmokeReport(report) {
   await fs.writeFile(destination, `${JSON.stringify(report, null, 2)}\n`);
 }
 
+async function simulationSmokeCheck() {
+  const requireWebgl = process.platform === 'win32' || process.argv.includes('--smoke-require-webgl');
+  const result = await mainWindow.webContents.executeJavaScript(`(async () => {
+    const token = document.querySelector('meta[name="quickprint-token"]')?.content;
+    async function read(endpoint) {
+      const response = await fetch(endpoint, { headers: { Authorization: 'Bearer ' + token } });
+      if (!response.ok) throw new Error('Simulation smoke API failed: ' + endpoint + ' HTTP ' + response.status);
+      return response.json();
+    }
+    async function waitFor(check, description) {
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        const value = check();
+        if (value) return value;
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      throw new Error('Simulation smoke timed out: ' + description);
+    }
+    const productionBefore = await read('/api/state');
+    if (productionBefore.jobs.length || productionBefore.printers.length || productionBefore.connectors.length) {
+      throw new Error('Simulation smoke requires an isolated workspace without production jobs, printers, or inputs.');
+    }
+    const before = await read('/api/simulation');
+    if (before.running || !Number.isFinite(before.timeMinutes) || !before.printers.length || !Array.isArray(before.jobs)) {
+      throw new Error('The packaged simulation API did not provide a paused virtual farm.');
+    }
+    if (typeof window.QuickPrintSimulation?.mount !== 'function' || typeof window.QuickPrintScene?.createFarmScene !== 'function') {
+      throw new Error('The packaged simulation UI or local Three.js bundle is missing.');
+    }
+    const sceneModule = window.QuickPrintScene;
+    let scene;
+    // Observe the production scene instance; do not replace its rendering.
+    window.QuickPrintScene = { ...sceneModule, createFarmScene(...args) {
+      scene = sceneModule.createFarmScene(...args);
+      return scene;
+    } };
+    location.hash = '#simulation';
+    await waitFor(() => {
+      const button = document.querySelector('[data-sim-action="step"]');
+      return document.querySelector('[data-sim-name]')?.textContent === before.scenario.name
+        && document.querySelector('[data-sim-error]')?.hidden && button && !button.disabled;
+    }, 'simulation controls and authenticated snapshot');
+    await waitFor(() => {
+      const diagnostics = scene?.getDiagnostics?.();
+      const fallback = document.querySelector('[data-sim-webgl]');
+      return diagnostics?.available && diagnostics.frames > 0 && diagnostics.drawCalls > 0
+        && diagnostics.triangles > 0 && diagnostics.printers === before.printers.length
+        || fallback && !fallback.hidden;
+    }, 'a rendered 3D farm or usable WebGL fallback');
+    const diagnostics = scene?.getDiagnostics?.() || { available: false };
+    const canvas = document.querySelector('[data-sim-scene] canvas');
+    const sceneRendered = Boolean(diagnostics.available && diagnostics.frames > 0 && diagnostics.drawCalls > 0
+      && diagnostics.triangles > 0 && diagnostics.printers === before.printers.length
+      && canvas?.width > 0 && canvas?.height > 0);
+    if (${JSON.stringify(requireWebgl)} && !sceneRendered) {
+      throw new Error('Packaged simulation failed to render a real WebGL scene: ' + (diagnostics.reason || 'no rendered farm geometry'));
+    }
+    if (!sceneRendered && (!document.querySelector('[data-sim-webgl]') || document.querySelector('[data-sim-webgl]').hidden)) {
+      throw new Error('The simulation did not provide its usable non-WebGL fallback.');
+    }
+    // Exercise the actual visible control and its authenticated HTTP request.
+    const afterMinutes = before.timeMinutes + 5;
+    const wholeMinutes = Math.floor(afterMinutes);
+    const expectedClock = String(Math.floor(wholeMinutes / 60)).padStart(2, '0') + ':' + String(wholeMinutes % 60).padStart(2, '0');
+    document.querySelector('[data-sim-action="step"]').click();
+    await waitFor(() => document.querySelector('[data-sim-time]')?.textContent === expectedClock
+      && !document.querySelector('[data-sim-action="step"]')?.disabled, 'five-minute simulation step');
+    const after = await read('/api/simulation');
+    if (after.running || after.timeMinutes !== afterMinutes || after.metrics.elapsedMinutes !== afterMinutes) {
+      throw new Error('The simulator control did not advance exactly five paused minutes.');
+    }
+    const productionAfter = await read('/api/state');
+    const productionKeys = ['jobs', 'printers', 'settings', 'connectors', 'events'];
+    if (productionKeys.some(key => JSON.stringify(productionBefore[key]) !== JSON.stringify(productionAfter[key]))) {
+      throw new Error('Virtual farm operation changed production workspace state.');
+    }
+    // The accessible equipment list must work in both WebGL and fallback mode.
+    document.querySelector('[data-sim-tab="fleet"]').click();
+    if (!document.querySelector('[data-sim-detail]')?.textContent.includes(before.printers[0].name)) {
+      throw new Error('The simulator equipment list is unavailable.');
+    }
+    return { apiReady: true, bundleLoaded: true, uiReady: true,
+      renderMode: sceneRendered ? 'webgl' : 'fallback', sceneRendered,
+      diagnostics: scene?.getDiagnostics?.() || diagnostics,
+      controlStepPassed: true, stepMinutes: 5, beforeMinutes: before.timeMinutes, afterMinutes,
+      productionUnchanged: true };
+  })()`);
+  const checkpoint = JSON.parse(await fs.readFile(path.join(app.getPath('userData'), 'simulation', 'state.json'), 'utf8'));
+  if (checkpoint.engine?.timeMinutes !== result.afterMinutes) throw new Error('The simulator did not persist its isolated five-minute step.');
+  return { ...result, persisted: true };
+}
+
 async function smokeCheck(credentials) {
   const response = await fetch(new URL('/api/health', backend.url), { signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Health check failed: HTTP ${response.status}`);
@@ -130,7 +230,8 @@ async function smokeCheck(credentials) {
     if (credentials.unseal(credentials.seal(probe)) !== probe) throw new Error('Credential storage validation failed.');
     credentialRoundTrip = 'passed';
   }
-  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, checkedAt: new Date().toISOString() });
+  const simulation = await simulationSmokeCheck();
+  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, simulation, checkedAt: new Date().toISOString() });
   stopping = true;
   await stopBackend();
   mainWindow.destroy();

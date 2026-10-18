@@ -1,6 +1,6 @@
 {
   "name": "quickprint",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local Windows print-fleet workspace with modular intake and LAN printer adapters",
   "private": true,
   "license": "UNLICENSED",
@@ -16,7 +16,14 @@
     "test:ui": "playwright test",
     "build:win": "node scripts/build-windows.js",
     "build:checksums": "node scripts/build-checksums.js",
-    "smoke:desktop": "electron . --smoke-test"
+    "smoke:desktop": "electron . --smoke-test",
+    "build:renderer": "node scripts/build-renderer.js",
+    "postinstall": "npm run build:renderer",
+    "prestart": "npm run build:renderer",
+    "preserve": "npm run build:renderer",
+    "pretest:ui": "npm run build:renderer",
+    "prebuild:win": "npm run build:renderer",
+    "presmoke:desktop": "npm run build:renderer"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
@@ -30,7 +37,9 @@
   "devDependencies": {
     "@playwright/test": "^1.56.0",
     "electron": "44.7.2",
-    "electron-builder": "26.15.3"
+    "electron-builder": "26.15.3",
+    "esbuild": "0.25.12",
+    "three": "0.180.0"
   },
   "build": {
     "appId": "com.3dprintingworld.quickprint",

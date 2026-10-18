@@ -40,7 +40,8 @@
     spark: '<path d="m12 2 2.5 7.5L22 12l-7.5 2.5L12 22l-2.5-7.5L2 12l7.5-2.5L12 2Z"/>',
   };
   const icon = (name, extra = '') => `<svg ${extra} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.file}</svg>`;
-  const navItems = [['overview', 'Overview', 'overview'], ['jobs', 'Jobs', 'jobs'], ['printers', 'Printers', 'printer'], ['inputs', 'Inputs', 'inputs'], ['settings', 'Settings', 'settings']];
+  const navItems = [['overview', 'Overview', 'overview'], ['jobs', 'Jobs', 'jobs'], ['printers', 'Printers', 'printer'], ['inputs', 'Inputs', 'inputs'], ['simulation', 'Simulation', 'cube'], ['settings', 'Settings', 'settings']];
+  let simulationWorkspace = null;
   let state = null;
   let page = 'overview';
   let jobFilter = 'all';
@@ -145,6 +146,8 @@
     $('#breadcrumb-title').textContent = current[1];
     $('#breadcrumb-icon').innerHTML = icon(current[2]);
     document.title = `QuickPrint · ${current[1]}`;
+    $('.breadcrumb-subtitle').textContent = page === 'simulation' ? 'Virtual workspace' : 'Workspace';
+    $('.topbar [data-action="upload"]').style.display = page === 'simulation' ? 'none' : '';
   }
 
   function navigate() {
@@ -156,6 +159,15 @@
 
   function renderPage() {
     if (!state) return;
+    if (page === 'simulation') {
+      if (!simulationWorkspace) {
+        $('#main').innerHTML = '<div id="simulation-workspace"></div>';
+        simulationWorkspace = window.QuickPrintSimulation.mount($('#simulation-workspace'), { api, toast });
+      }
+      lastPage = page;
+      return;
+    }
+    if (simulationWorkspace) { simulationWorkspace.dispose(); simulationWorkspace = null; }
     const savedFocus = document.activeElement?.id === 'job-search' ? { id: 'job-search', position: document.activeElement.selectionStart } : null;
     const renders = { overview: renderOverview, jobs: renderJobs, printers: renderPrinters, inputs: renderInputs, settings: renderSettings };
     $('#main').innerHTML = renders[page]();
@@ -410,7 +422,7 @@
 
   async function handleSubmit(event) {
     const form = event.target;
-    if (!(form instanceof HTMLFormElement)) return;
+    if (!(form instanceof HTMLFormElement) || form.closest('#simulation-workspace')) return;
     event.preventDefault();
     if (!connected) return toast('Reconnect to the local workspace before making changes.', true);
     const data = new FormData(form);
