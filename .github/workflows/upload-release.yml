@@ -72,7 +72,11 @@ jobs:
           ' "$VERIFICATION_DIR/artifacts.json"
           cat > "$VERIFICATION_DIR/verify-draft.sh" <<'BASH'
           set -euo pipefail
-          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$VERIFICATION_DIR/release.json"
+          # GitHub's releases/tags endpoint excludes unpublished draft releases.
+          # The CLI resolves a draft by tag through the authenticated release list.
+          release_id=$(gh release view "$RELEASE_TAG" --json databaseId --jq '.databaseId')
+          [[ "$release_id" =~ ^[0-9]+$ ]]
+          gh api "repos/$GH_REPO/releases/$release_id" > "$VERIFICATION_DIR/release.json"
           jq -e --arg tag "$RELEASE_TAG" '.draft == true and .tag_name == $tag' "$VERIFICATION_DIR/release.json"
           release_id=$(jq -r '.id' "$VERIFICATION_DIR/release.json")
           [[ "$release_id" =~ ^[0-9]+$ ]]
