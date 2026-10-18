@@ -35,7 +35,17 @@ jobs:
       - name: Install browser test runtime
         run: npx playwright install chromium
       - name: Test desktop interface workflows
-        run: npm run test:ui -- --reporter=list,github
+        id: browser_tests
+        # Software WebGL shares the hosted runner's CPU with browser automation.
+        run: npm run test:ui -- --workers=1 --reporter=list,github
+      - name: Upload browser failure traces and screenshots
+        if: ${{ failure() && steps.browser_tests.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: QuickPrint-Windows-browser-failure
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build installer and portable executable
         run: npm run build:win
       - name: Install QuickPrint for the current user

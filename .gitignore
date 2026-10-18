@@ -7,3 +7,5 @@ playwright-report/
 .env
 *.log
 data/
+src/renderer/simulation-scene.js
+src/renderer/THIRD-PARTY-NOTICES.txt

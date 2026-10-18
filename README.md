@@ -2,7 +2,7 @@
 
 QuickPrint is a Windows desktop workspace for receiving print requests, preparing files, managing LAN printers, and recording accepted production. Website orders, email attachments, watched folders, and manual uploads feed the same job workflow.
 
-**Windows downloads:** [Installer](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.1.0/QuickPrint-Setup-0.1.0-x64.exe) · [Portable executable](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.1.0/QuickPrint-Portable-0.1.0-x64.exe) · [Release and checksums](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/tag/v0.1.0)
+**Windows downloads:** [Installer](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.2.0/QuickPrint-Setup-0.2.0-x64.exe) · [Portable executable](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/download/v0.2.0/QuickPrint-Portable-0.2.0-x64.exe) · [Release and checksums](https://github.com/3dprintingworldinc-lang/QuickPrint/releases/tag/v0.2.0)
 
 For help configuring a PC with Codex, use the [PC setup prompt](SETUP-PC.md).
 
@@ -28,12 +28,19 @@ See [installation and operation](docs/INSTALLATION.md), [input integrations](doc
 | Jobs | File originals, prepared-artifact hashes, printer binding, explicit starts, status polling, supported pause/resume/cancel controls |
 | Production | Per-run history, uncertain-result holds, accepted file-copy quantities, operator reconciliation before another run |
 | Desktop | Local administration, persistent data, Windows account-encrypted credentials, installer and portable build targets |
+| Simulation | Interactive 3D farm, configurable virtual printers and workloads, routing rules, manual/automatic/shared-robot clearing, seeded failures and scenario import/export |
 
 Printer support depends on the available protocol and firmware. A printer being reachable on the LAN is not enough. The [connection requirements](docs/INSTALLATION.md#printer-connections) describe model, API, certificate and file-format restrictions. Protocol fixtures and application tests do not establish physical qualification of every listed printer or firmware.
 
 Quantities count repetitions of a file. If a prepared plate contains six parts and quantity is three, QuickPrint tracks three runs of that plate. It does not count or individually inspect the six parts. Each run needs a separate confirmed start; this version does not automatically run the remaining quantity.
 
 QuickPrint preserves PS AM Print's separation of intake, preparation, dispatch and production reconciliation. It implements these stages in a self-contained Node service. This is not a complete copy of PS AM's factory-specific deployment, automation or manufacturing policies. [Architecture and reuse](docs/ARCHITECTURE.md) describes the boundary and source provenance.
+
+## Virtual print farm
+
+Version 0.2 adds a **Simulation** tab in the Windows installer, portable executable and development app. Start with a farm template, arrange equipment in 3D, configure printer capabilities and clearing cycles, then run test jobs with accelerated time. Routing explanations, seeded failures and an event log help compare different setups.
+
+Virtual equipment, jobs and routing rules stay separate from production dispatch. No printer connection is needed, and simulation actions never operate physical clearing hardware. Print times and failure rates are scenario inputs; the scene does not model physical collisions or robot travel. See the [simulation guide](docs/SIMULATION.md) for controls, routing behavior and result interpretation.
 
 ## Develop and build
 

@@ -11,6 +11,7 @@ const { QuickPrintService } = require('./core/service');
 const adapterModule = require('./adapters');
 const slicerModule = require('./slicing');
 const { ConnectorManager, validateConnector } = require('./connectors');
+const { SimulationService } = require('./simulation/service');
 const { version } = require('../package.json');
 
 const RENDERER = path.join(__dirname, 'renderer');
@@ -79,6 +80,8 @@ async function startServer(options = {}) {
   const token = options.token || crypto.randomBytes(32).toString('hex');
   const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, seal: options.seal, unseal: options.unseal });
   await service.init();
+  const simulation = new SimulationService({ dataDir, autoTick: options.simulationAutoTick !== false });
+  await simulation.init();
   const connectors = new ConnectorManager({ service });
   let intakeServer = null, intakeError = null, intakeSignature = '', pollTimer, polling = false, pollOperation = null, maintenance = false, closed = false, backupOperation = null;
   const app = express();
@@ -101,6 +104,16 @@ async function startServer(options = {}) {
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', maintenanceGuard);
   app.get('/api/state', (req, res) => res.json({ ...service.snapshot(), adapterCatalog: adapterModule.adapterCatalog(), connectorStatus: connectors.status(), intakeStatus: { listening: Boolean(intakeServer), error: intakeError }, version }));
+  app.get('/api/simulation', (req, res) => res.json(simulation.snapshot()));
+  app.put('/api/simulation/scenario', async (req, res) => res.json(await simulation.replaceScenario(req.body)));
+  app.post('/api/simulation/preset', async (req, res) => res.json(await simulation.loadPreset(req.body?.name)));
+  app.post('/api/simulation/control', async (req, res) => res.json(await simulation.control(req.body)));
+  app.post('/api/simulation/fault', async (req, res) => res.json(await simulation.fault(req.body)));
+  app.get('/api/simulation/preview/:jobId', (req, res) => res.json(simulation.preview(req.params.jobId)));
+  app.get('/api/simulation/export', (req, res) => {
+    res.setHeader('Content-Disposition', 'attachment; filename="QuickPrint-scenario.json"');
+    res.json(simulation.snapshot().scenario);
+  });
   app.post('/api/jobs', requestLimits, upload.array('files', 10), maintenanceGuard, async (req, res) => res.status(201).json(await service.submit(submission(req, 'desktop'))));
   app.post('/api/printers', async (req, res) => res.json(await service.savePrinter(req.body)));
   app.delete('/api/printers/:id', async (req, res) => { await service.removePrinter(req.params.id); res.json({ ok: true }); });
@@ -180,10 +193,11 @@ async function startServer(options = {}) {
   app.get('/api/backup', async (req, res) => {
     if (maintenance) throw fail('Another workspace backup is already in progress.', 409);
     maintenance = true;
-    let backupBuffer, finishBackup;
+    let backupBuffer, finishBackup, simulationResume;
     backupOperation = new Promise(resolve => { finishBackup = resolve; });
     clearInterval(pollTimer);
     try {
+    simulationResume = await simulation.freeze();
     await connectors.stop();
     await pollOperation;
     if (service.snapshot().jobs.some(job => ['preparing', 'dispatching', 'printing', 'paused'].includes(job.status))) throw fail('Wait until active jobs have stopped before exporting a consistent backup.', 409);
@@ -210,7 +224,7 @@ async function startServer(options = {}) {
     } finally {
       maintenance = false;
       try {
-        if (!closed) { await connectors.start(); if (!closed) schedulePoll(); }
+        if (!closed) { simulation.resume(simulationResume); await connectors.start(); if (!closed) schedulePoll(); }
       } finally { finishBackup(); backupOperation = null; }
     }
     res.setHeader('Content-Disposition', 'attachment; filename="QuickPrint-backup.zip"');
@@ -243,17 +257,19 @@ async function startServer(options = {}) {
     await configureIntake().catch(() => {});
     schedulePoll();
   } catch (error) {
-    await closeServer(server); await closeServer(intakeServer); await connectors.stop(); await service.close(); throw error;
+    await closeServer(server); await closeServer(intakeServer); await connectors.stop();
+    try { await simulation.close(); } finally { await service.close(); }
+    throw error;
   }
   return {
-    server, service, port: server.address().port, url: `http://127.0.0.1:${server.address().port}`, token,
+    server, service, simulation, port: server.address().port, url: `http://127.0.0.1:${server.address().port}`, token,
     async close() {
       if (closed) return; closed = true;
       clearInterval(pollTimer);
       if (backupOperation) await backupOperation;
       await connectors.stop();
       await closeServer(intakeServer); await closeServer(server);
-      await service.close();
+      try { await simulation.close(); } finally { await service.close(); }
     }
   };
 }
