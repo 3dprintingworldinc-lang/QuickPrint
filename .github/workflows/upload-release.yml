@@ -45,12 +45,13 @@ jobs:
       RELEASE_BRANCH: ${{ inputs.release_branch }}
       BUILD_RUN_ID: ${{ inputs.build_run_id }}
       SOURCE_COMMIT: ${{ inputs.source_commit }}
-      VERIFICATION_DIR: ${{ runner.temp }}/quickprint-release
     steps:
       - name: Verify exact successful native build and unpublished release
         shell: bash
         run: |
           set -euo pipefail
+          export VERIFICATION_DIR="$RUNNER_TEMP/quickprint-release"
+          printf 'VERIFICATION_DIR=%s\n' "$VERIFICATION_DIR" >> "$GITHUB_ENV"
           [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
           [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
