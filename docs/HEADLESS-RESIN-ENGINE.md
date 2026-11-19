@@ -20,7 +20,8 @@ on Windows x64. Configure `prusa-slicer-console.exe` and `UVtoolsCmd.exe`, keepi
 each provider's adjacent libraries and resources intact. The engine fingerprints
 the Prusa console/core DLL and UVtools console/command/core DLLs. Its QuickPrint
 manifest covers `resin-engine.js`, `goo.js`, `resin-profiles.js`,
-`resin-geometry.js`, the process runner in `slicing/index.js`, and
+`resin-geometry.js`, `resin-plate.js`, `resin-plate-engine.js`, `goo-plate.js`,
+the process runner in `slicing/index.js`, and
 `psam/zip-inspection.js`. These selected hashes
 are not a complete manifest of every runtime dependency in the provider
 installations.
@@ -29,6 +30,8 @@ The code checks that Prusa's help identifies PrusaSlicer and advertises
 `--export-sla`, and that UVtools reports a recognizable core version. It does not
 pin all accepted versions to the verified pair; another accepted interface still
 requires its own end-to-end verification.
+Explicit packed plates currently require the verified PrusaSlicer **2.9.7**
+interface; other versions are rejected for that path.
 
 Installed UVtools 4.4.3 has a known command exit-code behavior: commands can return
 1 after running. Only that exact version receives an exit policy of `[0, 1]`;
@@ -106,6 +109,11 @@ The full-resolution local receipt is
    rectangular bed or maximum height. Invoke Prusa with the copied preset,
    normalized STL, `--scale 1`, rotations, `--export-sla`, and managed
    `prepared.sl1` output. Configuration compatibility substitutions are disabled.
+   With an explicit `plate` request, instead preapply that rotation, create a
+   canonical shared mesh and native single-copy reference, reserve its measured
+   full support/pad footprint, then export explicit pixel-aligned 3MF instances
+   with automatic arrangement disabled. The final GOO must pass the independent
+   [all-layer copy proof](RESIN-PLATES.md) before it is a completed attempt.
 3. Inspect the SL1 archive. Require bounded `prusaslicer.ini` and `config.ini`,
    contiguous `prepared00000.png` layer names, consistent layer counts, expected
    PNG header dimensions, and matching effective geometry, mirrors, orientation,
@@ -132,12 +140,16 @@ The full-resolution local receipt is
    retain the first candidate with zero reported issues, and stop trying further
    candidates. If every candidate reports issues, retain the candidate with the
    fewest reports and return `analysis_failed`. Ties retain the earlier candidate.
-   A process, integrity or profile failure stops the operation; it is not hidden
-   by trying more orientations.
+   A process, integrity or profile failure stops the operation. In packed mode,
+   no-capacity, clipped-reference and non-equivalent raster candidates are
+   explicitly rejected and recorded; a different configured orientation may
+   still pass. If no copy-equivalent candidate survives, preparation fails.
 
 If every source orientation is out of bounds, fail with
 `RESIN_MODEL_OUT_OF_BOUNDS` before native slicing. These fit checks exclude
-generated supports/pad, which still need layer/issue analysis and qualification.
+generated supports/pad on the single-instance path. Packed mode additionally
+reserves the actual native reference footprint and support/pad height, then
+checks the final masks and issue report. Both paths still need qualification.
 The candidate search is finite and preset-driven. It does not infer customer
 intent, search arbitrary orientations, repair every mesh defect, or establish
 that one orientation is aesthetically or mechanically best.
@@ -264,16 +276,28 @@ Candidate angles are degrees in `[-360, 360]`; up to four are configured.
 
 ### Source copies and production quantity
 
-Each completed attempt and selected result records `modelCopiesPerRun: 1`;
-the verification CLI reports the same field. This means one submitted source
-instance. It does not count disconnected mesh components, physical parts,
-supports, or accepted production units. The engine passes no `--duplicate` or
-`--duplicate-grid` option and does not pack additional source instances.
-A single-unit repeat plan counts one order unit per file run only after an
-operator declares that the whole submitted model represents exactly one order
-unit. Repeated runs and physically accepted quantities still need separate
-production evidence; a slice never supplies QC counts.
-The actual provider rerun recorded this field in
+Each completed attempt and selected result records `modelCopiesPerRun`.
+Without an explicit plate request it is `1`. With
+`plate:{copies,gapMm,marginMm}`, it is the actual independently verified fit,
+which may be smaller than requested. Copies are 1 through 500, gap is
+nonnegative and margin at least 1 mm. The desktop service also limits the
+request to the current target's remaining units. Source instances do not count
+disconnected mesh components, physical parts, supports or accepted production
+units. One whole source instance counts as one order unit only after explicit
+operator declaration. Every run still needs separate readiness and production
+evidence; a slice never supplies QC counts.
+
+The engine uses a single shared canonical mesh with explicit 3MF instances,
+native reference support/pad measurement and integer-pixel translations.
+Independent validation requires exact grayscale replication on every GOO layer,
+the same exposure/motion schedule and physical settings, clear margins and no
+overlap. It passes no `--duplicate` or `--duplicate-grid` option. Source,
+oriented mesh, reference/final GOO, original/effective presets, layout and 3MF
+identities are retained and rechecked at capture, download and qualified dispatch.
+See [multi-copy plate preparation](RESIN-PLATES.md) for the complete proof,
+actual native results, supported policy and a reproducible 20-copy example.
+
+The earlier single-source-instance provider rerun recorded this field in
 `artifacts/resin-single-instance-verification/verification-dd630f36-9c06-473c-a6aa-5afcd5281d16.json`:
 234 layers, zero reported issues, GOO SHA-256
 `c4e56cffb26b8f89d7cea14202fd053feb9e0769b6a73ba3b0fd2d65ed3df3d5`.
@@ -296,8 +320,10 @@ The inspected SL1 `config.ini`/`config.json` contain no instance-count or
 placement-footprint contract. Raster component counting confirmed this simple
 cube probe, but cannot establish part counts for arbitrary geometry/supports.
 Local help, logs, SL1 files and raster-count evidence are retained under
-`scratch/resin-plate-plan/` and excluded from version control. Multiple-copy
-packing needs an independently checked placement/count contract before use.
+`scratch/resin-plate-plan/` and excluded from version control. The explicit
+placement and full raster proof above replace those unsafe duplication flags;
+successful native exit status or connected-component counting alone remains
+insufficient.
 
 ## Desktop use and order requirements
 
@@ -372,10 +398,14 @@ The authenticated API equivalent is `POST /api/jobs/:id/resin/slice` with:
   "confirmedRequirements": true,
   "confirmedSizing": true,
   "profileSlotId": "standard-grey",
-  "sizing": { "mode": "dimension", "axis": "z", "millimeters": 6 }
+  "sizing": { "mode": "dimension", "axis": "z", "millimeters": 6 },
+  "plate": { "copies": 6, "gapMm": 1, "marginMm": 2 }
 }
 ```
 
+The optional `plate` object requests up to that many copies. Omit it for the
+single-instance path. A STEP/STP request also requires `expectedGeometrySha256`
+from the mesh the operator reviewed; see [CAD preparation](RESIN-CAD.md).
 This request accepts the explicit sizing plan and review fields;
 model/output/profile paths come from the imported job and local Settings.
 The authenticated download route is
@@ -403,7 +433,10 @@ when that separate run path is available; see the [production guide](RESIN-PRODU
 Pending/approved plans hold replacement slicing. Use confirmed queued-preparation
 withdrawal, or explicitly adopt a newer studio QC replacement target, before
 revising that preparation. Both preserve earlier production evidence; neither
-grants a new print authorization or QC credit.
+grants a new print authorization or QC credit. When a confirmed plate result
+leaves fewer units than its immutable artifact contains, fresh matched portal
+progress can release the old hold for a smaller capture, fresh receipt and
+approval; see [production remainder steps](RESIN-PRODUCTION.md#6-record-the-physical-result-then-the-next-plate).
 
 Native resin slicing and the SatelLite preprocessing probe share one service
 engine lock. Duplicate preparations for the same job are rejected. Active work

@@ -64,6 +64,10 @@ The authenticated job API is `POST /api/jobs/:id/resin/cad` with
 `GET /api/jobs/:id/resin/geometry` then verifies the saved conversion and returns
 measurements without running native providers. It identifies both the original
 `sourceSha256` and the converted `geometrySha256`.
+For STEP slicing, submit that reviewed `geometrySha256` as
+`expectedGeometrySha256` alongside the sizing/requirements confirmations. A
+missing or stale hash fails with `RESIN_CAD_REVIEW_STALE` before SLA providers
+run; refresh the measurements and confirm the current conversion again.
 
 ## What is verified
 
@@ -134,6 +138,17 @@ the managed runtime from setup:
 ```powershell
 node scripts/verify-resin-cad.js --model tests/fixtures/resin/verification-cylinder.step --freecad "C:/Program Files/FreeCAD 1.0/bin/FreeCADCmd.exe" --audit-runtime C:/absolute/managed-cad-audit/site-packages --output artifacts/resin-cad-verification
 ```
+
+To continue through the synthetic 6 mm resin check, capture the CAD command's
+JSON and use its verified mesh with the CAD-specific public profile:
+
+```powershell
+$cadCheck = node scripts/verify-resin-cad.js --model tests/fixtures/resin/verification-cylinder.step --freecad "C:/Program Files/FreeCAD 1.0/bin/FreeCADCmd.exe" --audit-runtime C:/absolute/managed-cad-audit/site-packages --output artifacts/resin-cad-verification | ConvertFrom-Json
+node scripts/verify-resin-engine.js --model $cadCheck.filePath --profile tests/fixtures/resin/verification-cad-profile.json --prusa ".cache/prusa/PrusaSlicer-2.9.7/prusa-slicer-console.exe" --uvtools ".cache/uvtools/UVtoolsCmd.exe" --output artifacts/resin-cad-slice-verification --dimension-z 6
+```
+
+Replace native installation/runtime paths as needed. The cube-oriented
+`verification-profile.json` is not the cylinder's zero-report profile.
 
 Optional flags are `--linear-deflection-mm`, `--angular-deflection-rad` and
 `--timeout-ms`. The report is independently reverified before success. Software

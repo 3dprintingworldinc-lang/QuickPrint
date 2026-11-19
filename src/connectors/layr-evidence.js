@@ -9,7 +9,7 @@ function context(manager, id) {
   const job = manager.service.getJob(id);
   if (job.technology !== 'resin' || !job.order || job.status !== 'review') throw fail('Select a reviewed resin ticket with a captured slice.');
   const slice = job.resinSlice;
-  if (!slice?.analysis?.passed || slice.analysis.count !== 0 || slice.inspection?.validatedLayerData !== true || slice.sourceSha256 !== job.sha256) throw fail('Only a structurally validated, issue-free slice can be sent as preparation evidence.');
+  if (!slice?.analysis?.passed || slice.analysis.count !== 0 || slice.inspection?.validatedLayerData !== true || slice.sourceSha256 !== job.sha256 || !Number.isSafeInteger(slice.modelCopiesPerRun) || slice.modelCopiesPerRun < 1 || slice.modelCopiesPerRun > 500) throw fail('Only a structurally validated, issue-free slice with a verified source-instance count can be sent as preparation evidence.');
   return { job, slice };
 }
 async function verifyFiles(manager, job, slice) {
@@ -28,7 +28,7 @@ async function verifyQueuedEvidence(manager, summary, command) {
   const { job, slice } = context(manager, matches[0].id);
   const data = command.data;
   if (data.sourceSha256 !== job.sha256 || data.artifact?.sha256 !== slice.sha256 || data.artifact?.sizeBytes !== slice.bytes || data.artifact?.format !== slice.format ||
-      data.profileSha256 !== slice.profileSha256 || data.tool?.executableSha256 !== slice.tool?.executableSha256 || data.printerId !== slice.printerId || data.printerModel !== slice.printerModel || data.material !== slice.material) {
+      data.profileSha256 !== slice.profileSha256 || data.tool?.executableSha256 !== slice.tool?.executableSha256 || data.printerId !== slice.printerId || data.printerModel !== slice.printerModel || data.material !== slice.material || data.partsPerRun !== slice.modelCopiesPerRun) {
     throw fail('The local slice changed after this unsent evidence was queued. Review the held operation before sending another slice.');
   }
   await verifyFiles(manager, job, slice);
@@ -41,7 +41,7 @@ async function queueSliceEvidence(manager, id, { connectorId, version } = {}) {
   const config = configs[0];
   let deviceFingerprint = null;
   if (manager.service.snapshot().printers.some(printer => printer.id === slice.printerId && printer.type === 'sdcp')) deviceFingerprint = (await manager.service.inspectResinPrinter(slice.printerId)).deviceFingerprint;
-  const key = ['slice', config.portalUrl, job.order.portalJobId, job.order.ticketFingerprint, slice.sha256, slice.profileSha256, slice.tool?.executableSha256, deviceFingerprint || 'unbound', 1].join(':');
+  const key = ['slice', config.portalUrl, job.order.portalJobId, job.order.ticketFingerprint, slice.sha256, slice.profileSha256, slice.tool?.executableSha256, deviceFingerprint || 'unbound', slice.modelCopiesPerRun].join(':');
   await verifyFiles(manager, job, slice);
   let evidenceKey = key;
   let existing = manager.outbox.lookup?.(evidenceKey);
@@ -68,7 +68,7 @@ async function queueSliceEvidence(manager, id, { connectorId, version } = {}) {
   return manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: 'record_slice', id: job.order.portalJobId, version,
     data: { ticketFingerprint: job.order.ticketFingerprint, sourceSha256: job.sha256,
       tool: { name: slice.tool.name, version: slice.tool.version, executableSha256: slice.tool.executableSha256 },
-      profileSha256: slice.profileSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, deviceFingerprint, partsPerRun: 1,
+      profileSha256: slice.profileSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, deviceFingerprint, partsPerRun: slice.modelCopiesPerRun,
       artifact: { sha256: slice.sha256, sizeBytes: slice.bytes, format: slice.format },
     } }, evidenceKey);
 }

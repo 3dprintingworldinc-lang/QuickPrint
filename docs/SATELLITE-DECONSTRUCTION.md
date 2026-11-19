@@ -308,10 +308,12 @@ UVtools GOO, with independent layer validation and print-issue analysis. See the
 reproduction commands and physical qualification limits. This does not expose a
 new SatelLite SDK or make its private methods callable.
 
-The engine records `modelCopiesPerRun: 1`: one submitted source instance, not a
-disconnected-component, physical-part or accepted-unit count. Initial repeat
-planning requires the operator to declare that the whole model is one order
-unit. Printing and QC must supply the actual run/accepted quantities.
+The engine records the actual verified `modelCopiesPerRun`: one submitted source
+instance by default, or the independently proved fit for an explicit plate
+request. Source instances are not disconnected-component, physical-part or
+accepted-unit counts. Production planning requires the operator to declare that
+the whole model is one order unit. Printing and QC must supply the actual
+run/accepted quantities.
 
 Prusa's advertised duplication flags were exercised separately with the 3 mm
 fixture cube, a 40 x 20 mm bed and supports/pad disabled. Requests for 1, 2 and 20
@@ -322,8 +324,11 @@ requested cubes without a failing exit. Tagged
 and [slicing source](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessActions.cpp)
 show duplication, arrangement and selection of bed 0. The actual SL1 metadata
 provided no instance-count/footprint contract. Ignored evidence is in
-`scratch/resin-plate-plan/`. QuickPrint therefore sends no duplication flags;
-validated multi-instance placement/counting remains future work.
+`scratch/resin-plate-plan/`. QuickPrint therefore sends no duplication flags.
+Its separate [verified plate path](RESIN-PLATES.md) uses explicit shared-mesh
+3MF placements, a native support/pad reference and exact all-layer GOO copy
+proof. A 20-copy synthetic export passed that proof and all six issue checks;
+supported candidates with islands or raster mismatches remain held or rejected.
 
 ## Remaining qualification work
 

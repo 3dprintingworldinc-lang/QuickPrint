@@ -28,6 +28,26 @@ function resinTarget(job, ticket) {
 const targetFields = target => ({ targetId: target.id, targetKind: target.kind, targetCycle: target.cycle, targetParts: target.requiredParts });
 const sameTarget = (left, right) => ['id', 'kind', 'cycle', 'requiredParts', 'qcOperationId'].every(key => left[key] === right[key]) && Date.parse(left.authorizedAt) === Date.parse(right.authorizedAt);
 
+function resinImportSnapshot(order) {
+  const snapshot = order.productionSnapshot;
+  if (snapshot === undefined) return null;
+  const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && [Object.prototype,null].includes(Object.getPrototypeOf(value)) && Reflect.ownKeys(value).length === keys.length && Reflect.ownKeys(value).every(key => keys.includes(key));
+  const target = snapshot?.target, progress = snapshot?.progress;
+  const authorized = typeof target?.authorizedAt === 'string' ? Date.parse(target.authorizedAt) : NaN;
+  if (!exact(snapshot,['portalJobId','portalVersion','ticketFingerprint','target','progress']) || snapshot.portalJobId !== order.portalJobId || snapshot.portalVersion !== order.portalVersion || snapshot.ticketFingerprint !== order.ticketFingerprint ||
+      !exact(target,['id','kind','cycle','requiredParts','authorizedAt','qcOperationId']) || !UUID.test(target.id || '') || target.id !== order.portalJobId || target.kind !== 'order' || target.cycle !== 0 || target.requiredParts !== order.requestedQuantity || target.qcOperationId !== null ||
+      typeof target.authorizedAt !== 'string' || target.authorizedAt.length > 40 || !Number.isFinite(authorized) || new Date(authorized).toISOString() !== target.authorizedAt ||
+      !exact(progress,['requestedParts','printedParts','remainingParts','completedRuns','failedRuns']) || progress.requestedParts !== order.requestedQuantity || !Number.isSafeInteger(progress.printedParts) || progress.printedParts < 0 || progress.printedParts > order.requestedQuantity || progress.remainingParts !== order.requestedQuantity - progress.printedParts ||
+      !Number.isSafeInteger(progress.completedRuns) || progress.completedRuns < 0 || !Number.isSafeInteger(progress.failedRuns) || progress.failedRuns < 0) throw error(400, 'The imported original-target production snapshot must match its ticket identity, version and quantities.', 'INVALID_PRODUCTION_SNAPSHOT');
+  return clone(snapshot);
+}
+
+function resinPlateRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) || Reflect.ownKeys(value).length !== 3 || Reflect.ownKeys(value).some(key => !['copies','gapMm','marginMm'].includes(key)) ||
+      !Number.isSafeInteger(value.copies) || value.copies < 1 || value.copies > 500 || typeof value.gapMm !== 'number' || !Number.isFinite(value.gapMm) || value.gapMm < 0 || value.gapMm > 10000 || typeof value.marginMm !== 'number' || !Number.isFinite(value.marginMm) || value.marginMm < 1 || value.marginMm > 10000) throw error(400, 'A plate needs 1–500 whole-source copies, a nonnegative gap and at least 1 mm bed margin.', 'RESIN_PLATE_REQUEST_INVALID');
+  return { copies: value.copies, gapMm: value.gapMm, marginMm: value.marginMm };
+}
+
 function text(value, maximum = 500) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').trim().slice(0, maximum);
 }
@@ -310,6 +330,7 @@ class QuickPrintService extends EventEmitter {
 
   async submit({ source = 'manual', sourceId, name, customer, quantity = 1, notes, files, order } = {}) {
     this._assertReady();
+    let productionSnapshot;
     if (order !== undefined) {
       if (!order || order.production?.printType !== 'resin' || !/^[a-f0-9]{64}$/.test(order.ticketFingerprint || '')
         || !Number.isSafeInteger(order.requestedQuantity) || order.requestedQuantity < 1 || order.requestedQuantity > 500
@@ -322,6 +343,7 @@ class QuickPrintService extends EventEmitter {
       try { portal = new URL(order.portalUrl); } catch { throw error(400, 'The production ticket needs its portal origin.', 'INVALID_PRODUCTION_TICKET'); }
       if (portal.protocol !== 'https:' || portal.origin !== order.portalUrl || source !== `layr:${portal.origin}` || sourceId !== `${order.portalJobId}:${order.ticketFingerprint}`) throw error(400, 'The production ticket and submission identity must match.', 'INVALID_PRODUCTION_TICKET');
       if (!Buffer.isBuffer(files[0].data) || !/\.(stl|obj|step|stp)$/i.test(files[0].name) || digest(files[0].data) !== order.modelSha256) throw error(400, 'The imported model must match its production ticket receipt.', 'MODEL_RECEIPT_MISMATCH');
+      productionSnapshot = resinImportSnapshot(order);
       order = clone(order);
     }
     if (typeof source !== 'string' || source.length > 200 || (sourceId !== undefined && (typeof sourceId !== 'string' || sourceId.length > 1000))) {
@@ -360,8 +382,10 @@ class QuickPrintService extends EventEmitter {
               pendingAcceptanceQuantity: 0, status: 'review', createdAt: now, updatedAt: now,
               inputPath, sha256: digest(file.data), bytes: file.data.length, runs: [], currentRunId: null,
               ...(order ? { order, technology: 'resin' } : {}),
+              ...(productionSnapshot ? { resinProduction: { target: clone(productionSnapshot.target), targetVerified: true, baselinePrintedParts: productionSnapshot.progress.printedParts } } : {}),
               history: [{ at: now, from: null, to: 'review', message: 'File received. Select a compatible printer and prepare it for review.' }],
             };
+            if (productionSnapshot) this._quantities(job);
             jobs.push(job);
           }
           this.state.jobs.push(...jobs);
@@ -689,8 +713,9 @@ class QuickPrintService extends EventEmitter {
   }
 
   async sliceResinJob(id, request = {}) {
-    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256'].includes(key))) throw error(400, 'Resin slicing accepts reviewed sizing, confirmations, a reviewed CAD geometry hash and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate'].includes(key))) throw error(400, 'Resin slicing accepts reviewed sizing, plate policy, confirmations, a reviewed CAD geometry hash and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
     if (request.expectedGeometrySha256 !== undefined && (typeof request.expectedGeometrySha256 !== 'string' || !SHA256.test(request.expectedGeometrySha256))) throw error(400, 'The reviewed CAD geometry hash must be a SHA-256 value.', 'INVALID_RESIN_SLICE_REQUEST');
+    const plate = request.plate === undefined ? undefined : resinPlateRequest(request.plate);
     let sizing;
     try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
     const originalSize = sizing?.mode === 'original';
@@ -700,6 +725,7 @@ class QuickPrintService extends EventEmitter {
       if (job.technology !== 'resin' || !job.order?.ticketFingerprint) throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
       if (['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState)) throw error(409, 'Preparation approval is pending or committed. Resolve that approval before replacing its artifact.', 'RESIN_APPROVAL_LOCKED');
       if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before slicing.', 'JOB_BUSY');
+      if (plate) { const quantities = clone(job); this._quantities(quantities); if (plate.copies > quantities.resinProduction.remainingParts) throw error(409, 'Requested plate copies exceed the current production target remainder.', 'QUANTITY_EXCEEDED'); }
       const settings = resinEngineConfiguration(this.state.settings.resinEngine || {});
       const slots = settings.slots || [];
       let slot;
@@ -722,7 +748,7 @@ class QuickPrintService extends EventEmitter {
         const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-slicing');
         const implementation = this.resinEngine || module;
         controller.signal.throwIfAborted();
-        const result = await implementation.prepareResin({ ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, signal: controller.signal });
+        const result = await implementation.prepareResin({ ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), signal: controller.signal });
         controller.signal.throwIfAborted();
         if (!result || !result.analysis || !Number.isSafeInteger(result.analysis.count) || result.analysis.count < 0 || result.analysis.passed !== (result.analysis.count === 0) || !Array.isArray(result.analysis.issues) || result.analysis.issues.length !== result.analysis.count || result.analysis.issues.some(issue => typeof issue !== 'string') || !Array.isArray(result.analysis.checks) || result.analysis.checks.length !== RESIN_ANALYSIS_CHECKS.length || RESIN_ANALYSIS_CHECKS.some(check => !result.analysis.checks.includes(check)) || result.sourceSha256 !== expectedGeometry.engineSourceSha256 || result.profileSha256 !== loaded.profileSha256 || result.printerId !== loaded.profile.printerId || result.printerModel !== loaded.profile.printerModel || result.material !== loaded.profile.material || !result.tool || !/^[a-f0-9]{64}$/.test(result.tool.executableSha256 || '')) throw error(502, 'Resin slicing returned incomplete or mismatched evidence.', 'INVALID_RESIN_OUTPUT');
         const inputGeometry = await this._verifyResinInputGeometry(job, result, expectedGeometry);
@@ -730,6 +756,7 @@ class QuickPrintService extends EventEmitter {
         const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
         module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
         if (inspection.perLayerSettings) throw error(502, 'Per-layer resin parameters require separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
+        await this._verifyResinPlateEvidence(job, { ...result, inputGeometry }, { loaded, artifactBytes: bytes, requested: plate });
         await this._readResinGeometrySource(job);
         if (expectedGeometry.cadPreparation) {
           const checked = await this._expectedResinGeometry(job, sizing);
@@ -740,7 +767,7 @@ class QuickPrintService extends EventEmitter {
           controller.signal.throwIfAborted();
           const current = this._job(id);
           const cad = expectedGeometry.cadPreparation;
-          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true, ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
+          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true, ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
           if (result.analysis.passed) delete current.error;
           else current.error = `${result.analysis.count} resin print issue(s) require review. Inspect the captured file and change the model or profile before retrying.`;
           this._transition(current, 'review', result.analysis.passed ? 'Resin slice captured. Printer/material qualification is still required.' : current.error);
@@ -839,10 +866,35 @@ class QuickPrintService extends EventEmitter {
     return { filePath: descriptor.filePath, sha256: anticipated.sha256, bytes: anticipated.bytes, bounds: measured.sourceBounds };
   }
 
-  async _verifyResinSizingEvidence(job, slice) {
+  async _loadResinSliceProfile(slice) {
+    const settings = this.state.settings.resinEngine || {}, slotId = slice.operatorReview?.profileSlotId;
+    const profilePath = slotId ? settings.slots?.find(slot => slot.id === slotId)?.profilePath : settings.profilePath;
+    if (!profilePath) throw error(409, 'The reviewed resin profile is no longer configured.', 'RESIN_PROFILE_CHANGED');
+    const loaded = await require('../slicing/resin-engine').loadProfile(profilePath);
+    if (loaded.profileSha256 !== slice.profileSha256 || loaded.profile.printerId !== slice.printerId || loaded.profile.printerModel !== slice.printerModel || loaded.profile.material !== slice.material) throw error(409, 'The resin profile changed after this slice was captured.', 'RESIN_PROFILE_CHANGED');
+    return loaded;
+  }
+
+  async _verifyResinPlateEvidence(job, slice, { loaded, artifactBytes, requested = slice.operatorReview?.plate } = {}) {
+    const copies = slice.modelCopiesPerRun;
+    if (!Number.isSafeInteger(copies) || copies < 1 || copies > 500) throw error(409, 'The slice must identify its actual bounded source-instance count.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    if (!requested && !slice.platePreparation && copies === 1) return 1;
+    if (!requested || !slice.platePreparation || !slice.sizingPlan || !slice.inputGeometry) throw error(409, 'Packed slices require the reviewed plate policy and independent placement evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    const policy = resinPlateRequest(requested);
+    if (copies > policy.copies) throw error(409, 'The artifact contains more source instances than requested.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    const profile = loaded || await this._loadResinSliceProfile(slice);
+    const bytes = artifactBytes || await this._resinSliceFile(job,slice);
+    const normalized = await this._readResinGeometrySource({ ...job, inputPath: slice.inputGeometry.filePath, sha256: slice.inputGeometry.sha256 });
+    const checked = await require('../slicing/resin-plate-engine').verifyResinPlatePreparation(normalized,slice.platePreparation,{ profile: profile.profile, ini: profile.ini, preset: profile.preset, artifactBytes: bytes, directory: path.join(this.dataDir,'jobs',job.id,'resin-slicing') });
+    if (!checked || checked.modelCopiesPerRun !== copies || checked.layout?.copiesPlaced !== copies || checked.rasterProof?.copiesPerRun !== copies || checked.artifactSha256 !== slice.sha256 || checked.sourceSha256 !== slice.inputGeometry.sha256 || !require('node:util').isDeepStrictEqual(checked.requested,policy)) throw error(409, 'The layout, exact raster proof, reviewed request and artifact count disagree.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    return copies;
+  }
+
+  async _verifyResinSizingEvidence(job, slice, options = {}) {
     const isCad = /\.(step|stp)$/i.test(job.fileName);
     if (!slice.sizingPlan) {
       if (isCad) throw error(409, 'STEP resin slices require source-bound CAD and sizing evidence.', 'RESIN_CAD_REQUIRED');
+      if (slice.platePreparation || slice.operatorReview?.plate || slice.modelCopiesPerRun > 1) throw error(409, 'Packed slices require normalized source sizing evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
       if (slice.operatorReview?.confirmedOriginalSize !== true || (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original')) throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
       return;
     }
@@ -851,14 +903,15 @@ class QuickPrintService extends EventEmitter {
     if (isCad && (slice.sourceSha256 !== job.sha256 || slice.meshSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.embeddedUnits !== true || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.cadPreparation, expected.cadPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinCadSliceTool(slice.rawSliceTool, expected.cadPreparation)))) throw error(409, 'CAD source, conversion, slicing provider or reviewed units changed.', 'RESIN_CAD_CHANGED');
     if (!isCad && (slice.cadPreparation || slice.meshSourceSha256 || slice.rawSliceTool)) throw error(409, 'Mesh-only slices cannot carry unrelated CAD evidence.', 'RESIN_CAD_CHANGED');
     await this._verifyResinInputGeometry(job, slice, expected);
+    await this._verifyResinPlateEvidence(job,slice,options);
   }
 
   async getResinSliceDownload(id) {
     return this._withLocks([`job:${id}`], async () => {
       const job = this._job(id);
       if (job.technology !== 'resin') throw error(409, 'Select a resin ticket.', 'RESIN_TICKET_REQUIRED');
-      await this._resinSliceFile(job);
-      if (job.resinSlice.sizingPlan || /\.(step|stp)$/i.test(job.fileName)) await this._verifyResinSizingEvidence(job, job.resinSlice);
+      const bytes = await this._resinSliceFile(job);
+      if (job.resinSlice.sizingPlan || /\.(step|stp)$/i.test(job.fileName) || job.resinSlice.platePreparation || job.resinSlice.modelCopiesPerRun > 1) await this._verifyResinSizingEvidence(job, job.resinSlice,{ artifactBytes: bytes });
       if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Slice this ticket again.', 'ORIGINAL_CHANGED');
       return { filePath: job.resinSlice.filePath, fileName: 'prepared-unqualified.goo', sha256: job.resinSlice.sha256, bytes: job.resinSlice.bytes };
     });
@@ -895,23 +948,18 @@ class QuickPrintService extends EventEmitter {
 
   async _resinDispatchBindings(job, receipt, deviceFingerprint) {
     const slice = job.resinSlice;
-    if (job.technology !== 'resin' || !job.order || !SHA256.test(job.order.ticketFingerprint || '') || !slice || slice.format !== 'goo' || slice.modelCopiesPerRun !== 1 || slice.inspection?.validatedLayerData !== true || slice.operatorReview?.confirmedRequirements !== true || (slice.sizingPlan ? slice.operatorReview.confirmedSizing !== true : slice.operatorReview.confirmedOriginalSize !== true) || slice.operatorReview.ticketFingerprint !== job.order.ticketFingerprint || slice.analysis?.passed !== true || slice.analysis.count !== 0 || !Array.isArray(slice.analysis.issues) || slice.analysis.issues.length !== 0 || !Array.isArray(slice.analysis.checks) || RESIN_ANALYSIS_CHECKS.some(check => !slice.analysis.checks.includes(check)) || !SHA256.test(slice.tool?.executableSha256 || '')) throw error(409, 'A validated, issue-free, single-source-instance resin slice is required.', 'RESIN_SLICE_UNQUALIFIED');
-    if (!SHA256.test(deviceFingerprint || '') || !receipt || receipt.kind !== 'slice' || !UUID.test(receipt.id || '') || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint || receipt.sourceSha256 !== job.sha256 || receipt.profileSha256 !== slice.profileSha256 || receipt.tool?.executableSha256 !== slice.tool.executableSha256 || receipt.printerId !== slice.printerId || receipt.printerModel !== slice.printerModel || receipt.material !== slice.material || receipt.artifact?.sha256 !== slice.sha256 || receipt.artifact?.sizeBytes !== slice.bytes || receipt.artifact?.format !== 'goo' || receipt.partsPerRun !== 1 || receipt.deviceFingerprint !== deviceFingerprint || receipt.printReady !== false) throw error(409, 'The portal receipt does not identify this exact slice, profile, one-unit plan and printer.', 'RESIN_RECEIPT_MISMATCH');
+    const copies = slice?.modelCopiesPerRun;
+    if (job.technology !== 'resin' || !job.order || !SHA256.test(job.order.ticketFingerprint || '') || !slice || slice.format !== 'goo' || !Number.isSafeInteger(copies) || copies < 1 || copies > 500 || (copies > 1 && (!slice.platePreparation || !slice.operatorReview?.plate)) || slice.inspection?.validatedLayerData !== true || slice.operatorReview?.confirmedRequirements !== true || (slice.sizingPlan ? slice.operatorReview.confirmedSizing !== true : slice.operatorReview.confirmedOriginalSize !== true) || slice.operatorReview.ticketFingerprint !== job.order.ticketFingerprint || slice.analysis?.passed !== true || slice.analysis.count !== 0 || !Array.isArray(slice.analysis.issues) || slice.analysis.issues.length !== 0 || !Array.isArray(slice.analysis.checks) || RESIN_ANALYSIS_CHECKS.some(check => !slice.analysis.checks.includes(check)) || !SHA256.test(slice.tool?.executableSha256 || '')) throw error(409, 'A validated issue-free slice with verified source-instance count is required.', 'RESIN_SLICE_UNQUALIFIED');
+    if (!SHA256.test(deviceFingerprint || '') || !receipt || receipt.kind !== 'slice' || !UUID.test(receipt.id || '') || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint || receipt.sourceSha256 !== job.sha256 || receipt.profileSha256 !== slice.profileSha256 || receipt.tool?.executableSha256 !== slice.tool.executableSha256 || receipt.printerId !== slice.printerId || receipt.printerModel !== slice.printerModel || receipt.material !== slice.material || receipt.artifact?.sha256 !== slice.sha256 || receipt.artifact?.sizeBytes !== slice.bytes || receipt.artifact?.format !== 'goo' || receipt.partsPerRun !== copies || receipt.deviceFingerprint !== deviceFingerprint || receipt.printReady !== false) throw error(409, 'The portal receipt does not identify this exact slice, profile, plate count and printer.', 'RESIN_RECEIPT_MISMATCH');
     if (slice.sourceSha256 !== job.sha256 || job.order.modelSha256 !== job.sha256 || digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed after resin preparation.', 'ORIGINAL_CHANGED');
-    if (slice.sizingPlan || /\.(step|stp)$/i.test(job.fileName)) await this._verifyResinSizingEvidence(job, slice);
+    const bytes = await this._resinSliceFile(job), loaded = await this._loadResinSliceProfile(slice);
+    if (slice.sizingPlan || /\.(step|stp)$/i.test(job.fileName) || slice.platePreparation || copies > 1) await this._verifyResinSizingEvidence(job, slice,{ loaded,artifactBytes: bytes });
     else if (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original') throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
-    const bytes = await this._resinSliceFile(job);
-    const settings = this.state.settings.resinEngine || {};
-    const slotId = slice.operatorReview?.profileSlotId;
-    const profilePath = slotId ? settings.slots?.find(slot => slot.id === slotId)?.profilePath : settings.profilePath;
-    if (!profilePath) throw error(409, 'The reviewed resin profile is no longer configured.', 'RESIN_PROFILE_CHANGED');
     const module = require('../slicing/resin-engine');
-    const loaded = await module.loadProfile(profilePath);
-    if (loaded.profileSha256 !== slice.profileSha256 || loaded.profile.printerId !== slice.printerId || loaded.profile.printerModel !== slice.printerModel || loaded.profile.material !== slice.material) throw error(409, 'The resin profile changed after this slice was captured.', 'RESIN_PROFILE_CHANGED');
     const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
     module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
     if (inspection.perLayerSettings || inspection.sha256 !== slice.sha256) throw error(409, 'The resin artifact does not match its reviewed global profile.', 'RESIN_SLICE_UNQUALIFIED');
-    return { receiptId: receipt.id, sourceSha256: job.sha256, artifactSha256: slice.sha256, profileSha256: slice.profileSha256, engineSha256: slice.tool.executableSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, format: 'goo', deviceFingerprint, partsPerRun: 1 };
+    return { receiptId: receipt.id, sourceSha256: job.sha256, artifactSha256: slice.sha256, profileSha256: slice.profileSha256, engineSha256: slice.tool.executableSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, format: 'goo', deviceFingerprint, partsPerRun: copies };
   }
 
   async adoptResinPreparationTarget(issuer, id, { ticket, confirmedTarget, observedAt } = {}) {
@@ -953,6 +1001,36 @@ class QuickPrintService extends EventEmitter {
     });
   }
 
+  async applyResinPlateRemainder(issuer, id, { ticket, runId, observedAt } = {}) {
+    this._resinIssuer(issuer);
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), production = job.resinProduction, run = job.runs.find(item => item.id === runId && item.technology === 'resin');
+      if (!fresh(observedAt)) throw error(409, 'Refresh the confirmed portal plate result before reopening preparation.', 'RESIN_AUTHORIZATION_STALE');
+      const target = production?.target || resinTarget(job), remote = ticket?.production?.run;
+      if (job.technology !== 'resin' || !run || !run.resolvedAt || run.outcome !== 'completed' || run.reconciliation?.outcome !== 'completed' || run.reconciliation.printedParts !== run.printedParts || !Number.isSafeInteger(run.printedParts) || run.printedParts < 1 || !Number.isSafeInteger(run.plannedParts) || run.plannedParts < 2 || run.plannedParts > 500 || run.printedParts > run.plannedParts || !Number.isSafeInteger(run.portalVersion) || run.portalVersion < 1 || !run.startEvidence || run.terminalEvidence?.outcome !== 'completed' || !this._matchesRun(run.startEvidence,run) || !this._matchesRun(run.terminalEvidence,run) ||
+          (run.targetId || job.order.portalJobId) !== target.id || ticket?.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.ticket?.specifications?.production?.printType !== 'resin' || !ticket.production?.target || !sameTarget(resinTarget(job,ticket),target) || !Number.isSafeInteger(ticket.version) || ticket.version < 1 || remote?.status !== 'completed') throw error(409, 'The portal did not confirm this identified completed plate and immutable production target.', 'RESIN_REMAINDER_UNCONFIRMED');
+      const expected = { runId: run.id, targetId: target.id, receiptId: run.receiptId, artifactSha256: run.artifactSha256, remoteId: run.startEvidence.remoteId, printerId: run.printerId, deviceFingerprint: run.deviceFingerprint, plannedParts: run.plannedParts, printedParts: run.printedParts };
+      if (Object.entries(expected).some(([key,value]) => remote[key] !== value)) throw error(409, 'The portal plate result identifies different physical production evidence.', 'RESIN_REMAINDER_UNCONFIRMED');
+      const previous = production.remainderRelease;
+      if (previous?.runId === run.id && previous.version === ticket.version && previous.receiptId === run.receiptId) return publicValue(clone(job));
+      const plan = production.plan, quantities = clone(job); this._quantities(quantities);
+      const local = quantities.resinProduction, progress = ticket.production.progress;
+      if (!['review','cancelled'].includes(job.status) || this._currentRun(job) || ticket.status !== 'preparing' || ticket.production.approvedReceiptId || ticket.production.approvedTargetId || !progress || progress.requestedParts !== target.requiredParts || progress.printedParts !== local.printedParts || progress.remainingParts !== local.remainingParts || !Number.isSafeInteger(progress.remainingParts) || progress.remainingParts < 1 || progress.remainingParts >= run.plannedParts ||
+          !plan || plan.receiptId !== run.receiptId || plan.artifactSha256 !== run.artifactSha256 || plan.deviceFingerprint !== run.deviceFingerprint || plan.printerId !== run.printerId || plan.partsPerRun !== run.plannedParts || plan.targetId !== target.id) throw error(409, 'A smaller remainder requires this exact stopped plate, confirmed counts and its previous preparation plan.', 'RESIN_REMAINDER_UNCONFIRMED');
+      if (ticket.version <= Math.max(plan.approvalVersion || 0,plan.approvalExpectedVersion || 0,run.portalVersion,previous?.version || 0)) throw error(409, 'An older portal result cannot release a newer preparation generation.', 'RESIN_REMAINDER_STALE');
+      return this._mutate(() => {
+        const current = this._job(id), currentProduction = current.resinProduction, currentPlan = currentProduction.plan;
+        currentProduction.remainderRelease = { id: crypto.randomUUID(), runId: run.id, version: ticket.version, receiptId: run.receiptId, artifactSha256: run.artifactSha256, targetId: target.id, observedAt, releasedAt: this._now() };
+        for (const field of ['approvalState','approvalRequestedAt','approvedAt','approvalVersion','approvalExpectedVersion','approvalOperationId']) delete currentPlan[field];
+        delete currentProduction.authorization;
+        currentProduction.portalProgress = clone(progress);
+        this._invalidateResinPermits(id);
+        this._transition(current,'review','The portal confirmed a smaller production remainder. Prepare a newly reviewed plate for the remaining units.');
+        return publicValue(current);
+      });
+    });
+  }
+
   async reviewResinProductionPlan(issuer, id, { receipt, deviceFingerprint, confirmedWholeModel, ticket } = {}) {
     this._resinIssuer(issuer);
     if (confirmedWholeModel !== true) throw error(400, 'Confirm that the entire imported source model represents one ordered production unit.', 'RESIN_UNIT_PLAN_REQUIRED');
@@ -967,6 +1045,8 @@ class QuickPrintService extends EventEmitter {
       if (changedTarget && (!ticket || target.kind !== 'replacement' || target.cycle <= previousTarget.cycle)) throw error(409, 'A new replacement target requires an explicit studio-authorized QC cycle.', 'RESIN_TARGET_INVALID');
       if (changedTarget && ((job.resinProduction?.targetHistory || []).some(item => item.target?.id === target.id) || job.runs.some(run => run.targetId === target.id))) throw error(409, 'An earlier production target identity cannot be reused.', 'RESIN_TARGET_MISMATCH');
       if (target.requiredParts < 1) throw error(409, 'This correction target authorizes finishing work without another physical print.', 'RESIN_TARGET_COMPLETE');
+      const quantityView = clone(job); this._quantities(quantityView);
+      if (bindings.partsPerRun > (changedTarget ? target.requiredParts : quantityView.resinProduction.remainingParts)) throw error(409, 'This plate contains more instances than the current production target needs.', 'QUANTITY_EXCEEDED');
       const previousPlan = job.resinProduction?.plan;
       if (!changedTarget && ['pending', 'approved'].includes(previousPlan?.approvalState) && Object.entries(bindings).some(([key, value]) => previousPlan[key] !== value)) throw error(409, 'Resolve the current preparation approval before replacing its production plan.', 'RESIN_APPROVAL_LOCKED');
       return this._mutate(() => {
@@ -1000,7 +1080,8 @@ class QuickPrintService extends EventEmitter {
       if (!plan || plan.confirmedWholeModel !== true || Object.entries(bindings).some(([key, value]) => plan[key] !== value)) throw error(409, 'The preparation evidence no longer matches the reviewed production plan.', 'RESIN_APPROVAL_PLAN_MISMATCH');
       if (plan.approvalState === 'approved') throw error(409, 'This preparation approval is already committed. Replay its saved operation instead of issuing another approval.', 'RESIN_APPROVAL_LOCKED');
       if (plan.approvalState === 'pending' && plan.approvalOperationId && plan.approvalOperationId !== operationId) throw error(409, 'A pending approval belongs to another saved operation.', 'RESIN_APPROVAL_LOCKED');
-      if (plan.withdrawalVersion && (!Number.isSafeInteger(expectedVersion) || expectedVersion < plan.withdrawalVersion)) throw error(409, 'Refresh the reopened preparation before sending another approval.', 'RESIN_AUTHORIZATION_STALE');
+      const releasedVersion = Math.max(plan.withdrawalVersion || 0,job.resinProduction?.remainderRelease?.version || 0);
+      if (releasedVersion && (!Number.isSafeInteger(expectedVersion) || expectedVersion < releasedVersion)) throw error(409, 'Refresh the reopened preparation before sending another approval.', 'RESIN_AUTHORIZATION_STALE');
       if (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1 || (plan.approvalState === 'pending' && plan.approvalExpectedVersion && plan.approvalExpectedVersion !== expectedVersion))) throw error(409, 'The approval operation must retain its expected portal version.', 'RESIN_APPROVAL_PLAN_MISMATCH');
       await this._mutate(() => {
         const current = this._job(id);
@@ -1075,7 +1156,8 @@ class QuickPrintService extends EventEmitter {
     const checked = Date.parse(authorization?.checkedAt);
     const expires = Date.parse(authorization?.expiresAt);
     if (!authorization || authorization.qualified !== true || !fresh(authorization.checkedAt) || !Number.isFinite(expires) || expires <= Date.now() || expires - checked > 35000 || expires <= checked || !SHA256.test(authorization.qualificationFingerprint || '') || !ticket || ticket.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.status !== 'queued' || !Number.isSafeInteger(ticket.version) || ticket.version < 1 || ticket.production?.approvedReceiptId !== bindings.receiptId || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.ticket?.specifications?.production?.printType !== 'resin' || !progress || progress.requestedParts !== target.requiredParts || !Number.isSafeInteger(progress.printedParts) || progress.printedParts < 0 || !Number.isSafeInteger(progress.remainingParts) || progress.remainingParts < 1 || progress.printedParts + progress.remainingParts !== progress.requestedParts) throw error(409, 'The portal did not provide current qualified authorization for a queued resin unit.', 'RESIN_AUTHORIZATION_REQUIRED');
-    const expected = { jobVersion: ticket.version, ticketFingerprint: job.order.ticketFingerprint, receiptId: bindings.receiptId, sourceSha256: bindings.sourceSha256, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, engineSha256: bindings.engineSha256, deviceFingerprint: bindings.deviceFingerprint, printerId: bindings.printerId, printerModel: bindings.printerModel, material: bindings.material, format: bindings.format, partsPerRun: 1, plannedParts: 1, remainingParts: progress.remainingParts };
+    if (bindings.partsPerRun > progress.remainingParts) throw error(409, 'The qualified plate exceeds the authoritative production remainder.', 'RESIN_AUTHORIZATION_MISMATCH');
+    const expected = { jobVersion: ticket.version, ticketFingerprint: job.order.ticketFingerprint, receiptId: bindings.receiptId, sourceSha256: bindings.sourceSha256, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, engineSha256: bindings.engineSha256, deviceFingerprint: bindings.deviceFingerprint, printerId: bindings.printerId, printerModel: bindings.printerModel, material: bindings.material, format: bindings.format, partsPerRun: bindings.partsPerRun, plannedParts: bindings.partsPerRun, remainingParts: progress.remainingParts };
     if (ticket.production?.target || authorization.targetId !== undefined) Object.assign(expected, targetFields(target));
     if (ticket.production?.target && ticket.production.approvedTargetId !== target.id) throw error(409, 'The approved receipt belongs to another production target.', 'RESIN_TARGET_MISMATCH');
     if (Object.entries(expected).some(([key, value]) => authorization[key] !== value) || !receipt || receipt.id !== bindings.receiptId) throw error(409, 'The fresh authorization does not match this production plan.', 'RESIN_AUTHORIZATION_MISMATCH');
@@ -1095,7 +1177,7 @@ class QuickPrintService extends EventEmitter {
       const plan = job.resinProduction?.plan;
       if (!plan || plan.confirmedWholeModel !== true || Object.entries(bindings).some(([key, value]) => plan[key] !== value)) throw error(409, 'Review the exact single-unit production plan before authorizing a run.', 'RESIN_UNIT_PLAN_REQUIRED');
       const checked = this._validateResinAuthorization(job, bindings, { authorization, receipt, ticket });
-      if (ticket.version <= (plan.withdrawalVersion || 0) || ticket.version < (plan.approvalVersion || 0)) throw error(409, 'Refresh production authorization after the latest preparation change.', 'RESIN_AUTHORIZATION_STALE');
+      if (ticket.version <= Math.max(plan.withdrawalVersion || 0,job.resinProduction?.remainderRelease?.version || 0) || ticket.version < (plan.approvalVersion || 0)) throw error(409, 'Refresh production authorization after the latest preparation change.', 'RESIN_AUTHORIZATION_STALE');
       if ((plan.targetId || job.order.portalJobId) !== checked.target.id || (job.resinProduction?.target?.id || job.order.portalJobId) !== checked.target.id) throw error(409, 'Review this exact current production target before another run.', 'RESIN_TARGET_MISMATCH');
       const adapter = await this._adapter(printer);
       if (typeof adapter.attributes !== 'function') throw error(409, 'The printer cannot provide qualified SDCP identity.', 'RESIN_PRINTER_REQUIRED');
@@ -1158,17 +1240,17 @@ class QuickPrintService extends EventEmitter {
       await this._mutate(() => {
         const current = this._job(id);
         current.printerId = printer.id;
-        current.runs.push({ id: runId, technology: 'resin', ...targetFields(permit.target), printerId: printer.id, printerType: 'sdcp', printerFingerprint: permit.printerFingerprint, phase: 'uploading', createdAt: this._now(), artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, receiptId: bindings.receiptId, deviceFingerprint: bindings.deviceFingerprint, qualificationFingerprint: permit.authorization.qualificationFingerprint, plannedParts: 1, fileName: remoteName });
+        current.runs.push({ id: runId, technology: 'resin', ...targetFields(permit.target), printerId: printer.id, printerType: 'sdcp', printerFingerprint: permit.printerFingerprint, phase: 'uploading', createdAt: this._now(), artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, receiptId: bindings.receiptId, deviceFingerprint: bindings.deviceFingerprint, qualificationFingerprint: permit.authorization.qualificationFingerprint, plannedParts: bindings.partsPerRun, portalVersion: permit.authorization.jobVersion, fileName: remoteName });
         current.currentRunId = runId;
         delete current.error;
-        this._transition(current, 'dispatching', 'Qualified one-unit dispatch intent saved before transfer.', { runId });
+          this._transition(current, 'dispatching', 'Qualified plate dispatch intent saved before transfer.', { runId });
       });
       let startRequested = false;
       try {
         const upload = await adapter.upload({ filePath: job.resinSlice.filePath, fileName: remoteName });
         if (!upload?.remotePath || basename(upload.remotePath) !== remoteName) throw error(502, 'Upload did not return this run’s exact remote filename.', 'UPLOAD_IDENTITY');
         await this._mutate(() => { const run = this._currentRun(this._job(id)); run.remotePath = upload.remotePath; run.phase = 'uploaded'; });
-        const context = { jobId: id, ...targetFields(permit.target), portalJobId: job.order.portalJobId, portalUrl: job.order.portalUrl, printerId: printer.id, receiptId: bindings.receiptId, runId, deviceFingerprint: bindings.deviceFingerprint, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, plannedParts: 1, authorization: clone(permit.authorization) };
+        const context = { jobId: id, ...targetFields(permit.target), portalJobId: job.order.portalJobId, portalUrl: job.order.portalUrl, printerId: printer.id, receiptId: bindings.receiptId, runId, deviceFingerprint: bindings.deviceFingerprint, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, plannedParts: bindings.partsPerRun, authorization: clone(permit.authorization) };
         const proof = await authority.reauthorize(clone(context));
         await this._resinDispatchBindings(job, proof?.receipt, bindings.deviceFingerprint);
         const refreshed = this._validateResinAuthorization(job, bindings, proof, permit.authorization);
@@ -1189,7 +1271,7 @@ class QuickPrintService extends EventEmitter {
           const current = this._job(id), run = this._currentRun(current);
           run.remoteId = started.remoteId; run.phase = 'observed'; run.startedAt = this._now(); run.observedPrintingAt = started.observedAt;
           run.startEvidence = { remoteId: started.remoteId, currentFile: started.currentFile, observedAt: started.observedAt };
-          this._transition(current, 'printing', 'SDCP identified this qualified one-unit print. No production or QC credit has been applied.', { runId });
+          this._transition(current, 'printing', 'SDCP identified this qualified plate print. No production or QC credit has been applied.', { runId });
           return publicValue(current);
         });
       } catch (failure) {
@@ -1205,13 +1287,15 @@ class QuickPrintService extends EventEmitter {
   }
 
   async reconcileResinRun(id, { runId, outcome, printedParts = 0, notes = '' } = {}) {
-    if (!OUTCOMES.has(outcome) || !Number.isInteger(printedParts) || printedParts < 0 || printedParts > 1 || (outcome !== 'completed' && printedParts !== 0)) throw error(400, 'Record zero or one printed unit; only a completed run can contribute production.', 'RESIN_RECONCILIATION_INVALID');
+    if (!OUTCOMES.has(outcome) || !Number.isSafeInteger(printedParts) || printedParts < 0 || printedParts > 500 || (outcome !== 'completed' && printedParts !== 0)) throw error(400, 'Record a bounded printed count; only a completed run can contribute production.', 'RESIN_RECONCILIATION_INVALID');
     const printerId = this._job(id).printerId;
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const existingJob = this._job(id);
       if (existingJob.technology !== 'resin') throw error(409, 'Select a resin production run.', 'RESIN_TICKET_REQUIRED');
       const existingRun = existingJob.runs.find(item => item.id === runId && item.technology === 'resin');
       if (!existingRun) throw error(409, 'Choose the exact resin run to reconcile.', 'STALE_RECONCILIATION');
+      const planned = Number.isSafeInteger(existingRun.plannedParts) && existingRun.plannedParts >= 1 && existingRun.plannedParts <= 500 ? existingRun.plannedParts : 1;
+      if (printedParts > planned) throw error(400, 'Printed units cannot exceed this exact run’s planned plate count.', 'RESIN_RECONCILIATION_INVALID');
       if (!existingRun.resolvedAt && printedParts === 0) {
         try {
           const adapter = await this._adapter(this._printer(printerId));

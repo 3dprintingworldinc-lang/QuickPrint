@@ -105,6 +105,9 @@ The other plans are `{ "mode": "original" }` and
 `{ "mode": "scale", "factor": 2 }`. Original size is the default and also
 accepts the existing `confirmedOriginalSize` confirmation. Resizing requires
 `confirmedSizing: true`. Requests do not supply model/output paths or scripts.
+For STEP, also include `expectedGeometrySha256` equal to the converted
+`geometrySha256` returned by the geometry GET. This binds the confirmation to
+the displayed CAD mesh; a missing or stale value is rejected before SLA slicing.
 
 From the repository root, with complete provider installations at these local
 development paths:

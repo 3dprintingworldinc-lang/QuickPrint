@@ -245,7 +245,7 @@ test('two resin units require separate physical confirmations and counted runs, 
   await expect(page.getByRole('button', { name: 'Start one resin unit', exact: true })).toHaveCount(0);
   expect(workspace.remote.writes.map(value => value.action)).toEqual(['record_slice', 'approve_preparation', 'start_print', 'finish_print', 'start_print', 'finish_print']);
   expect(new Set(workspace.remote.writes.filter(value => value.action === 'start_print').map(value => value.data.runId)).size).toBe(2);
-  expect(dispatchBodies).toEqual([{ confirmedReady: true }, { confirmedReady: true }]);
+  expect(dispatchBodies).toEqual([{ confirmedReady: true, receiptId: workspace.remote.receipt.id, plannedParts: 1 }, { confirmedReady: true, receiptId: workspace.remote.receipt.id, plannedParts: 1 }]);
   expect(mutations(workspace.adapter).map(([action]) => action)).toEqual(['upload', 'start', 'upload', 'start']);
   expect(errors).toEqual([]);
   // The studio can authorize a separately identified replacement target. The

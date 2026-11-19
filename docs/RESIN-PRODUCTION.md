@@ -43,7 +43,14 @@ profile is not a production calibration.
 ## 2. Resolve the order and capture a slice
 
 Connect the scoped production machine API under **Inputs** and import a paid
-resin ticket awaiting preparation. Resolve scale, target dimensions, supports,
+resin ticket awaiting preparation.
+
+On a fresh workspace, a validated original-target import retains its existing
+printed count, so preparation is bounded by the imported remainder. Duplicate
+imports cannot overwrite local history; fresh authorization still checks the
+live counts before a run. Replacement targets require their separate review.
+
+Resolve scale, target dimensions, supports,
 finish and other free-text requirements before slicing. For STEP/STP, configure
 the [CAD providers](RESIN-CAD.md), confirm embedded CAD units and use **Prepare
 STEP geometry** first. Its verified mesh is already in millimetres; ticket units
@@ -66,11 +73,21 @@ the configured rotations, captures GOO, validates its layers and target values,
 and runs the six selected issue checks. Reported issues require review. A clean
 capture still has `printReady: false` and `printerCompatible: false`.
 
-Each file contains one submitted source instance (`modelCopiesPerRun: 1`).
+For multiple copies, expand **Plate copies and spacing**. Choose the maximum
+copies for this plate, the gap between full support footprints and the edge
+margin. Copies must be 1 through 500 and cannot exceed this target's remaining
+units; gaps are nonnegative and margins at least 1 mm. Native support/pad
+footprints, pixel alignment and resource bounds can reduce the actual fit.
+Review the displayed **verified source instances per plate** before approval.
+The engine proves the explicit placements against every final GOO layer; a
+request for 20 is never evidence that 20 were captured.
+
+Without a plate request the file contains one submitted source instance.
 Disconnected geometry and support components do not determine how many order
-units that model represents. Multiple-copy packing is unavailable because the
-Prusa duplication overflow probe silently omitted requested copies; see
-[quantity evidence](HEADLESS-RESIN-ENGINE.md#source-copies-and-production-quantity).
+units an instance represents. Each whole source instance must represent one
+ordered unit by the operator's explicit declaration. See
+[verified multi-copy plates](RESIN-PLATES.md) for the count/footprint proof,
+native observations and rejected orientations.
 
 ## 3. Confirm the device-bound portal receipt
 
@@ -78,7 +95,7 @@ Use **Queue slice receipt**, or enable automatic validated-slice receipt
 synchronization on the production input. The manager reads the selected SDCP
 device identity and records a `record_slice` operation containing source,
 artifact, profile, engine and device fingerprints, material/printer labels,
-artifact size/format and `partsPerRun: 1`.
+artifact size/format and `partsPerRun` equal to the actual verified plate count.
 
 Wait for the outbox operation to be **confirmed**. A queued or pending write is
 not a portal receipt. This synchronization sends evidence metadata; it neither
@@ -103,7 +120,8 @@ historical qualified flag cannot replace the portal's current binding check.
 
 Refresh **Review production qualification**. Once current qualification is
 confirmed, explicitly declare that the **whole submitted model represents one
-requested production unit**. Use **Approve one-unit run plan**. This stores the
+requested production unit**. Use **Approve plate of N units** (or
+**Approve one-unit run plan** for a single instance). This stores the
 local plan and sends `approve_preparation` through the durable outbox. Wait for
 portal confirmation and the `queued` stage before a physical run. Approval is
 not a physical start and does not count a printed unit.
@@ -116,23 +134,26 @@ reconciliation clears the local preparation hold for further review. A local
 failure before the first request is definitely sent remains an unsent paused
 operation. These states must be resolved rather than replacing the bound slice.
 
-## 5. Opt in and start one unit
+## 5. Opt in and start one approved plate
 
 After qualification, enable **Settings -> Resin model preparation -> Enable
 qualified resin dispatch** and save. The API setting is
 `resinEngine.dispatchEnabled: true`; the default is false. This switch permits
 the qualified path to proceed, but supplies no server qualification itself.
 
-Open the production review and choose **Start one resin unit** only after
+Open the production review and choose **Start plate of N units** (or
+**Start one resin unit**) only after
 checking the stopped/idle printer, build plate, resin and readiness for this
-individual run. Confirm the start dialog. Each remaining unit needs another
-explicit readiness confirmation.
+individual run. Confirm the start dialog. Each subsequent plate needs its own
+explicit readiness confirmation. A readiness dialog binds
+the receipt ID and displayed plate count; a changed review must be refreshed.
 
 The service then:
 
 1. Reconciles saved portal evidence and reads fresh authorization for the exact
    queued ticket, receipt, device, current production target and remaining quantity.
-2. Rechecks original/CAD-conversion/normalized-input/GOO/profile hashes, sizing proof, local printer binding, device attributes,
+2. Rechecks original/CAD-conversion/normalized-input/GOO/profile hashes, sizing
+   and complete plate proof, actual copy count, local printer binding, device attributes,
    GOO capabilities and fresh idle status. It creates a short-lived, one-use
    internal permit; HTTP-supplied `qualified`/approval flags cannot create one.
 3. Durably records a new run ID and unique remote filename, then uploads that
@@ -147,7 +168,7 @@ A profile/device/source change or revoked qualification halts the flow. If it
 occurs after upload, an uploaded file can remain on the printer without a start.
 No print is automatically started by polling, receipt synchronization or recovery.
 
-## 6. Record the physical result, then the next unit
+## 6. Record the physical result, then the next plate
 
 Refresh the job's printer status. Idle or 100% progress alone is insufficient.
 The service must observe an explicit terminal result for its own SDCP task ID
@@ -155,18 +176,30 @@ and filename. A different task/file or a print started outside QuickPrint cannot
 complete this run.
 
 When the run needs review, use **Record run outcome**. Verify the stopped printer
-and record an outcome, notes and **0 or 1 printed order units**. One requires the
+and record an outcome, notes and **0 through N printed order units**, where N is
+this run's approved plate count. Any positive count requires the
 service's identified start and matching completed terminal evidence. Failed,
 cancelled or verified-not-started runs contribute zero. Neither telemetry alone
 nor a client-supplied completion object invents a printed count.
 
-The manager durably synchronizes `finish_print` or `fail_print`. With one unit
-recorded on a two-unit ticket, the portal returns to `queued` with one remaining;
-it does not start the next run. Reopen production review, check readiness and
-explicitly start that unit. Each run has a new local run ID, remote filename and
+The manager durably synchronizes `finish_print` with that explicit printed count,
+or `fail_print` with zero. The portal returns to `queued` while another full
+approved plate fits the remainder; it does not start the next run. Reopen
+production review, check readiness and explicitly start that plate.
+Each run has a new local run ID, remote filename and
 identified printer task. Starts/results also bind the current target identity.
 When all units of that target are recorded, the
 portal advances to `post_processing`.
+
+For example, a 20-unit target with a verified six-instance plate can use
+**6 + 6 + 6 + 2**. After the third confirmed six-unit result, the portal has two
+remaining and returns to `preparing`, clearing the old approval. A fresh portal
+read must match that exact completed local run and counts before QuickPrint
+releases its old preparation hold. Capture a plate requesting two copies, queue
+and confirm its fresh receipt, approve it and confirm readiness for the final
+run. Changing only a start count cannot turn the six-instance artifact into a
+two-instance plate. A lost result reply keeps the hold until exact replay and
+confirmation; an old release cannot clear a newer approval.
 
 These are printed-unit counts, not quality acceptance. Generic file-copy
 quantity stays separate, and no local `acceptedQuantity`/QC credit is granted.
@@ -247,7 +280,8 @@ separate from those counts.
 | Start acknowledgement/task identity missing or ambiguous | Hold the durable run in `needs_attention`/`result_unknown`; never retry the hardware start automatically, including after restart. Inspect the printer before reconciling. |
 | Unknown start later appears under a matching filename | A filename does not repair missing original start identity. Positive credit still requires the service's identified start/completion evidence. |
 | Portal response lost after a physical start/result | Keep the physical evidence locally and replay the same saved operation UUID, expected version and exact body. Do not repeat the physical action. |
-| Start/result writeback pending | Later evidence for that job waits for reconciliation; a new unit cannot overtake unconfirmed printed progress. |
+| Start/result writeback pending | Later evidence for that job waits for reconciliation; a new plate cannot overtake unconfirmed printed progress. |
+| Remaining units are fewer than this plate | Wait for confirmed result/fresh same-target progress, then capture and approve a smaller plate with a fresh receipt. |
 | Definite portal conflict/rejection | Review the saved operation and current ticket. A recorded local dismissal preserves history and does not undo a remote operation. Attempted uncertain writes require exact replay/reconciliation. |
 
 After independently verifying that an uncertain run did not start, or that a
@@ -261,15 +295,16 @@ All routes require the local QuickPrint access token:
 
 | Route | Operation |
 | --- | --- |
+| `POST /api/jobs/:id/resin/slice` | Reviewed sizing/profile request plus optional `plate:{copies,gapMm,marginMm}`; request count is an upper bound and cannot exceed the current remainder |
 | `GET /api/jobs/:id/resin/production` | Read current receipt/device qualification, binding JSON, plan and quantities |
 | `GET .../production/target` | Read the current studio target without slice/device qualification |
 | `POST .../production/target` | `{confirmedTarget:true, targetId}` using the UUID returned by GET; locally adopt that newer stopped, unapproved replacement/finishing target; no portal write |
 | `POST .../production/approve` | `{receiptId, confirmedWholeModel:true}`; review the exact plan and queue portal approval |
 | `POST .../production/withdraw` | `{receiptId?, reason}`; withdraw the exact stopped queued approval without resetting counts |
-| `POST .../production/dispatch` | `{confirmedReady:true}`; authorize and attempt one physical run |
-| `POST .../production/reconcile` | `{runId, outcome, printedParts, notes}`; record the exact stopped run and synchronize evidence |
+| `POST .../production/dispatch` | `{confirmedReady:true, receiptId, plannedParts:N}`; bind the displayed approved receipt/count and attempt one physical run; receipt/count are required for multi-copy plates |
+| `POST .../production/reconcile` | `{runId, outcome, printedParts, notes}`; record 0 through the approved N from this exact stopped run; positive counts require identified completion |
 
-Run `node --test tests/resin-dispatch.test.js tests/layr-production-flow.test.js`.
+Run `node --test tests/resin-plate-service.test.js tests/resin-dispatch.test.js tests/layr-production-flow.test.js tests/layr-plate-production-flow.test.js`.
 The core fixtures verify permits, bindings, authorization and hardware uncertainty.
 The flow suite exercises the local API/manager with injected hardware and runs
 actual private portal handlers/SQLite when the reviewed source is available;
@@ -282,7 +317,8 @@ No case uploads to or starts a real printer.
 
 Live portal migration/deployment/token setup and actual hardware qualification
 remain. The engine does not interpret free-text sizing, establish hollow/drain
-plans or certify self-intersection/cavity safety, infer arbitrary
-supports/finish requirements, or pack multiple source instances. Post-processing,
+plans or certify self-intersection/cavity safety, or infer arbitrary
+supports/finish requirements. Plate proof establishes explicit source-instance
+replication, not support strength, cure or physical acceptance. Post-processing,
 QC decisions, replacement allowance and delivery remain explicit studio/operator
 work; no automatic quality acceptance is inferred from printed-unit evidence.

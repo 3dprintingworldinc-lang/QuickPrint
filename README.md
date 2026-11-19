@@ -31,7 +31,7 @@ See [installation and operation](docs/INSTALLATION.md), [input integrations](doc
 
 Printer support depends on the available protocol and firmware. A printer being reachable on the LAN is not enough. The [connection requirements](docs/INSTALLATION.md#printer-connections) describe model, API, certificate and file-format restrictions. Protocol fixtures and application tests do not establish physical qualification of every listed printer or firmware.
 
-Quantities count repetitions of a file. If a prepared plate contains six parts and quantity is three, QuickPrint tracks three runs of that plate. It does not count or individually inspect the six parts. Each run needs a separate confirmed start; this version does not automatically run the remaining quantity.
+Generic job quantities count repetitions of a file. If a prepared plate contains six parts and quantity is three, QuickPrint tracks three runs of that plate. The separate qualified resin order flow binds an independently verified source-instance count to each plate and records printed order units after operator reconciliation. Each physical run needs a separate confirmed start; QuickPrint does not automatically start the remaining quantity.
 
 QuickPrint preserves PS AM Print's separation of intake, preparation, dispatch and production reconciliation. It implements these stages in a self-contained Node service. This is not a complete copy of PS AM's factory-specific deployment, automation or manufacturing policies. [Architecture and reuse](docs/ARCHITECTURE.md) describes the boundary and source provenance.
 
@@ -46,7 +46,7 @@ available with its newest-100-jobs limit.
 
 The callable **PrusaSlicer SLA -> SL1 -> UVtools GOO** pipeline evaluates explicit
 orientation candidates, validates every GOO layer and target parameter, and runs
-six print-issue checks. Named profile slots support separate resin settings;
+six print-issue checks. Up to 32 named profile slots support separate resin settings;
 customization saves validated profile/preset copies while preserving originals.
 STL/triangulated OBJ measurement supports explicit uniform factors or one
 source-axis target dimension, preserving original bytes and hashing the
@@ -56,11 +56,23 @@ CAD units convert to millimetres once; originals and conversion evidence stay bo
 Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 
+Explicit multi-copy resin plates reserve the native single-copy support/pad
+footprint, place copies on the printer pixel grid, and require every final GOO
+layer to equal the declared translated grayscale copies with matching physical
+parameters. The requested copy count is an upper bound; the captured result
+reports the number that actually fits. A real synthetic 20-copy file passed
+this proof and all six issue checks with supports/pad explicitly disabled.
+The supported three-copy request fit two copies, passed their copy proof and
+remained held on two islands. These file checks do not qualify physical output.
+
 Captured resin slices stay unqualified and cannot enter generic printer dispatch.
 The separate qualified resin flow requires current studio/device/profile
 authorization, local dispatch opt-in (off by default), and a new readiness
-confirmation for each one-unit run. Identified terminal telemetry and operator
+confirmation for each approved plate run. Identified terminal telemetry and operator
 printed counts update the portal's remaining quantity without granting QC credit.
+When the remaining quantity is smaller than the approved plate, preparation
+reopens for a smaller plate, fresh receipt and approval; for example, 20 units
+can use confirmed runs of 6 + 6 + 6 + 2.
 Queued preparation can be withdrawn for revision without resetting counts.
 Studio QC can authorize a bounded replacement target with separate current and
 lifetime production totals; it cannot turn printed counts into QC acceptance.
@@ -74,6 +86,7 @@ and have not been deployed.
 See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
 [qualified production steps](docs/RESIN-PRODUCTION.md),
 [headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
+[verified multi-copy plates](docs/RESIN-PLATES.md),
 [model sizing](docs/RESIN-SIZING.md),
 [STEP geometry preparation](docs/RESIN-CAD.md),
 [SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and

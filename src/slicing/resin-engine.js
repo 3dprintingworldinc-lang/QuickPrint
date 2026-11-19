@@ -85,7 +85,10 @@ async function loadProfile(profilePath) {
   if (!['0', '1'].includes(ini.supports_enable) || !['0', '1'].includes(ini.pad_enable)) throw fail('Explicit support and pad policies are required.', 'RESIN_PROFILE_INVALID');
   const orientations = profile.orientationCandidates;
   if (!Array.isArray(orientations) || !orientations.length || orientations.length > 4) throw fail('Provide one to four explicit orientation candidates.', 'RESIN_PROFILE_INVALID');
-  for (const candidate of orientations) for (const key of ['x', 'y', 'z']) numeric(candidate?.[key], `orientation ${key}`, -360, 360);
+  for (const candidate of orientations) for (const key of ['x', 'y', 'z']) {
+    numeric(candidate?.[key], `orientation ${key}`, -360, 360);
+    if (candidate[key] === 0) candidate[key] = 0;
+  }
   const properties = profile.uvtoolsProperties;
   const required = ['MachineName', 'LayerHeight', 'ExposureTime', 'BottomExposureTime', 'BottomLayerCount', 'BottomLiftHeight', 'LiftHeight', 'BottomLiftSpeed', 'LiftSpeed', 'RetractSpeed', 'LightPWM', 'BottomLightPWM'];
   if (!properties || typeof properties !== 'object' || required.some(key => !Object.hasOwn(properties, key))) throw fail('Explicit target resin exposure and movement properties are required.', 'RESIN_PROFILE_INVALID');
@@ -177,7 +180,9 @@ async function assertPreparedGeometry(inputGeometry, triangleCount) {
   return bytes;
 }
 
-async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable, uvtoolsExecutable, signal, unitScale = 1, sizing = { mode: 'original' }, timeoutMs = 15 * 60 * 1000 }, { run = runProcess, inspectGoo = require('./goo').inspectGoo } = {}) {
+async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable, uvtoolsExecutable, signal, unitScale = 1, sizing = { mode: 'original' }, plate, timeoutMs = 15 * 60 * 1000 }, { run = runProcess, inspectGoo = require('./goo').inspectGoo, preparePackedAttempt } = {}) {
+  const plateModule = require('./resin-plate-engine');
+  const plateOptions = plate === undefined ? undefined : plateModule.normalizeResinPlateOptions(plate);
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 60 * 60 * 1000) throw fail('Resin slicing timeout must be between one second and one hour.', 'RESIN_ENGINE_CONFIGURATION');
   if (![inputPath, outputDir, prusaExecutable, uvtoolsExecutable].every(value => typeof value === 'string' && path.isAbsolute(value))) throw fail('Resin engine file and executable paths must be absolute.', 'RESIN_ENGINE_CONFIGURATION');
   if (!/\.(stl|obj)$/i.test(inputPath)) throw fail('The headless resin engine accepts STL or OBJ.', 'RESIN_MODEL_FORMAT');
@@ -190,6 +195,7 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   const targetGeometry = { ...profile.expected, machineZMm: Number(loaded.ini.max_print_height) };
   const version = await run(prusaExecutable, ['--help'], { signal, timeoutMs: 15000 });
   if (!/^PrusaSlicer-[\d.]+/m.test(version) || !version.includes('--export-sla')) throw fail('PrusaSlicer SLA interface was not recognized.', 'RESIN_ENGINE_CONFIGURATION');
+  if (plateOptions && !/^PrusaSlicer-2\.9\.7(?:\s|$)/m.test(version)) throw fail('Packed placement is verified for PrusaSlicer 2.9.7 only.', 'RESIN_PLATE_PROVIDER_UNSUPPORTED');
   const coreVersion = (await run(uvtoolsExecutable, ['--core-version'], { signal, timeoutMs: 15000 })).trim();
   if (!/^\d+\.\d+\.\d+$/.test(coreVersion)) throw fail('UVtools core version was not recognized.', 'RESIN_ENGINE_CONFIGURATION');
   // UVtools 4.4.3 Program.Main returns 1 after every invoked command. Output
@@ -202,6 +208,9 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     ['quickprint-resin-engine', __filename], ['quickprint-goo-validator', path.join(__dirname, 'goo.js')],
     ['quickprint-resin-profiles', path.join(__dirname, 'resin-profiles.js')],
     ['quickprint-resin-geometry', path.join(__dirname, 'resin-geometry.js')],
+    ['quickprint-resin-plate-geometry', path.join(__dirname, 'resin-plate.js')],
+    ['quickprint-resin-plate-engine', path.join(__dirname, 'resin-plate-engine.js')],
+    ['quickprint-goo-plate-proof', path.join(__dirname, 'goo-plate.js')],
     ['quickprint-process-runner', path.join(__dirname, 'index.js')],
     ['quickprint-archive-validator', path.join(__dirname, 'psam', 'zip-inspection.js')],
   ]) binaryManifest.push({ name, sha256: hash(await fs.readFile(filename)) });
@@ -215,6 +224,36 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   await fs.writeFile(preparedInput, prepared.stl, { flag: 'wx' });
   await fs.writeFile(presetCopy, loaded.preset, { flag: 'wx' });
   const inputGeometry = { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds };
+  const capture = async (nativeInput, directory, packed = false, orientation = {}) => {
+    signal?.throwIfAborted();
+    const sl1Path = path.join(directory, 'prepared.sl1'), gooPath = path.join(directory, 'prepared.goo'), logs = {};
+    // Packed inputs already embody rotation and placement. Even a zero CLI
+    // rotation recentres STL object geometry in Prusa 2.9.7, so omit rotations.
+    const transform = packed ? ['--dont-arrange', '--no-ensure-on-bed', '--scale', '1', '--threads', '1', '--datadir', path.join(directory, 'prusa-data')] : ['--scale', '1', '--rotate-x', String(orientation.x), '--rotate-y', String(orientation.y), '--rotate', String(orientation.z)];
+    const nativePreset = packed ? orientation.presetPath : presetCopy;
+    logs.slicing = await run(prusaExecutable, ['--load', nativePreset, '--config-compatibility', 'disable', ...transform, '--export-sla', '--output', sl1Path, nativeInput], { signal, timeoutMs });
+    const sl1Stat = await fs.stat(sl1Path);
+    if (sl1Stat.size > MAX_BYTES) throw fail('SLA output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
+    const sl1 = inspectSl1(await fs.readFile(sl1Path), targetGeometry);
+    for (const key of ['supports_enable', 'pad_enable', 'hollowing_enable', 'layer_height', 'initial_layer_height', 'exposure_time', 'initial_exposure_time']) if (Number(sl1.effective[key]) !== Number(loaded.ini[key])) throw fail(`The slicer changed the requested ${key}.`, 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
+    if (packed) plateModule.assertPackedEffectiveSettings(sl1.effective, parseIni((await fs.readFile(nativePreset)).toString('utf8')));
+    signal?.throwIfAborted();
+    logs.conversion = await run(uvtoolsExecutable, ['--quiet', 'convert', sl1Path, 'GooFile', gooPath, '--no-overwrite'], uvOptions);
+    const scriptPath = path.join(directory, 'target-parameters.cs'), receiptPath = path.join(directory, 'target-parameters.receipt');
+    await fs.writeFile(scriptPath, parameterScript(profile.uvtoolsProperties, receiptPath, profileSha256), { flag: 'wx' });
+    logs.properties = await run(uvtoolsExecutable, ['--quiet', 'run', gooPath, scriptPath], uvOptions);
+    if ((await fs.readFile(receiptPath, 'utf8')) !== profileSha256) throw fail('Target parameters were not applied by the conversion engine.', 'RESIN_CONVERSION_MISMATCH', 502);
+    const gooStat = await fs.stat(gooPath);
+    if (gooStat.size > MAX_BYTES) throw fail('GOO output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
+    const inspection = inspectGoo(await fs.readFile(gooPath), { limits: { maxFileBytes: MAX_BYTES }, expected: { ...targetGeometry, machineName: profile.printerModel, exposureTimeSeconds: profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: profile.uvtoolsProperties.BottomLayerCount } });
+    if (inspection.perLayerSettings) throw fail('This engine requires a global exposure/movement profile; per-layer parameter changes need separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
+    assertTargetProperties(inspection, profile.uvtoolsProperties);
+    if (inspection.layerCount !== sl1.layerCount) throw fail('Conversion changed the layer count.', 'RESIN_CONVERSION_MISMATCH', 502);
+    const analysis = parseIssueReport(await run(uvtoolsExecutable, ['--quiet', 'print-issues', gooPath, ...CHECKS], uvOptions));
+    if (hash(await fs.readFile(gooPath)) !== inspection.sha256) throw fail('The resin artifact changed during analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
+    signal?.throwIfAborted();
+    return { filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: inspection.sha256, inspection, analysis, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256, logs };
+  };
   const attempts = [], rejectedOrientations = [];
   for (let index = 0; index < profile.orientationCandidates.length; index++) {
     signal?.throwIfAborted();
@@ -229,38 +268,23 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     }
     const directory = path.join(workDir, `attempt-${index + 1}`);
     await fs.mkdir(directory);
-    const sl1Path = path.join(directory, 'prepared.sl1'), gooPath = path.join(directory, 'prepared.goo');
-    const logs = {};
-    // Unit conversion, uniform resizing and one global origin translation are
-    // already in these measured STL bytes. Prusa receives rotations only.
-    logs.slicing = await run(prusaExecutable, ['--load', presetCopy, '--config-compatibility', 'disable', '--scale', '1', '--rotate-x', String(orientation.x), '--rotate-y', String(orientation.y), '--rotate', String(orientation.z), '--export-sla', '--output', sl1Path, preparedInput], { signal, timeoutMs });
-    const sl1Stat = await fs.stat(sl1Path);
-    if (sl1Stat.size > MAX_BYTES) throw fail('SLA output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
-    const sl1 = inspectSl1(await fs.readFile(sl1Path), targetGeometry);
-    for (const key of ['supports_enable', 'pad_enable', 'hollowing_enable', 'layer_height', 'initial_layer_height', 'exposure_time', 'initial_exposure_time']) if (Number(sl1.effective[key]) !== Number(loaded.ini[key])) throw fail(`The slicer changed the requested ${key}.`, 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
-    logs.conversion = await run(uvtoolsExecutable, ['--quiet', 'convert', sl1Path, 'GooFile', gooPath, '--no-overwrite'], uvOptions);
-    const scriptPath = path.join(directory, 'target-parameters.cs'), receiptPath = path.join(directory, 'target-parameters.receipt');
-    await fs.writeFile(scriptPath, parameterScript(profile.uvtoolsProperties, receiptPath, profileSha256), { flag: 'wx' });
-    logs.properties = await run(uvtoolsExecutable, ['--quiet', 'run', gooPath, scriptPath], uvOptions);
-    if ((await fs.readFile(receiptPath, 'utf8')) !== profileSha256) throw fail('Target parameters were not applied by the conversion engine.', 'RESIN_CONVERSION_MISMATCH', 502);
-    const gooStat = await fs.stat(gooPath);
-    if (gooStat.size > MAX_BYTES) throw fail('GOO output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
-    const inspection = inspectGoo(await fs.readFile(gooPath), { limits: { maxFileBytes: MAX_BYTES }, expected: { ...targetGeometry, machineName: profile.printerModel, exposureTimeSeconds: profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: profile.uvtoolsProperties.BottomLayerCount } });
-    if (inspection.perLayerSettings) throw fail('This engine requires a global exposure/movement profile; per-layer parameter changes need separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
-    assertTargetProperties(inspection, profile.uvtoolsProperties);
-    if (inspection.layerCount !== sl1.layerCount) throw fail('Conversion changed the layer count.', 'RESIN_CONVERSION_MISMATCH', 502);
-    const issueOutput = await run(uvtoolsExecutable, ['--quiet', 'print-issues', gooPath, ...CHECKS], uvOptions);
-    const analysis = parseIssueReport(issueOutput);
-    const finalHash = hash(await fs.readFile(gooPath));
-    if (finalHash !== inspection.sha256) throw fail('The resin artifact changed during analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
-    // One submitted source instance; this does not count disconnected geometry,
-    // physical parts, or accepted production units. No duplication flags are used.
-    const attempt = { modelCopiesPerRun: 1, sizingPlan: prepared.plan, inputGeometry, sourceOrientationGeometry, orientation, analysis, inspection, filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: finalHash, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256 };
+    let captured;
+    try {
+      captured = plateOptions ? await (preparePackedAttempt || plateModule.preparePackedResinAttempt)({ sourceNormalizedSTL: inputBytes, orientation, requested: plateOptions, profile, ini: loaded.ini, preset: loaded.preset, directory, render: capture, signal }) : { ...await capture(preparedInput, directory, false, orientation), modelCopiesPerRun: 1 };
+    } catch (failure) {
+      if (plateOptions && ['RESIN_PLATE_NO_CAPACITY', 'GOO_PLATE_CLIPPED', 'GOO_PLATE_IMAGE_MISMATCH'].includes(failure.code)) { rejectedOrientations.push({ orientation, sourceOrientationGeometry, reason: failure.code }); continue; }
+      throw failure;
+    }
+    const { logs, ...artifact } = captured;
+    const attempt = { ...artifact, sizingPlan: prepared.plan, inputGeometry, sourceOrientationGeometry, orientation };
     attempts.push(attempt);
     await fs.writeFile(path.join(directory, 'evidence.json'), JSON.stringify({ ...attempt, tool, profileSha256, logs }, null, 2));
-    if (analysis.passed) break;
+    if (attempt.analysis.passed) break;
   }
-  if (!attempts.length) throw fail('No requested orientation fits the selected printer’s rectangular XY bed and machine height.', 'RESIN_MODEL_OUT_OF_BOUNDS');
+  if (!attempts.length) {
+    if (plateOptions && rejectedOrientations.some(candidate => candidate.reason === 'GOO_PLATE_IMAGE_MISMATCH')) throw fail('No requested orientation produced a complete pixel-equivalent plate. Review orientation, spacing and profile before retrying.', 'RESIN_PLATE_NO_VERIFIED_CANDIDATE', 409);
+    throw fail('No requested orientation fits the selected printer’s rectangular XY bed and machine height.', 'RESIN_MODEL_OUT_OF_BOUNDS');
+  }
   const selected = attempts.find(attempt => attempt.analysis.passed) || attempts.reduce((best, attempt) => attempt.analysis.count < best.analysis.count ? attempt : best);
   signal?.throwIfAborted();
   // A later orientation's provider work must not invalidate an earlier winner.
@@ -268,9 +292,10 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   const selectedStat = await fs.stat(selected.filePath);
   if (!selectedStat.isFile() || selectedStat.size !== selected.bytes || selectedStat.size > MAX_BYTES || hash(await fs.readFile(selected.filePath)) !== selected.sha256) throw fail('The selected resin artifact changed after analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
   await assertPreparedGeometry(inputGeometry, prepared.plan.triangleCount);
+  if (selected.platePreparation) await plateModule.verifyResinPlatePreparation(await assertPreparedGeometry(inputGeometry, prepared.plan.triangleCount), selected.platePreparation, { profile, ini: loaded.ini, preset: loaded.preset, artifactBytes: await fs.readFile(selected.filePath), directory: workDir });
   if (hash(await fs.readFile(inputPath)) !== hash(original)) throw fail('The source model changed during resin slicing.', 'ORIGINAL_CHANGED', 409);
   signal?.throwIfAborted();
-  return { ...selected, status: selected.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, format: 'goo', sourceSha256: hash(original), profileSha256, printerId: profile.printerId, printerModel: profile.printerModel, material: profile.material, tool, rejectedOrientations, attempts: attempts.map(({ filePath, orientation, analysis, sourceOrientationGeometry }) => ({ filePath, orientation, analysis, sourceOrientationGeometry })), createdAt: new Date().toISOString() };
+  return { ...selected, status: selected.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, format: 'goo', sourceSha256: hash(original), profileSha256, printerId: profile.printerId, printerModel: profile.printerModel, material: profile.material, tool, rejectedOrientations, attempts: attempts.map(({ filePath, orientation, analysis, sourceOrientationGeometry, modelCopiesPerRun, platePreparation }) => ({ filePath, orientation, analysis, sourceOrientationGeometry, modelCopiesPerRun, ...(platePreparation ? { copiesRequested: platePreparation.requested.copies, layoutSha256: platePreparation.layout.layoutSha256 } : {}) })), createdAt: new Date().toISOString() };
 }
 
-module.exports = { prepareResin, loadProfile, parseIni, parseIssueReport, inspectSl1, parameterScript, assertTargetProperties };
+module.exports = { prepareResin, loadProfile, parseIni, parseIssueReport, inspectSl1, parameterScript, assertTargetProperties, verifyResinPlatePreparation: require('./resin-plate-engine').verifyResinPlatePreparation };

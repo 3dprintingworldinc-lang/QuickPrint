@@ -1284,6 +1284,7 @@ main {
   gap:17px
 }
 #resin-sizing-fields [hidden] { display:none !important }
+#resin-plate-spacing[hidden] { display:none !important }
 .field {
   display:flex;
   flex-direction:column;

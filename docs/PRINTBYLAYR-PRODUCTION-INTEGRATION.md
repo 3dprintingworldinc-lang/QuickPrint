@@ -5,7 +5,7 @@ integration in the private `3dprintingworldinc-lang/printbylayr` repository. The
 reviewable source is [draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15).
 The pushed portal branch is
 `codex/quickprint-production-api`, commit
-`039cfaa38aa0890e59e3b160278d7333551739a0`, based on main commit
+`e5c06d4d43fe2fec394451b42c656acb9e0194dd`, based on main commit
 `492e67198c4dc7f4161887877711456a4aed31cc`.
 
 No portal migration or production deployment has been performed. The private
@@ -19,10 +19,10 @@ repository and materialize the reviewed commit in a separate private directory:
 ```powershell
 git clone https://github.com/3dprintingworldinc-lang/printbylayr.git <private-checkout>
 git -C <private-checkout> fetch origin codex/quickprint-production-api
-git -C <private-checkout> switch --detach 039cfaa38aa0890e59e3b160278d7333551739a0
+git -C <private-checkout> switch --detach e5c06d4d43fe2fec394451b42c656acb9e0194dd
 git -C <private-checkout> diff --check
 $env:QUICKPRINT_PORTAL_SOURCE = '<absolute-private-checkout>'
-node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js
+node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js tests/layr-cad-intake-flow.test.js tests/layr-plate-production-flow.test.js
 ```
 
 Verify the checked-out SHA with `git -C <private-checkout> rev-parse HEAD` and
@@ -39,8 +39,12 @@ operation ledger; they add no migration beyond 0005 and 0006. Each replacement
 cycle has its own bounded print allowance and progress, with lifetime totals
 kept separately. See [the production workflow](RESIN-PRODUCTION.md).
 
-Both portal clients preserve STL, OBJ, STEP and STP sources and their receipt
-hashes during import. Local measurement and slicing support STL and triangulated
+Customer resin intake accepts STL, OBJ, STEP and STP. CAD uploads receive an
+explicit conversion-review message and remain eligible for the studio's manual
+quote workflow. Actual intake-to-payment tests cover STEP/STP with declared
+mm/in/m units, original model downloads and unqualified preparation receipts.
+Both portal clients preserve these source formats and their receipt hashes
+during import. Local measurement and slicing support STL and triangulated
 OBJ; STEP/STP use the separately verified [CAD transfer and tessellation
 workflow](RESIN-CAD.md). Intake itself preserves the original geometry for review.
 
@@ -51,6 +55,9 @@ contract tests. With `QUICKPRINT_PORTAL_SOURCE`, or the default local
 D1 SQL transactions and private model download path. The standalone tests
 always cover allowed actions, fingerprints, credentials, bounded downloads,
 unchanged retry bodies, lost-response ambiguity and receipt reconciliation.
+The plate flow also exercises 20 units as 6 + 6 + 6 + 2 against these actual
+handlers. A confirmed smaller remainder reopens preparation for a new plate and
+receipt; it cannot reuse the larger artifact or grant QC acceptance.
 
 The private portal branch's `docs/PRODUCTION-API.md` contains the complete request
 and response contract, migration, dedicated token setup, qualification bindings and

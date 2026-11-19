@@ -7,6 +7,11 @@ const issuers = new WeakMap();
 const fail = (message, code = 'LAYR_PRODUCTION_REVIEW_REQUIRED') => Object.assign(new Error(message), { status: 409, code });
 const filename = value => String(value || '').replaceAll('\\', '/').split('/').pop();
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+function plateParts(slice) {
+  const count = slice?.modelCopiesPerRun;
+  if (!Number.isSafeInteger(count) || count < 1 || count > 500) throw fail('Review a slice with a verified source-instance count.', 'LAYR_PLATE_COUNT_INVALID');
+  return count;
+}
 
 function context(manager, id, { sliceRequired = true } = {}) {
   if (manager.stopping || !manager.started) throw fail('Production inputs are stopped.', 'LAYR_OUTBOX_STOPPED');
@@ -45,10 +50,10 @@ function assertNoLocalRun(job) {
   if (job.currentRunId || ['printing', 'paused', 'dispatching', 'needs_attention'].includes(job.status)) throw fail('Resolve the physical resin run before changing its preparation.', 'LAYR_PHYSICAL_EVIDENCE_HELD');
 }
 function assertReceipt(job, slice, receipt, deviceFingerprint) {
-  if (slice.modelCopiesPerRun !== 1 || receipt?.kind !== 'slice' || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint ||
+  if (receipt?.kind !== 'slice' || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint ||
       receipt.sourceSha256 !== job.sha256 || receipt.profileSha256 !== slice.profileSha256 || receipt.printerId !== slice.printerId || receipt.printerModel !== slice.printerModel || receipt.material !== slice.material ||
       receipt.tool?.executableSha256 !== slice.tool?.executableSha256 || receipt.artifact?.sha256 !== slice.sha256 || receipt.artifact?.sizeBytes !== slice.bytes || receipt.artifact?.format !== slice.format ||
-      receipt.deviceFingerprint !== deviceFingerprint || receipt.partsPerRun !== 1) throw fail('The receipt must bind this exact single-model slice, profile and physical printer. Queue a new slice receipt if those details changed.', 'LAYR_RECEIPT_MISMATCH');
+      receipt.deviceFingerprint !== deviceFingerprint || receipt.partsPerRun !== plateParts(slice)) throw fail('The receipt must bind this exact slice, source-instance count, profile and physical printer. Queue a new slice receipt if those details changed.', 'LAYR_RECEIPT_MISMATCH');
 }
 function receiptIdFor(manager, job, explicit) {
   if (explicit) return explicit;
@@ -99,7 +104,7 @@ async function verifyQueuedProductionEvidence(manager, summary, command) {
     if (command.action === 'start_print') {
       if (run.receiptId !== data.receiptId || run.printerId !== data.printerId || run.artifactSha256 !== data.artifactSha256 || run.deviceFingerprint !== data.deviceFingerprint || run.plannedParts !== data.plannedParts || run.startEvidence.observedAt !== data.observedAt) throw fail('The saved physical start evidence does not match this operation.');
     } else if (!run.reconciliation || run.reconciliation.printedParts !== data.printedParts || (run.terminalEvidence?.observedAt || run.reconciliation.reviewedAt) !== data.observedAt ||
-      (command.action === 'finish_print' && (data.printedParts !== 1 || run.terminalEvidence?.outcome !== 'completed' || run.terminalEvidence.remoteId !== data.remoteId || filename(run.terminalEvidence.currentFile) !== filename(run.startEvidence.currentFile)))) throw fail('The saved operator count and identified terminal evidence do not match this operation.');
+      (command.action === 'finish_print' && (!Number.isSafeInteger(data.printedParts) || data.printedParts < 1 || data.printedParts > run.plannedParts || run.terminalEvidence?.outcome !== 'completed' || run.terminalEvidence.remoteId !== data.remoteId || filename(run.terminalEvidence.currentFile) !== filename(run.startEvidence.currentFile)))) throw fail('The saved operator count and identified terminal evidence do not match this operation.');
     return;
   }
   if (command.action !== 'approve_preparation') return;
@@ -159,6 +164,24 @@ async function processOutbox(manager, signal) {
     if (ticket.status !== 'preparing' || ticket.production?.approvedReceiptId != null || ticket.production?.approvedTargetId != null || targetFor(job, ticket).id !== localTargetId(job)) continue;
     await manager.service.applyResinPreparationWithdrawal(issuer(manager), job.id, { ticket, receiptId: command.data.receiptId, operationId: entry.operationId, withdrawalVersion: entry.confirmation.version });
   }
+  // A completed plate can leave fewer units than that immutable artifact holds.
+  // Only confirmed result evidence plus a fresh preparing projection releases
+  // its old approval; local reconciliation alone cannot unlock replacement.
+  for (const entry of status.filter(value => value.action === 'finish_print' && value.state === 'confirmed' && value.confirmation?.status === 'preparing')) {
+    if (signal?.aborted || manager.stopping) break;
+    const command = manager.outbox.command(entry.operationId);
+    const jobs = manager.service.snapshot().jobs.filter(job => belongs(job, entry) && job.order.ticketFingerprint === command.data.ticketFingerprint);
+    if (jobs.length !== 1) continue;
+    const job = jobs[0], run = job.runs.find(value => value.id === command.data.runId), remaining = entry.confirmation.progress?.remainingParts;
+    if (!run?.resolvedAt || run.plannedParts <= 1 || !Number.isSafeInteger(remaining) || remaining < 1 || remaining >= run.plannedParts || job.resinProduction?.remainderRelease?.runId === run.id || job.resinProduction?.plan?.receiptId !== run.receiptId) continue;
+    const plan = job.resinProduction.plan;
+    if (!['pending', 'approved'].includes(plan.approvalState) || (plan.approvalVersion || 0) >= entry.confirmation.version || (plan.approvalExpectedVersion || 0) >= entry.confirmation.version) continue;
+    const { config } = context(manager, job.id, { sliceRequired: false });
+    const { ticket } = await read(manager, options => manager.layrProductionClient.getTicket(config, job.order.portalJobId, options));
+    assertTicket(job, ticket);
+    if (ticket.status !== 'preparing' || ticket.production?.approvedReceiptId != null || ticket.production?.approvedTargetId != null || targetFor(job, ticket).id !== localTargetId(job) || ticket.production?.run?.runId !== run.id) continue;
+    await manager.service.applyResinPlateRemainder(issuer(manager), job.id, { ticket, runId: run.id, observedAt: new Date(manager.now()).toISOString() });
+  }
   return status;
 }
 
@@ -180,7 +203,7 @@ async function reviewProduction(manager, id, { receiptId } = {}) {
     hasActiveRun: Boolean(local.currentRunId), localStatus: local.status,
     checkedAt: qualification?.checkedAt, portalStatus: ticket.status, portalVersion: ticket.version, target, originalRequestedParts: job.order.requestedQuantity,
     requestedParts, printedParts, remainingParts: requestedParts - printedParts, totals: ticket.production?.totals,
-    partsPerRun: 1, modelCopiesPerRun: slice.modelCopiesPerRun, planReviewed: job.resinProduction?.plan?.receiptId === receiptId && localTargetId(job) === target.id,
+    partsPerRun: plateParts(slice), modelCopiesPerRun: slice.modelCopiesPerRun, planReviewed: job.resinProduction?.plan?.receiptId === receiptId && localTargetId(job) === target.id,
     binding: { profileSha256: slice.profileSha256, engineSha256: slice.tool.executableSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, format: slice.format, deviceFingerprint: device.deviceFingerprint },
     dispatchEnabled: manager.service.getSettings().resinEngine?.dispatchEnabled === true,
     ...(!qualification?.qualified ? { reason: 'The studio must qualify this exact engine, profile, resin and device signature.' } : {}) };
@@ -243,6 +266,7 @@ async function approvePreparation(manager, id, { receiptId, confirmedWholeModel 
   if (saved.existing) return manager.outbox.get(saved.existing.operationId);
   if (result.ticket.status !== 'preparing') throw fail('The order is no longer awaiting preparation approval.', 'LAYR_TICKET_CHANGED');
   if (target.requiredParts < 1 || result.ticket.production?.progress?.remainingParts === 0) throw fail('This target authorizes no remaining replacement printing.', 'LAYR_TARGET_COMPLETE');
+  if (plateParts(slice) > (result.ticket.production?.progress?.remainingParts ?? target.requiredParts)) throw fail('Prepare a smaller plate for the remaining production units before approval.', 'LAYR_PLATE_REMAINDER_REQUIRED');
   await manager.service.reviewResinProductionPlan(issuer(manager), id, { ticket: result.ticket, receipt: result.receipt, deviceFingerprint: device.deviceFingerprint, confirmedWholeModel: true });
   const operation = await manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: 'approve_preparation', id: job.order.portalJobId, version: result.ticket.version,
     data: { ticketFingerprint: job.order.ticketFingerprint, receiptId } }, saved.key);
@@ -286,7 +310,7 @@ async function withdrawPreparation(manager, id, request = {}) {
 
 async function syncRunEvidence(manager, id) {
   const { job, config } = context(manager, id, { sliceRequired: false });
-  const runs = job.runs.filter(run => run.receiptId && run.plannedParts === 1 && run.startEvidence);
+  const runs = job.runs.filter(run => run.receiptId && Number.isSafeInteger(run.plannedParts) && run.plannedParts >= 1 && run.plannedParts <= 500 && run.startEvidence);
   if (!runs.length) return [];
   const queued = [];
   for (const run of runs) {
@@ -305,7 +329,7 @@ async function syncRunEvidence(manager, id) {
       if (targetFor(job, ticket).id !== targetId) throw fail('The saved physical run belongs to a different production target.', 'LAYR_TARGET_CHANGED');
       queued.push(await manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: 'start_print', id: job.order.portalJobId, version: ticket.version,
         data: { ticketFingerprint: job.order.ticketFingerprint, receiptId: run.receiptId, runId: run.id, artifactSha256: run.artifactSha256, printerId: run.printerId,
-          remoteId: run.startEvidence.remoteId, observedAt: run.startEvidence.observedAt, deviceFingerprint: run.deviceFingerprint, plannedParts: 1, targetId } }, startKey));
+          remoteId: run.startEvidence.remoteId, observedAt: run.startEvidence.observedAt, deviceFingerprint: run.deviceFingerprint, plannedParts: run.plannedParts, targetId } }, startKey));
       break;
     }
     if (!matches) throw fail('The portal does not identify this local physical run. Reconcile its saved evidence before continuing.', 'LAYR_RUN_MISMATCH');
@@ -315,9 +339,9 @@ async function syncRunEvidence(manager, id) {
       throw fail('The portal is not awaiting a result for this run.', 'LAYR_RUN_MISMATCH');
     }
     const printedParts = run.reconciliation.printedParts;
-    if (![0, 1].includes(printedParts)) throw fail('The reconciled run has no explicit production unit count.');
-    if (printedParts === 1 && (run.terminalEvidence?.outcome !== 'completed' || run.terminalEvidence.remoteId !== run.startEvidence.remoteId || filename(run.terminalEvidence.currentFile) !== filename(run.startEvidence.currentFile))) throw fail('A printed unit requires identified completion telemetry.');
-    queued.push(await manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: printedParts === 1 ? 'finish_print' : 'fail_print', id: job.order.portalJobId, version: ticket.version,
+    if (!Number.isSafeInteger(printedParts) || printedParts < 0 || printedParts > run.plannedParts) throw fail('The reconciled run has no explicit production count within its approved plate.');
+    if (printedParts > 0 && (run.terminalEvidence?.outcome !== 'completed' || run.terminalEvidence.remoteId !== run.startEvidence.remoteId || filename(run.terminalEvidence.currentFile) !== filename(run.startEvidence.currentFile))) throw fail('Printed units require identified completion telemetry.');
+    queued.push(await manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: printedParts > 0 ? 'finish_print' : 'fail_print', id: job.order.portalJobId, version: ticket.version,
       data: { ticketFingerprint: job.order.ticketFingerprint, runId: run.id, remoteId: run.startEvidence.remoteId, observedAt: run.terminalEvidence?.observedAt || run.reconciliation.reviewedAt, printedParts, targetId } }, resultKey));
     break;
   }
@@ -330,11 +354,15 @@ async function syncAfterPhysicalAction(manager, id) {
     return { syncError: 'The physical result is saved locally; portal synchronization needs review.' };
   }
 }
-async function dispatchProduction(manager, id, { confirmedReady } = {}) {
-  if (confirmedReady !== true) throw fail('Confirm the physical printer is ready for one production unit.', 'CONFIRMATION_REQUIRED');
+async function dispatchProduction(manager, id, request = {}) {
+  if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedReady', 'receiptId', 'plannedParts'].includes(key))) throw fail('Confirm readiness for the reviewed production plate.', 'LAYR_PLATE_REVIEW_STALE');
+  const { confirmedReady, receiptId: expectedReceiptId, plannedParts } = request;
+  if (confirmedReady !== true) throw fail('Confirm the physical printer is ready for this approved production plate.', 'CONFIRMATION_REQUIRED');
   if (manager.service.getSettings().resinEngine?.dispatchEnabled !== true) throw fail('Qualified resin dispatch is disabled in Settings.', 'RESIN_DISPATCH_DISABLED');
   const { job, slice } = context(manager, id), receiptId = job.resinProduction?.plan?.receiptId;
-  if (!receiptId) throw fail('Review and approve this order’s single-unit production plan first.');
+  if (!receiptId) throw fail('Review and approve this order’s verified plate plan first.');
+  const count = plateParts(slice);
+  if ((count > 1 && (expectedReceiptId === undefined || plannedParts === undefined)) || (expectedReceiptId !== undefined && expectedReceiptId !== receiptId) || (plannedParts !== undefined && plannedParts !== count)) throw fail('The approved receipt or plate count changed after review. Refresh the production review before starting.', 'LAYR_PLATE_REVIEW_STALE');
   await processOutbox(manager); await syncRunEvidence(manager, id); await processOutbox(manager);
   const device = await manager.service.inspectResinPrinter(slice.printerId);
   const proof = await authority(manager, id, { receiptId, deviceFingerprint: device.deviceFingerprint });

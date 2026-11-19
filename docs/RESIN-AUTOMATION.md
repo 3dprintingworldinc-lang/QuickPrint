@@ -39,17 +39,21 @@ private-source test setup and deployment boundary.
    applies reviewed target parameters, validates every GOO layer and runs the six
    configured UVtools issue checks. The first candidate with no reported issues
    is retained. If none passes, the candidate with the fewest reports remains
-   visible for review. All results preserve source/profile/tool/artifact hashes.
+   visible for review. **Plate copies and spacing** optionally requests up to
+   500 source instances, bounded by the target's remaining units. The engine
+   reports the actual fit and proves every copy's final raster, including native
+   supports/pad. All results preserve source/profile/tool/artifact hashes.
 5. A validated, issue-free capture can be sent as `record_slice` preparation
    evidence through the durable outbox, manually or automatically on a connector
    poll. This records hashes and target metadata, not raw GOO bytes, approval for
    printing, or a completed order. Requested parts remain separate from file runs.
 6. After physical calibration outside the app, use **Review production
-   qualification** to confirm the exact studio binding, declare the whole model
-   as one ordered unit and approve the portal run plan. Enable qualified resin
+   qualification** to confirm the exact studio binding, declare each whole source
+   instance as one ordered unit and approve the verified plate plan. Enable qualified resin
    dispatch locally, then confirm readiness for each individual run. Matched
    printer task/file completion and an operator count feed durable portal
-   writeback; remaining units require separate starts.
+   writeback; remaining units require separate starts. A remainder smaller than
+   that plate reopens preparation for a smaller capture, fresh receipt and approval.
 7. Use **Reopen preparation** to withdraw a queued approval before revising
    sizing/profile settings, once physical evidence is resolved. Counts and run
    history remain. Studio QC can explicitly authorize a separate replacement
@@ -82,7 +86,7 @@ remained held on resin-trap reports. A copied profile changing only orientation
 to `(45,15,0)` produced 309 layers with zero reports across all six checks.
 That file remained unqualified; see the [CAD reproduction/evidence](RESIN-CAD.md#reproduce-a-file-only-verification).
 
-Named profile slots keep separate reviewed printer/resin settings while sharing
+Up to 32 named profile slots keep separate reviewed printer/resin settings while sharing
 provider executables and the timeout. Profile customization edits material,
 layer height, exposure/motion/PWM, support/pad policy and orientation candidates.
 Saving creates validated managed JSON/INI copies and updates only the selected
@@ -101,15 +105,31 @@ Embedded CAD units convert to mm once; source bytes and assembly placements are
 preserved. See [CAD preparation](RESIN-CAD.md) and
 [model sizing](RESIN-SIZING.md) for the mesh subset, limits and 6 mm reproduction.
 
-The engine records `modelCopiesPerRun: 1`, meaning one submitted source instance,
-not a physical-part or mesh-component count. The single-unit repeat plan requires an
-operator to declare that the whole model represents one order unit. Each run
-requires readiness confirmation; an identified completed run plus operator
-count can contribute one printed unit. Printed counts do not grant QC acceptance.
-Automatic packing is deliberately unavailable: a real Prusa `--duplicate 20`
-probe exited 0 but exported only ten cubes' material and ten separate footprints
-after bed-0 filtering. The [engine guide](HEADLESS-RESIN-ENGINE.md#source-copies-and-production-quantity)
-records the bounded probe and primary-source explanation.
+Without a plate request, the engine retains its single-source-instance path.
+With a plate request, `modelCopiesPerRun` is the actual verified fit, never the
+requested upper bound or a disconnected-component count. The operator declares
+that each whole source instance represents one order unit. Native reference
+slicing measures the full support/pad footprint; deterministic explicit 3MF
+instances use integer-pixel translations. Independent verification requires an
+exact grayscale union on every final GOO layer, matching layer schedules and
+physical settings, clear margins and separate footprints. It does not use
+Prusa's unsafe `--duplicate` overflow behavior.
+
+Real PrusaSlicer 2.9.7/UVtools 7.1.2 preparation produced 20 of 20 requested
+synthetic cubes, 60 layers and zero reports from all six issue checks with
+supports/pad explicitly disabled in a copied profile. The supported flat
+three-copy request fit two copies, passed their copy proof and stayed held on
+two islands. A tilted candidate failed exact raster equivalence and was rejected.
+Original files were preserved; all captures remain unqualified. See
+[plate proof and native evidence](RESIN-PLATES.md).
+
+Each approved plate needs a new readiness confirmation. An identified completed
+run plus the operator's count can contribute from zero through its approved
+number of units; failed/cancelled/not-started runs contribute zero. For a
+20-unit target on six-copy plates, confirmed production can proceed as
+6 + 6 + 6 + 2. The last two require a smaller capture, fresh device-bound receipt
+and approval after the portal confirms the preceding run and releases the old
+preparation. Printed counts do not grant QC acceptance.
 
 The outbox durably saves each operation UUID, expected ticket version and exact
 body before transmission. Lost responses and restart recovery replay those same
@@ -151,9 +171,9 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
 | Units and sizing | mm/in/m conversion; measured source axes; explicit uniform factor or one-axis target; normalized input hash/bounds | Resolve free text and unsupported nonuniform/complex CAD changes |
 | Mesh/solid policy | STL/triangulated OBJ measurement; source-bound STEP audit/tessellation; closed-mesh and analytic solid checks; preserved originals; SatelLite probe | General healing, non-solid/void-shell CAD, self-intersection and cavity/drain-hole/wall certification |
-| Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; one source instance per file | Customer support/finish requirements, physical support strength, arbitrary orientation and validated plate packing |
+| Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; native-footprint multi-copy layout with exact all-layer raster proof | Customer support/finish requirements, physical support strength and qualification; candidates without equivalent copy rasters are rejected |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
-| Profile customization | Named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |
+| Profile customization | Up to 32 named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |
 | Evidence synchronization | Durable slice/approval/start/result operations; exact UUID/body/version replay; optional automatic slice receipts | Deploy portal migration/API, provision scoped token and qualified bindings, verify live reconciliation |
 | Printer LAN | Conditional qualified resin run path; current server authority, local opt-in, per-run readiness, owned task/file identity; real read-only V1.5.6 calls | Actual upload/start/control and printer/resin/profile qualification; generic resin dispatch stays blocked |
 | Wash/cure/support removal | Requirements and portal production states remain available | Machine/operator evidence for the actual post-processing operations |
@@ -172,7 +192,8 @@ Local checks cover ticket eligibility/metadata, bounded model downloads,
 credential protection, receipt deduplication/restart recovery, production paging,
 actual private portal server transactions, durable outbox replay/conflicts,
 source/output identity, provider failures, profile constraints, cancellation,
-conditional resin permits, separate two-unit starts and exact physical-evidence
+conditional resin permits, verified multi-copy plates and partial-remainder
+recapture, separate starts and exact physical-evidence
 writeback after lost replies. Browser and Windows development-desktop checks cover
 the local workflows. Hardware tests use fixtures except for the separately
 recorded native slice exports and read-only printer observations.

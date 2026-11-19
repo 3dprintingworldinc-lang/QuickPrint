@@ -75,7 +75,7 @@ async function fixture(t, { autoSync = false, config = {}, loseResponse = false 
   const filePath = path.join(dataDir, 'jobs', local.id, 'resin-slicing', 'attempt-1', 'prepared.goo');
   await fs.mkdir(path.dirname(filePath), { recursive: true }); await fs.writeFile(filePath, bytes);
   const slice = {
-    format: 'goo', filePath, bytes: bytes.length, sha256: hash(bytes), sourceSha256: hash(MODEL), profileSha256: 'c'.repeat(64),
+    format: 'goo', modelCopiesPerRun: 1, filePath, bytes: bytes.length, sha256: hash(bytes), sourceSha256: hash(MODEL), profileSha256: 'c'.repeat(64),
     printerId: 'saturn-fixture', printerModel: 'ELEGOO Test', material: 'Reviewed test resin',
     tool: { name: 'PrusaSlicer + UVtools', version: '2.9.7 + 4.4.3', executableSha256: 'd'.repeat(64),
       binaryManifest: [{ name: 'private-binary', path: 'C:/private/install/UVtools.Core.dll', sha256: 'e'.repeat(64) }], executablePath: 'C:/private/install/slicer.exe' },

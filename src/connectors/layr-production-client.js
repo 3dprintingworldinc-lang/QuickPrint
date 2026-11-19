@@ -184,10 +184,18 @@ async function listPreparationJobs(input, { fetchImpl = fetch, signal } = {}) {
 function buildOrderMetadata(job, portalUrl, data) {
   projection(job);
   const specs = job.ticket.specifications;
+  // Only seed a fresh workspace from the immutable original target. A later
+  // replacement target needs its separate explicit local review/adoption.
+  const target = productionTarget(job);
+  const productionSnapshot = target?.kind === 'order' ? {
+    portalJobId: job.id, portalVersion: job.version, ticketFingerprint: ticketFingerprint(job),
+    target: structuredClone(target), progress: structuredClone(productionProgress(job)),
+  } : undefined;
   return {
     portalUrl: new URL(portalUrl).origin, portalJobId: job.id, portalVersion: job.version, reference: job.reference,
     ticketFingerprint: ticketFingerprint(job), requestedQuantity: specs.project.quantity, units: specs.file.units,
     production: structuredClone(specs.production), project: structuredClone(specs.project), apiMode: 'production',
+    ...(productionSnapshot ? { productionSnapshot } : {}),
     ...(data === undefined ? {} : { modelSha256: createHash('sha256').update(data).digest('hex') }),
   };
 }
