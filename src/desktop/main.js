@@ -33,6 +33,11 @@ function trustedSender(event) {
 }
 
 function installNativeBridge() {
+  ipcMain.handle('quickprint:open-layr-authorization', async (event, url) => {
+    trustedSender(event);
+    if (typeof url !== 'string' || !backend.isLayrAuthorizationUrl(url)) throw new Error('Start PrintByLayr sign-in from Inputs first.');
+    await shell.openExternal(url);
+  });
   ipcMain.handle('quickprint:version', (event) => { trustedSender(event); return app.getVersion(); });
   ipcMain.handle('quickprint:select-folder', async (event) => {
     trustedSender(event);

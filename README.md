@@ -35,6 +35,35 @@ Quantities count repetitions of a file. If a prepared plate contains six parts a
 
 QuickPrint preserves PS AM Print's separation of intake, preparation, dispatch and production reconciliation. It implements these stages in a self-contained Node service. This is not a complete copy of PS AM's factory-specific deployment, automation or manufacturing policies. [Architecture and reuse](docs/ARCHITECTURE.md) describes the boundary and source provenance.
 
+## Resin automation work in this branch
+
+QuickPrint imports paid preparation tickets through the scoped, paginated
+PrintByLayr production API and preserves approved requirements, model hashes and
+requested part counts. A durable outbox records validated slice receipts with
+stable operation IDs and expected versions, supports automatic synchronization,
+and retains conflicts for review. The legacy OAuth/MCP read connection remains
+available with its newest-100-jobs limit.
+
+The callable **PrusaSlicer SLA -> SL1 -> UVtools GOO** pipeline evaluates explicit
+orientation candidates, validates every GOO layer and target parameter, and runs
+six print-issue checks. Named profile slots support separate resin settings;
+customization saves validated profile/preset copies while preserving originals.
+Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
+SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
+
+Captured resin slices stay unqualified and cannot enter generic printer dispatch.
+The actual Saturn 4 Ultra 16K SDCP adapter was verified for read-only status and
+attributes; uploads, starts and physical output remain unqualified. Production
+still requires the portal update/token, resolved sizing/support instructions,
+printer/resin/profile calibration, post-processing and QC. The portal changes
+are in [private draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15)
+and have not been deployed.
+
+See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
+[headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
+[SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and
+[SDCP integration](docs/SDCP-INTEGRATION.md).
+
 ## Develop and build
 
 Use Node.js 22 or newer and the repository lockfile:

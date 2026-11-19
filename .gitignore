@@ -7,3 +7,6 @@ playwright-report/
 .env
 *.log
 data/
+_reference/
+scratch/
+integrations/

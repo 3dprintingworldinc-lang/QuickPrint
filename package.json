@@ -25,7 +25,8 @@
     "imapflow": "^1.0.195",
     "mailparser": "^3.7.4",
     "mqtt": "^5.14.1",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.0",

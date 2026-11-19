@@ -5,6 +5,13 @@ const { adapterError, endpoint } = require('./http');
 // Deliberately explicit: installed printer plugins are reviewed source modules,
 // never JavaScript loaded from a printer, imported job, or user-supplied path.
 const REGISTRY = {
+  sdcp: {
+    name: 'ELEGOO Resin / SDCP v3', module: './sdcp', constructor: 'SDCPAdapter',
+    description: 'SDCP v3 WebSocket status/control and HTTP resin-file transfer.',
+    requirements: 'Use the printer LAN address, SDCP discovery brand Id and mainboard ID. The observed Saturn 4 Ultra 16K uses port 3030 and firmware V1.5.6. Qualify the exact machine, resin profile and format before dispatch. Firmware-reported build dimensions may differ from the slicer profile. Transport fixtures do not establish physical print qualification.',
+    defaultPort: 3030, fields: ['host', 'port', 'mainboardId', 'brandId', 'model'],
+    formats: ['goo', 'ctb'],
+  },
   octoprint: {
     name: 'OctoPrint', module: './octoprint', constructor: 'OctoPrintAdapter',
     description: 'OctoPrint REST API for printers connected to an OctoPrint host.',

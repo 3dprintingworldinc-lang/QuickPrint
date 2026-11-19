@@ -10,6 +10,7 @@ const FILE_EXTENSIONS = new Set(['.stl', '.step', '.stp', '.obj', '.3mf', '.gcod
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const ACTIVE = new Set(['dispatching', 'printing', 'paused']);
 const OUTCOMES = new Set(['completed', 'failed', 'cancelled', 'not_started']);
+const RESIN_ANALYSIS_CHECKS = ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'];
 
 function text(value, maximum = 500) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').trim().slice(0, maximum);
@@ -42,7 +43,7 @@ function digest(value) {
 function configurationFingerprint(printer) {
   return digest(JSON.stringify({
     id: printer.id, type: printer.type, host: printer.host, port: printer.port,
-    serial: printer.serial, model: printer.model, capabilities: printer.capabilities, slicer: printer.slicer,
+    serial: printer.serial, model: printer.model, mainboardId: printer.mainboardId, brandId: printer.brandId, capabilities: printer.capabilities, slicer: printer.slicer,
   }));
 }
 
@@ -64,19 +65,46 @@ function slicerConfiguration(config, previous = {}) {
   return next;
 }
 
+function resinEngineConfiguration(config, previous = {}) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw error(400, 'Resin engine settings must be an object.', 'RESIN_ENGINE_CONFIGURATION');
+  const next = { ...previous };
+  for (const key of ['prusaExecutable', 'uvtoolsExecutable', 'profilePath']) {
+    if (config[key] === undefined) continue;
+    if (typeof config[key] !== 'string' || /[\0\r\n]/.test(config[key]) || config[key].length > 4000 || (config[key].trim() && !path.isAbsolute(config[key].trim()))) throw error(400, 'Resin engine files must use absolute local paths.', 'RESIN_ENGINE_CONFIGURATION');
+    next[key] = config[key].trim();
+  }
+  if (config.slots !== undefined) {
+    if (!Array.isArray(config.slots) || config.slots.length > 32) throw error(400, 'Configure at most 32 resin profile slots.', 'RESIN_PROFILE_SLOTS_INVALID');
+    const ids = new Set();
+    next.slots = config.slots.map(slot => {
+      if (!slot || typeof slot !== 'object' || Array.isArray(slot) || Object.keys(slot).some(key => !['id', 'name', 'profilePath'].includes(key)) ||
+          typeof slot.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(slot.id) || ids.has(slot.id) ||
+          typeof slot.name !== 'string' || !slot.name.trim() || slot.name.length > 100 || /[\u0000-\u001f\u007f]/.test(slot.name) ||
+          typeof slot.profilePath !== 'string' || !slot.profilePath.trim() || slot.profilePath.length > 4000 || /[\0\r\n]/.test(slot.profilePath) || !path.isAbsolute(slot.profilePath.trim())) throw error(400, 'Each resin slot needs a unique ID, name and absolute profile JSON path.', 'RESIN_PROFILE_SLOTS_INVALID');
+      ids.add(slot.id);
+      return { id: slot.id, name: slot.name.trim(), profilePath: slot.profilePath.trim() };
+    });
+  }
+  if (config.timeoutMs !== undefined) next.timeoutMs = integer(config.timeoutMs, 900000, 1000, 3600000);
+  return next;
+}
+
 class QuickPrintService extends EventEmitter {
-  constructor({ dataDir, adapters, slicer, seal, unseal } = {}) {
+  constructor({ dataDir, adapters, slicer, satellite, resinEngine, seal, unseal } = {}) {
     super();
     if (!dataDir) throw error(500, 'A QuickPrint data directory is required.');
     this.dataDir = path.resolve(dataDir);
     this.adapters = adapters;
     this.slicer = slicer;
+    this.satellite = satellite;
+    this.resinEngine = resinEngine;
     this.store = new StateStore({ dataDir: this.dataDir, seal, unseal });
     this._transaction = Promise.resolve();
     this._locks = new Map();
     this._adapterCache = new Map();
     this._operations = new Set();
     this._preparations = new Map();
+    this._pendingPreparations = new Set();
     this._closing = false;
     this._ready = false;
   }
@@ -88,6 +116,7 @@ class QuickPrintService extends EventEmitter {
       settings: {
         siteName: 'QuickPrint',
         slicer: { executable: '', kind: 'orca', profilePaths: [], extraArgs: [] },
+        resinEngine: { prusaExecutable: '', uvtoolsExecutable: '', profilePath: '', slots: [], timeoutMs: 900000 },
         intake: { enabled: false, port: 9732, token: crypto.randomBytes(32).toString('base64url') },
         pollIntervalMs: 10000,
       },
@@ -237,8 +266,22 @@ class QuickPrintService extends EventEmitter {
   getSettings({ secrets = false } = {}) { this._assertReady(); return secrets ? clone(this.state.settings) : publicValue(clone(this.state.settings)); }
   getConnectors({ secrets = false } = {}) { this._assertReady(); return secrets ? clone(this.state.connectors) : publicValue(clone(this.state.connectors)); }
 
-  async submit({ source = 'manual', sourceId, name, customer, quantity = 1, notes, files } = {}) {
+  async submit({ source = 'manual', sourceId, name, customer, quantity = 1, notes, files, order } = {}) {
     this._assertReady();
+    if (order !== undefined) {
+      if (!order || order.production?.printType !== 'resin' || !/^[a-f0-9]{64}$/.test(order.ticketFingerprint || '')
+        || !Number.isSafeInteger(order.requestedQuantity) || order.requestedQuantity < 1 || order.requestedQuantity > 500
+        || !['mm', 'in', 'm'].includes(order.units) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(order.portalJobId || '')
+        || !Number.isSafeInteger(order.portalVersion) || order.portalVersion < 1
+        || !Array.isArray(files) || files.length !== 1 || Number(quantity) !== 1 || files[0].quantity && files[0].quantity !== 1) {
+        throw error(400, 'A Layr resin import requires a verified ticket, specifications and one model file. Requested parts are tracked separately from print runs.', 'INVALID_PRODUCTION_TICKET');
+      }
+      let portal;
+      try { portal = new URL(order.portalUrl); } catch { throw error(400, 'The production ticket needs its portal origin.', 'INVALID_PRODUCTION_TICKET'); }
+      if (portal.protocol !== 'https:' || portal.origin !== order.portalUrl || source !== `layr:${portal.origin}` || sourceId !== `${order.portalJobId}:${order.ticketFingerprint}`) throw error(400, 'The production ticket and submission identity must match.', 'INVALID_PRODUCTION_TICKET');
+      if (!Buffer.isBuffer(files[0].data) || !/\.(stl|obj)$/i.test(files[0].name) || digest(files[0].data) !== order.modelSha256) throw error(400, 'The imported model must match its production ticket receipt.', 'MODEL_RECEIPT_MISMATCH');
+      order = clone(order);
+    }
     if (typeof source !== 'string' || source.length > 200 || (sourceId !== undefined && (typeof sourceId !== 'string' || sourceId.length > 1000))) {
       throw error(400, 'Source identity must be a string: source up to 200 characters, sourceId up to 1000.', 'SOURCE_IDENTITY');
     }
@@ -274,6 +317,7 @@ class QuickPrintService extends EventEmitter {
               quantity: file.quantity, completedQuantity: 0, acceptedQuantity: 0, remainingQuantity: file.quantity,
               pendingAcceptanceQuantity: 0, status: 'review', createdAt: now, updatedAt: now,
               inputPath, sha256: digest(file.data), bytes: file.data.length, runs: [], currentRunId: null,
+              ...(order ? { order, technology: 'resin' } : {}),
               history: [{ at: now, from: null, to: 'review', message: 'File received. Select a compatible printer and prepare it for review.' }],
             };
             jobs.push(job);
@@ -300,7 +344,7 @@ class QuickPrintService extends EventEmitter {
         throw error(409, 'Resolve this printer’s active or uncertain run before editing its connection.', 'PRINTER_BUSY');
       }
       const printer = { ...(previous || {}), id };
-      for (const key of ['name', 'type', 'host', 'model', 'serial', 'caCertificate', 'tlsFingerprint']) {
+      for (const key of ['name', 'type', 'host', 'model', 'serial', 'mainboardId', 'brandId', 'caCertificate', 'tlsFingerprint']) {
         if (config[key] !== undefined) printer[key] = text(config[key], key === 'caCertificate' ? 65536 : 1000);
       }
       for (const key of ['apiKey', 'password', 'accessCode']) {
@@ -415,6 +459,8 @@ class QuickPrintService extends EventEmitter {
   }
 
   _matchesRun(status, run) {
+    const type = run.printerType || this.state.printers.find(printer => printer.id === run.printerId)?.type;
+    if (type === 'sdcp') return Boolean(status.remoteId && run.remoteId && status.remoteId === run.remoteId && status.currentFile && run.remotePath && basename(status.currentFile) === basename(run.remotePath));
     if (status.remoteId && run.remoteId) return status.remoteId === run.remoteId;
     if (!status.currentFile || !run.remotePath) return false;
     return basename(status.currentFile) === basename(run.remotePath);
@@ -453,9 +499,232 @@ class QuickPrintService extends EventEmitter {
     }
   }
 
+  async _queueResinPreparation(id, keys, operation) {
+    this._assertReady();
+    const job = this._job(id);
+    if (this._preparations.has(id) || ACTIVE.has(job.status) || this._currentRun(job)) throw error(409, 'This job already has an active or queued preparation.', 'JOB_BUSY');
+    const controller = new AbortController();
+    this._preparations.set(id, controller);
+    this._pendingPreparations.add(id);
+    try {
+      return await this._withLocks(keys, () => {
+        controller.signal.throwIfAborted();
+        this._pendingPreparations.delete(id);
+        return operation(controller);
+      });
+    } finally {
+      if (this._preparations.get(id) === controller) {
+        this._preparations.delete(id);
+        this._pendingPreparations.delete(id);
+      }
+    }
+  }
+
+  async preprocessResinJob(id, { evaluate = true, fix, hollowThicknessMm } = {}) {
+    return this._queueResinPreparation(id, [`job:${id}`, 'satellite:preprocess', 'resin:engine'], async controller => {
+      const job = this._job(id);
+      if (job.technology !== 'resin') throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+      if (job.status !== 'review' || this._currentRun(job)) throw error(409, 'This ticket must be in review before probing preprocessing.', 'JOB_BUSY');
+      if (job.order.units !== 'mm') throw error(409, 'Convert and validate model units before SatelLite preprocessing. This probe accepts millimetres.', 'RESIN_UNIT_CONVERSION_REQUIRED');
+      try {
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          delete current.resinPreparation;
+          delete current.error;
+          this._transition(current, 'preparing', 'Probing SatelLite model preprocessing; no print file will be generated.');
+        });
+        const source = await fs.readFile(job.inputPath);
+        if (digest(source) !== job.sha256) throw error(409, 'The original model changed. Import it again.', 'ORIGINAL_CHANGED');
+        const implementation = this.satellite || require('../slicing/satellite');
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-preprocessing');
+        controller.signal.throwIfAborted();
+        const result = await implementation.preprocess({ inputPath: job.inputPath, outputDir, evaluate, fix, hollowThicknessMm, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (!result || !Array.isArray(result.files) || !result.files.length || result.files.length > 100 || !result.files.some(file => ['model', 'report'].includes(file?.kind))) throw error(502, 'SatelLite returned no captured model or report.', 'SATELLITE_NO_OUTPUT');
+        if (result.sourceSha256 !== job.sha256 || digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'Preprocessing source integrity could not be verified.', 'ORIGINAL_CHANGED');
+        for (const file of result.files) {
+          const relative = typeof file?.filePath === 'string' ? path.relative(outputDir, file.filePath) : '..';
+          if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw error(502, 'SatelLite output is outside its work directory.', 'INVALID_SATELLITE_OUTPUT');
+          const stat = await fs.lstat(file.filePath);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.bytes || stat.size > MAX_FILE_BYTES || digest(await fs.readFile(file.filePath)) !== file.sha256) throw error(502, 'SatelLite captured output integrity could not be verified.', 'INVALID_SATELLITE_OUTPUT');
+        }
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinPreparation = { ...result, status: 'captured_unqualified', printReady: false, finishedAt: this._now() };
+          delete current.error;
+          this._transition(current, 'review', 'Captured SatelLite output for inspection. Resin slicing and printer qualification remain pending.');
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id);
+          delete current.resinPreparation;
+          current.error = this._safeMessage(cause?.message || 'SatelLite preprocessing failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async _resinSliceFile(job, result = job.resinSlice) {
+    if (!result || result.format !== 'goo' || typeof result.filePath !== 'string' || !path.isAbsolute(result.filePath) || !/^[a-f0-9]{64}$/.test(result.sha256 || '')) throw error(409, 'No captured resin slice is available.', 'RESIN_SLICE_UNAVAILABLE');
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
+    const relative = path.relative(directory, result.filePath);
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw error(502, 'Resin output is outside its job work directory.', 'INVALID_RESIN_OUTPUT');
+    const stat = await fs.lstat(result.filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 512 * 1024 * 1024 || stat.size !== result.bytes) throw error(502, 'Resin output size or file type is invalid.', 'INVALID_RESIN_OUTPUT');
+    const realRelative = path.relative(await fs.realpath(directory), await fs.realpath(result.filePath));
+    if (!realRelative || realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw error(502, 'Resin output resolves outside its job work directory.', 'INVALID_RESIN_OUTPUT');
+    const bytes = await fs.readFile(result.filePath);
+    if (digest(bytes) !== result.sha256) throw error(409, 'The captured resin file changed. Slice this ticket again.', 'RESIN_ARTIFACT_CHANGED');
+    return bytes;
+  }
+
+  async sliceResinJob(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'profileSlotId'].includes(key))) throw error(400, 'Resin slicing accepts review confirmations and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    if (request.confirmedRequirements !== true || request.confirmedOriginalSize !== true) throw error(400, 'Confirm the ticket requirements, selected profile, and original model size before slicing.', 'RESIN_REVIEW_REQUIRED');
+    return this._queueResinPreparation(id, [`job:${id}`, 'resin:engine'], async controller => {
+      const job = this._job(id);
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint) throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before slicing.', 'JOB_BUSY');
+      const unitScale = { mm: 1, in: 25.4, m: 1000 }[job.order.units];
+      if (!unitScale) throw error(400, 'Resolve the model units before slicing.', 'RESIN_MODEL_UNITS');
+      const settings = resinEngineConfiguration(this.state.settings.resinEngine || {});
+      const slots = settings.slots || [];
+      let slot;
+      if (slots.length) {
+        slot = request.profileSlotId === undefined && slots.length === 1 ? slots[0] : slots.find(item => item.id === request.profileSlotId);
+        if (!slot) throw error(400, 'Choose a configured resin profile slot for this ticket.', 'RESIN_PROFILE_SLOT_REQUIRED');
+        settings.profilePath = slot.profilePath;
+      } else if (request.profileSlotId !== undefined) throw error(400, 'The selected resin profile slot no longer exists. Review the current Settings.', 'RESIN_PROFILE_SLOT_REQUIRED');
+      if (!['prusaExecutable', 'uvtoolsExecutable', 'profilePath'].every(key => settings[key])) throw error(400, 'Configure the resin engine executable and profile paths in Settings.', 'RESIN_ENGINE_CONFIGURATION');
+      try {
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id); delete current.resinSlice; delete current.error;
+          this._transition(current, 'preparing', 'Slicing the resin model with the reviewed local profile; no printer command is sent.');
+        });
+        if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Import it again.', 'ORIGINAL_CHANGED');
+        const module = require('../slicing/resin-engine');
+        const loaded = await module.loadProfile(settings.profilePath);
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-slicing');
+        const implementation = this.resinEngine || module;
+        controller.signal.throwIfAborted();
+        const result = await implementation.prepareResin({ inputPath: job.inputPath, outputDir, ...settings, unitScale, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (!result || !result.analysis || !Number.isSafeInteger(result.analysis.count) || result.analysis.count < 0 || result.analysis.passed !== (result.analysis.count === 0) || !Array.isArray(result.analysis.issues) || result.analysis.issues.length !== result.analysis.count || result.analysis.issues.some(issue => typeof issue !== 'string') || !Array.isArray(result.analysis.checks) || result.analysis.checks.length !== RESIN_ANALYSIS_CHECKS.length || RESIN_ANALYSIS_CHECKS.some(check => !result.analysis.checks.includes(check)) || result.sourceSha256 !== job.sha256 || result.profileSha256 !== loaded.profileSha256 || result.printerId !== loaded.profile.printerId || result.printerModel !== loaded.profile.printerModel || result.material !== loaded.profile.material || !result.tool || !/^[a-f0-9]{64}$/.test(result.tool.executableSha256 || '')) throw error(502, 'Resin slicing returned incomplete or mismatched evidence.', 'INVALID_RESIN_OUTPUT');
+        const bytes = await this._resinSliceFile(job, result);
+        const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
+        module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
+        if (inspection.perLayerSettings) throw error(502, 'Per-layer resin parameters require separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
+        if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The source model changed during slicing.', 'ORIGINAL_CHANGED');
+        controller.signal.throwIfAborted();
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinSlice = { ...result, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: true, ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale, units: current.order.units, ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
+          if (result.analysis.passed) delete current.error;
+          else current.error = `${result.analysis.count} resin print issue(s) require review. Inspect the captured file and change the model or profile before retrying.`;
+          this._transition(current, 'review', result.analysis.passed ? 'Resin slice captured. Printer/material qualification is still required.' : current.error);
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id); delete current.resinSlice;
+          current.error = this._safeMessage(cause?.message || 'Resin slicing failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async getResinSliceDownload(id) {
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (job.technology !== 'resin') throw error(409, 'Select a resin ticket.', 'RESIN_TICKET_REQUIRED');
+      await this._resinSliceFile(job);
+      if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Slice this ticket again.', 'ORIGINAL_CHANGED');
+      return { filePath: job.resinSlice.filePath, fileName: 'prepared-unqualified.goo', sha256: job.resinSlice.sha256, bytes: job.resinSlice.bytes };
+    });
+  }
+
+  _resinProfileSlot(id) {
+    if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw error(400, 'Choose a valid resin profile slot.', 'RESIN_PROFILE_SLOT_INVALID');
+    const slot = this.state.settings.resinEngine?.slots?.find(item => item.id === id);
+    if (!slot) throw error(404, 'Resin profile slot not found. Save the slot in Settings first.', 'RESIN_PROFILE_SLOT_NOT_FOUND');
+    return clone(slot);
+  }
+
+  async getResinProfileSlot(id) {
+    return this._withLocks([`resin:profile:${id}`], async () => {
+      const slot = this._resinProfileSlot(id);
+      const loaded = await require('../slicing/resin-engine').loadProfile(slot.profilePath);
+      if (JSON.stringify(this._resinProfileSlot(id)) !== JSON.stringify(slot)) throw error(409, 'This resin profile slot changed while loading. Refresh it before editing.', 'RESIN_PROFILE_SLOT_CHANGED');
+      return { slot, profile: require('../slicing/resin-profiles').profileView(loaded), profileSha256: loaded.profileSha256 };
+    });
+  }
+
+  async customizeResinProfileSlot(id, patch) {
+    return this._withLocks([`resin:profile:${id}`], async () => {
+      const slot = this._resinProfileSlot(id);
+      const { loadProfile } = require('../slicing/resin-engine');
+      const { customizeProfile, profileView } = require('../slicing/resin-profiles');
+      const loaded = await loadProfile(slot.profilePath);
+      let customization = patch;
+      if (patch && typeof patch === 'object' && !Array.isArray(patch) && Object.hasOwn(patch, 'expectedProfileSha256')) {
+        const { expectedProfileSha256, ...edits } = patch;
+        if (typeof expectedProfileSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedProfileSha256) || expectedProfileSha256 !== loaded.profileSha256) throw error(409, 'This resin profile changed since the editor loaded. Reload it before saving.', 'RESIN_PROFILE_SOURCE_CHANGED');
+        customization = edits;
+      }
+      const customized = customizeProfile(loaded, customization);
+      const managedRoot = path.resolve(this.dataDir, 'profiles', 'resin');
+      await fs.mkdir(managedRoot, { recursive: true, mode: 0o700 });
+      const rootRelative = path.relative(await fs.realpath(this.dataDir), await fs.realpath(managedRoot));
+      if (!rootRelative || rootRelative === '..' || rootRelative.startsWith(`..${path.sep}`) || path.isAbsolute(rootRelative)) throw error(409, 'Managed resin profiles must remain inside this workspace.', 'RESIN_PROFILE_PATH_INVALID');
+      const directory = await fs.mkdtemp(path.join(managedRoot, 'profile-'));
+      let saved = false;
+      try {
+        const profilePath = path.join(directory, 'profile.json');
+        await fs.writeFile(path.join(directory, 'preset.ini'), customized.preset, { flag: 'wx', mode: 0o600 });
+        await fs.writeFile(profilePath, JSON.stringify(customized.profile, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        // Validate the actual files that will be selected, not only the patch.
+        const snapshot = await loadProfile(profilePath);
+        if ((await loadProfile(slot.profilePath)).profileSha256 !== loaded.profileSha256) throw error(409, 'The source resin profile changed while editing. Reload it and retry.', 'RESIN_PROFILE_SOURCE_CHANGED');
+        const result = await this._mutate(() => {
+          this._assertReady();
+          let current;
+          try { current = this._resinProfileSlot(id); }
+          catch { throw error(409, 'This resin profile slot was removed while editing. Refresh Settings.', 'RESIN_PROFILE_SLOT_CHANGED'); }
+          if (JSON.stringify(current) !== JSON.stringify(slot)) throw error(409, 'This resin profile slot changed while editing. Reload it and retry.', 'RESIN_PROFILE_SLOT_CHANGED');
+          // Read current settings here so unrelated concurrent edits survive.
+          const selected = { ...current, profilePath };
+          this.state.settings.resinEngine.slots = this.state.settings.resinEngine.slots.map(item => item.id === id ? selected : item);
+          this._event({ type: 'settings', message: `Customized resin profile slot ${selected.name}; existing artifacts retain their recorded profile hashes.` });
+          return { slot: selected, profile: profileView(snapshot), profileSha256: snapshot.profileSha256 };
+        });
+        saved = true;
+        return result;
+      } finally {
+        if (!saved) {
+          // Only remove the uniquely created managed directory, never a source
+          // profile or a path supplied by an API request.
+          const relative = path.relative(managedRoot, path.resolve(directory));
+          if (relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) await fs.rm(directory, { recursive: true, force: true });
+        }
+      }
+    });
+  }
+
   async prepareJob(id, printerId) {
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
+      if (job.technology === 'resin' || job.order?.production?.printType === 'resin') throw error(409, 'Use Slice resin model with a reviewed resin engine profile for this ticket. Generic printer preparation is unavailable for resin.', 'RESIN_SLICING_UNAVAILABLE');
       const printer = this._printer(printerId);
       if (ACTIVE.has(job.status) || this._currentRun(job)) throw error(409, 'Resolve the current print run before preparing another artifact.', 'JOB_BUSY');
       if (job.acceptedQuantity >= job.quantity) throw error(409, 'This order already has its requested accepted quantity.', 'JOB_COMPLETE');
@@ -531,6 +800,7 @@ class QuickPrintService extends EventEmitter {
     if (confirmed !== true) throw error(400, 'Confirm the physical printer is ready before starting a print.', 'CONFIRMATION_REQUIRED');
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
+      if (job.technology === 'resin') throw error(409, 'Resin printer dispatch has not been qualified.', 'RESIN_DISPATCH_UNAVAILABLE');
       const printer = this._printer(printerId);
       if (job.status !== 'ready' || this._currentRun(job) || job.acceptedQuantity >= job.quantity) throw error(409, 'The job is not ready for another confirmed run.', 'JOB_NOT_READY');
       if (!job.artifact || job.printerId !== printerId || job.artifact.printerFingerprint !== configurationFingerprint(printer)) throw error(409, 'Prepare the file for this printer before dispatch.', 'PRINTER_MISMATCH');
@@ -554,7 +824,7 @@ class QuickPrintService extends EventEmitter {
       const remoteName = `qp-${id.slice(0, 8)}-${runId.slice(0, 8)}-${fileName(artifact.fileName)}`;
       await this._mutate(() => {
         const current = this._job(id);
-        current.runs.push({ id: runId, printerId, phase: 'uploading', createdAt: this._now(), artifactSha256: artifact.sha256, fileName: remoteName });
+        current.runs.push({ id: runId, printerId, printerType: printer.type, phase: 'uploading', createdAt: this._now(), artifactSha256: artifact.sha256, fileName: remoteName });
         current.currentRunId = runId;
         delete current.error;
         this._transition(current, 'dispatching', 'Dispatch intent saved; uploading one file-copy.', { runId });
@@ -614,6 +884,18 @@ class QuickPrintService extends EventEmitter {
     const printerId = this._job(id).printerId;
     const preparation = action === 'cancel' ? this._preparations.get(id) : null;
     if (preparation) preparation.abort(error(409, 'Preparation cancelled by the operator.', 'PREPARATION_CANCELLED'));
+    if (preparation && this._pendingPreparations.has(id)) {
+      // Pending resin work owns a queue gate but has not entered the engine.
+      // Persist cancellation now; its aborted callback will consume that gate
+      // only after its predecessors finish, preserving lock ordering.
+      return this._mutate(() => {
+        const job = this._job(id);
+        if (this._currentRun(job) || ACTIVE.has(job.status)) throw error(409, 'An active printer run must be controlled separately.', 'JOB_BUSY');
+        delete job.resinPreparation; delete job.resinSlice; delete job.error;
+        if (job.status !== 'cancelled') this._transition(job, 'cancelled', 'Queued resin preparation cancelled; the engine was not started.');
+        return publicValue(job);
+      });
+    }
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
       const run = this._currentRun(job);
@@ -706,6 +988,7 @@ class QuickPrintService extends EventEmitter {
       if (patch.slicer !== undefined) {
         next.slicer = slicerConfiguration(patch.slicer, next.slicer);
       }
+      if (patch.resinEngine !== undefined) next.resinEngine = resinEngineConfiguration(patch.resinEngine, next.resinEngine);
       if (patch.intake !== undefined) {
         if (!patch.intake || typeof patch.intake !== 'object' || Array.isArray(patch.intake)) throw error(400, 'Intake settings must be an object.');
         if (patch.intake.enabled !== undefined) next.intake.enabled = patch.intake.enabled === true;
@@ -727,12 +1010,20 @@ class QuickPrintService extends EventEmitter {
       const id = config.id || crypto.randomUUID();
       const previous = this.state.connectors.find((item) => item.id === id);
       if (config.id && !previous) throw error(404, 'Input connector not found.', 'CONNECTOR_NOT_FOUND');
-      if (!['folder', 'email'].includes(config.type || previous?.type)) throw error(400, 'Connector type must be folder or email.', 'CONNECTOR_TYPE');
+      if (!['folder', 'email', 'layr'].includes(config.type || previous?.type)) throw error(400, 'Connector type must be folder, email or layr.', 'CONNECTOR_TYPE');
       if (previous && config.type && config.type !== previous.type) throw error(409, 'A connector’s type cannot change. Create another connector.', 'CONNECTOR_TYPE_IMMUTABLE');
       const next = { ...(previous || {}), id, type: config.type || previous.type };
-      for (const key of ['name', 'path', 'host', 'username', 'mailbox']) if (config[key] !== undefined) next[key] = text(config[key], 4000);
+      for (const key of ['name', 'path', 'host', 'username', 'mailbox', 'portalUrl', 'clientId', 'expiresAt', 'apiMode']) if (config[key] !== undefined) next[key] = text(config[key], 4000);
       if (typeof config.password === 'string' && config.password.trim()) next.password = config.password;
-      for (const key of ['enabled', 'secure']) if (config[key] !== undefined) next[key] = config[key] === true;
+      for (const key of ['token', 'refreshToken']) if (typeof config[key] === 'string' && config[key].trim()) next[key] = config[key];
+      if (next.type === 'layr' && next.apiMode === 'production') {
+        delete next.refreshToken; delete next.expiresAt; delete next.clientId;
+      }
+      if (next.type === 'layr') {
+        require('../connectors/validation').validateConnector(next);
+        next.portalUrl = new URL(next.portalUrl).origin;
+      }
+      for (const key of ['enabled', 'secure', 'autoSyncPreparation']) if (config[key] !== undefined) next[key] = config[key] === true;
       for (const key of ['port', 'settleMs', 'pollIntervalMs']) if (config[key] !== undefined) next[key] = integer(config[key], undefined, key === 'settleMs' ? 0 : 1, key === 'port' ? 65535 : 86400000);
       if (config.defaults !== undefined) {
         if (!config.defaults || typeof config.defaults !== 'object' || Array.isArray(config.defaults)) throw error(400, 'Connector defaults must be an object.');

@@ -11,6 +11,7 @@ const { QuickPrintService } = require('./core/service');
 const adapterModule = require('./adapters');
 const slicerModule = require('./slicing');
 const { ConnectorManager, validateConnector } = require('./connectors');
+const { LayrOAuth } = require('./connectors/layr-oauth');
 const { version } = require('../package.json');
 
 const RENDERER = path.join(__dirname, 'renderer');
@@ -77,9 +78,11 @@ function localAddresses(port) {
 async function startServer(options = {}) {
   const dataDir = path.resolve(options.dataDir || process.env.QUICKPRINT_DATA_DIR || path.join(process.cwd(), 'data'));
   const token = options.token || crypto.randomBytes(32).toString('hex');
-  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, seal: options.seal, unseal: options.unseal });
+  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, satellite: options.satellite, resinEngine: options.resinEngine, seal: options.seal, unseal: options.unseal });
   await service.init();
-  const connectors = new ConnectorManager({ service });
+  const layrOAuth = options.layrOAuth || new LayrOAuth();
+  const connectors = new ConnectorManager({ service, layrOAuth, layrClient: options.layrClient, layrProductionClient: options.layrProductionClient, outbox: options.layrOutbox });
+  const layrConnections = new Map();
   let intakeServer = null, intakeError = null, intakeSignature = '', pollTimer, polling = false, pollOperation = null, maintenance = false, closed = false, backupOperation = null;
   const app = express();
   app.disable('x-powered-by');
@@ -94,18 +97,60 @@ async function startServer(options = {}) {
     next();
   });
   app.get('/api/health', (req, res) => res.json({ ok: true, app: 'QuickPrint', version }));
+  app.get('/integrations/layr/callback', async (req, res) => {
+    const pending = layrConnections.get(req.query.state);
+    if (!pending || pending.expiresAt < Date.now()) throw fail('This connection request expired. Start again from Inputs.', 400, 'OAUTH_STATE');
+    layrConnections.delete(req.query.state);
+    if (maintenance || closed) throw fail('QuickPrint is temporarily unavailable. Reconnect from Inputs.', 503);
+    if (req.query.error) {
+      layrOAuth.cancel?.(req.query.state);
+      throw fail('PrintByLayr sign-in was not completed. Reconnect from Inputs.', 400, 'OAUTH_DENIED');
+    }
+    const credentials = await layrOAuth.complete({ code: req.query.code, state: req.query.state, redirectUri: pending.redirectUri, issuer: req.query.iss });
+    if (maintenance || closed) throw fail('QuickPrint became unavailable during sign-in. Reconnect from Inputs.', 503);
+    // Re-read the target: a removed/replaced connector must never be resurrected.
+    if (pending.id && !service.getConnectors().some(item => item.id === pending.id && item.type === 'layr' && item.portalUrl === pending.portalUrl)) throw fail('This input changed while signing in. Start again from Inputs.', 409);
+    await service.saveConnector({ ...credentials, ...(pending.id ? { id: pending.id } : {}), type: 'layr', apiMode: 'mcp', name: 'PrintByLayr resin orders', enabled: true, pollIntervalMs: 60000 });
+    await connectors.reload();
+    res.type('html').send('<!doctype html><html lang="en"><meta charset="utf-8"><title>PrintByLayr connected</title><h1>PrintByLayr connected</h1><p>Return to QuickPrint. Paid resin tickets will appear in review after the next check.</p><a href="/">Open QuickPrint</a></html>');
+  });
   app.use('/api', authenticate(token));
   const maintenanceGuard = (req, res, next) => maintenance && !['GET', 'HEAD'].includes(req.method)
     ? res.status(503).json({ error: 'BACKUP_IN_PROGRESS', message: 'A workspace backup is in progress. Retry this request shortly.' }) : next();
   app.use('/api', maintenanceGuard);
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', maintenanceGuard);
-  app.get('/api/state', (req, res) => res.json({ ...service.snapshot(), adapterCatalog: adapterModule.adapterCatalog(), connectorStatus: connectors.status(), intakeStatus: { listening: Boolean(intakeServer), error: intakeError }, version }));
+  app.get('/api/state', (req, res) => res.json({ ...service.snapshot(), adapterCatalog: adapterModule.adapterCatalog(), connectorStatus: connectors.status(), productionOutbox: connectors.outbox.status(), intakeStatus: { listening: Boolean(intakeServer), error: intakeError }, version }));
+  app.post('/api/jobs/:id/resin/sync', async (req, res) => res.json(await connectors.queueSliceEvidence(req.params.id, { connectorId: req.body.connectorId, version: req.body.version })));
+  app.post('/api/integrations/layr/outbox/:id/dismiss', async (req, res) => res.json(await connectors.dismissOperation(req.params.id, { reason: req.body.reason })));
+  app.post('/api/integrations/layr/connect', async (req, res) => {
+    const existing = req.body.id ? service.getConnectors().find(item => item.id === req.body.id && item.type === 'layr') : null;
+    if (req.body.id && !existing) throw fail('PrintByLayr input not found.', 404);
+    if (existing?.apiMode === 'production') throw fail('Use the production machine token to reconnect this input.', 409);
+    const portalUrl = existing?.portalUrl || req.body.portalUrl;
+    const redirectUri = `http://127.0.0.1:${server.address().port}/integrations/layr/callback`;
+    for (const [key, item] of layrConnections) if (item.expiresAt < Date.now()) layrConnections.delete(key);
+    if (layrConnections.size >= 10) throw fail('Complete an existing sign-in request before starting another.', 429);
+    const connection = await layrOAuth.begin(portalUrl, redirectUri);
+    layrConnections.set(connection.state, { id: existing?.id, portalUrl: new URL(portalUrl).origin, authorizationUrl: connection.authorizationUrl, redirectUri, expiresAt: Date.now() + 10 * 60000 });
+    res.json({ authorizationUrl: connection.authorizationUrl });
+  });
   app.post('/api/jobs', requestLimits, upload.array('files', 10), maintenanceGuard, async (req, res) => res.status(201).json(await service.submit(submission(req, 'desktop'))));
   app.post('/api/printers', async (req, res) => res.json(await service.savePrinter(req.body)));
   app.delete('/api/printers/:id', async (req, res) => { await service.removePrinter(req.params.id); res.json({ ok: true }); });
   app.post('/api/printers/:id/test', async (req, res) => res.json(await service.testPrinter(req.params.id)));
   app.post('/api/jobs/:id/prepare', async (req, res) => res.json(await service.prepareJob(req.params.id, req.body.printerId)));
+  app.post('/api/jobs/:id/resin/preprocess', async (req, res) => res.json(await service.preprocessResinJob(req.params.id, req.body)));
+  app.post('/api/jobs/:id/resin/slice', async (req, res) => res.json(await service.sliceResinJob(req.params.id, req.body)));
+  app.get('/api/jobs/:id/resin/slice/download', async (req, res) => {
+    const artifact = await service.getResinSliceDownload(req.params.id);
+    const bytes = await fs.readFile(artifact.filePath);
+    if (bytes.length !== artifact.bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw fail('The resin slice changed before download.', 409, 'RESIN_ARTIFACT_CHANGED');
+    res.attachment(artifact.fileName).type('application/octet-stream').send(bytes);
+  });
+  app.get('/api/resin/satellite', async (req, res) => res.json(await (options.satellite || require('./slicing/satellite')).inspectInstallation()));
+  app.get('/api/resin/profiles/:id', async (req, res) => res.json(await service.getResinProfileSlot(req.params.id)));
+  app.put('/api/resin/profiles/:id', async (req, res) => res.json(await service.customizeResinProfileSlot(req.params.id, req.body)));
   app.post('/api/jobs/:id/dispatch', async (req, res) => res.json(await service.dispatchJob(req.params.id, req.body.printerId, { confirmed: req.body.confirmed === true })));
   app.post('/api/jobs/:id/control', async (req, res) => res.json(await service.controlJob(req.params.id, req.body.action)));
   app.post('/api/jobs/:id/reconcile', async (req, res) => res.json(await service.reconcileJob(req.params.id, req.body)));
@@ -169,7 +214,8 @@ async function startServer(options = {}) {
   app.post('/api/connectors', async (req, res) => {
     const existing = service.getConnectors({ secrets: true }).find(item => item.id === req.body.id) || {};
     const merged = { ...existing, ...req.body };
-    if (!merged.password && existing.password) merged.password = existing.password;
+    for (const key of ['password', 'token', 'refreshToken']) if (!merged[key] && existing[key]) merged[key] = existing[key];
+    if (merged.type === 'layr' && existing.portalUrl && merged.portalUrl !== existing.portalUrl) throw fail('Reconnect a new input to change the portal address.', 409);
     if (typeof validateConnector === 'function') validateConnector(merged);
     const result = await service.saveConnector(req.body);
     await connectors.reload();
@@ -247,6 +293,7 @@ async function startServer(options = {}) {
   }
   return {
     server, service, port: server.address().port, url: `http://127.0.0.1:${server.address().port}`, token,
+    isLayrAuthorizationUrl(url) { return [...layrConnections.values()].some(item => item.expiresAt > Date.now() && item.authorizationUrl === url); },
     async close() {
       if (closed) return; closed = true;
       clearInterval(pollTimer);
