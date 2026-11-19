@@ -48,6 +48,9 @@ The callable **PrusaSlicer SLA -> SL1 -> UVtools GOO** pipeline evaluates explic
 orientation candidates, validates every GOO layer and target parameter, and runs
 six print-issue checks. Named profile slots support separate resin settings;
 customization saves validated profile/preset copies while preserving originals.
+STL/triangulated OBJ measurement supports explicit uniform factors or one
+source-axis target dimension, preserving original bytes and hashing the
+normalized input. Resin STEP/STP is retained for review; tessellation is not implemented.
 Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 
@@ -56,6 +59,9 @@ The separate qualified resin flow requires current studio/device/profile
 authorization, local dispatch opt-in (off by default), and a new readiness
 confirmation for each one-unit run. Identified terminal telemetry and operator
 printed counts update the portal's remaining quantity without granting QC credit.
+Queued preparation can be withdrawn for revision without resetting counts.
+Studio QC can authorize a bounded replacement target with separate current and
+lifetime production totals; it cannot turn printed counts into QC acceptance.
 The actual Saturn 4 Ultra 16K SDCP adapter was verified for read-only status and
 attributes; uploads, starts and physical output remain unqualified. Production
 still requires the portal update/token, resolved sizing/support instructions,
@@ -66,6 +72,7 @@ and have not been deployed.
 See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
 [qualified production steps](docs/RESIN-PRODUCTION.md),
 [headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
+[model sizing](docs/RESIN-SIZING.md),
 [SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and
 [SDCP integration](docs/SDCP-INTEGRATION.md).
 

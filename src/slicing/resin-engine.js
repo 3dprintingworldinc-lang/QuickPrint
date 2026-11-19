@@ -7,8 +7,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { runProcess } = require('./index');
 const { inspectZip, readZipEntry } = require('./psam/zip-inspection');
+const { prepareResinGeometry, measureResinGeometry, measureResinOrientation, float32Tolerance } = require('./resin-geometry');
 
 const MAX_BYTES = 512 * 1024 * 1024;
+const MAX_MODEL_BYTES = 100 * 1024 * 1024;
 const ZIP_LIMITS = { maxArchiveBytes: MAX_BYTES, maxEntryBytes: 128 * 1024 * 1024, maxTotalUncompressedBytes: 1024 * 1024 * 1024, maxEntries: 25010, maxCompressionRatio: 10000 };
 const CHECKS = ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'];
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
@@ -28,6 +30,24 @@ function parseIni(contents) {
 function numeric(value, label, min, max) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < min || value > max) throw fail(`Invalid resin profile ${label}.`, 'RESIN_PROFILE_INVALID');
   return value;
+}
+
+function assertRectangularBed(ini, expected, code = 'RESIN_PROFILE_INVALID') {
+  const decimal = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+  const same = (a, b) => Math.abs(a - b) <= 0.000001;
+  const points = typeof ini.bed_shape === 'string' ? ini.bed_shape.split(',').map(point => point.trim().split('x')) : [];
+  if (![4, 5].includes(points.length) || points.some(point => point.length !== 2 || point.some(value => !decimal.test(value) || !Number.isFinite(Number(value))))) throw fail('Use an explicit rectangular SLA bed matching the printer display.', code);
+  const corners = points.map(point => point.map(Number));
+  if (corners.length === 5) {
+    if (!corners[4].every((value, axis) => same(value, corners[0][axis]))) throw fail('A closed SLA bed must repeat its first corner.', code);
+    corners.pop();
+  }
+  const target = [[0, 0], [expected.displayWidthMm, 0], [expected.displayWidthMm, expected.displayHeightMm], [0, expected.displayHeightMm]];
+  const indices = corners.map(point => target.findIndex(candidate => point.every((value, axis) => same(value, candidate[axis]))));
+  if (indices.includes(-1) || new Set(indices).size !== 4 || corners.some((point, index) => {
+    const next = corners[(index + 1) % corners.length];
+    return same(point[0], next[0]) === same(point[1], next[1]);
+  })) throw fail('The SLA bed must follow the four boundary corners at zero origin with the selected display dimensions.', code);
 }
 
 async function loadProfile(profilePath) {
@@ -53,6 +73,10 @@ async function loadProfile(profilePath) {
     if (key.startsWith('resolution') && !Number.isInteger(expected[key])) throw fail('Printer pixel dimensions must be whole numbers.', 'RESIN_PROFILE_INVALID');
     if (Number(ini[setting]) !== expected[key]) throw fail(`Printer geometry differs from the standalone preset: ${setting}.`, 'RESIN_PROFILE_INVALID');
   }
+  assertRectangularBed(ini, expected);
+  const machineZMm = Number(ini.max_print_height);
+  numeric(machineZMm, 'max_print_height', 0.001, 10000);
+  if (Object.hasOwn(expected, 'machineZMm') && (typeof expected.machineZMm !== 'number' || expected.machineZMm !== machineZMm)) throw fail('Machine height differs from the standalone preset.', 'RESIN_PROFILE_INVALID');
   if (expected.resolutionX * expected.resolutionY > 100000000) throw fail('Printer resolution exceeds this engine’s resource limit.', 'RESIN_PROFILE_INVALID');
   for (const [key, setting] of [['mirrorX', 'display_mirror_x'], ['mirrorY', 'display_mirror_y']]) {
     if (typeof expected[key] !== 'boolean' || ini[setting] !== String(Number(expected[key]))) throw fail(`Explicit ${setting} must match the printer geometry.`, 'RESIN_PROFILE_INVALID');
@@ -124,19 +148,46 @@ function inspectSl1(buffer, expected) {
   if (ini.printer_technology !== 'SLA' || Number(config.layerHeight) !== expected.layerHeightMm) throw fail('SLA archive technology or layer height differs from the selected profile.', 'RESIN_ARCHIVE_INVALID', 502);
   const fields = { resolutionX: 'display_pixels_x', resolutionY: 'display_pixels_y', displayWidthMm: 'display_width', displayHeightMm: 'display_height', layerHeightMm: 'layer_height' };
   for (const [field, key] of Object.entries(fields)) if (Number(ini[key]) !== expected[field]) throw fail(`Effective SLA profile changed ${key}.`, 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
+  assertRectangularBed(ini, expected, 'RESIN_EFFECTIVE_PROFILE_MISMATCH');
+  if (!Number.isFinite(Number(ini.max_print_height)) || Number(ini.max_print_height) <= 0 || (expected.machineZMm !== undefined && Number(ini.max_print_height) !== expected.machineZMm)) throw fail('Effective SLA profile changed machine height.', 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
   if (ini.display_orientation !== 'landscape' || ini.display_mirror_x !== String(Number(expected.mirrorX)) || ini.display_mirror_y !== String(Number(expected.mirrorY))) throw fail('Effective SLA profile changed image orientation.', 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
   return { layerCount: layers.length, sha256: hash(buffer), effectivePresetSha256: hash(get('prusaslicer.ini')), effective: ini };
 }
 
-async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable, uvtoolsExecutable, signal, unitScale = 1, timeoutMs = 15 * 60 * 1000 }, { run = runProcess, inspectGoo = require('./goo').inspectGoo } = {}) {
+async function assertPreparedGeometry(inputGeometry, triangleCount) {
+  // Read through one file handle into the known, bounded size. A changed file
+  // cannot cause an unbounded read between stat and validation.
+  const file = await fs.open(inputGeometry.filePath, 'r');
+  let bytes;
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size !== inputGeometry.bytes || stat.size > MAX_MODEL_BYTES) throw fail('The prepared input mesh changed before slicing.', 'RESIN_INPUT_GEOMETRY_CHANGED', 409);
+    bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = await file.read(bytes, offset, bytes.length - offset, offset);
+      if (!read.bytesRead) throw fail('The prepared input mesh was truncated.', 'RESIN_INPUT_GEOMETRY_CHANGED', 409);
+      offset += read.bytesRead;
+    }
+    const extra = Buffer.alloc(1);
+    if ((await file.read(extra, 0, 1, offset)).bytesRead || hash(bytes) !== inputGeometry.sha256) throw fail('The prepared input mesh changed before slicing.', 'RESIN_INPUT_GEOMETRY_CHANGED', 409);
+  } finally { await file.close(); }
+  const measured = measureResinGeometry(bytes, { format: 'stl', units: 'mm', limits: { maxBytes: MAX_MODEL_BYTES } });
+  if (measured.triangleCount !== triangleCount || JSON.stringify(measured.sourceBounds) !== JSON.stringify(inputGeometry.bounds)) throw fail('The prepared input mesh does not match its measured sizing evidence.', 'RESIN_INPUT_GEOMETRY_CHANGED', 409);
+  return bytes;
+}
+
+async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable, uvtoolsExecutable, signal, unitScale = 1, sizing = { mode: 'original' }, timeoutMs = 15 * 60 * 1000 }, { run = runProcess, inspectGoo = require('./goo').inspectGoo } = {}) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 60 * 60 * 1000) throw fail('Resin slicing timeout must be between one second and one hour.', 'RESIN_ENGINE_CONFIGURATION');
   if (![inputPath, outputDir, prusaExecutable, uvtoolsExecutable].every(value => typeof value === 'string' && path.isAbsolute(value))) throw fail('Resin engine file and executable paths must be absolute.', 'RESIN_ENGINE_CONFIGURATION');
   if (!/\.(stl|obj)$/i.test(inputPath)) throw fail('The headless resin engine accepts STL or OBJ.', 'RESIN_MODEL_FORMAT');
   if (![1, 25.4, 1000].includes(unitScale)) throw fail('Model units must be explicitly converted from mm, inches or metres.', 'RESIN_MODEL_UNITS');
   const original = await fs.readFile(inputPath);
-  if (!original.length || original.length > 100 * 1024 * 1024) throw fail('Resin models must be nonempty and at most 100 MiB.', 'RESIN_MODEL_SIZE');
+  if (!original.length || original.length > MAX_MODEL_BYTES) throw fail('Resin models must be nonempty and at most 100 MiB.', 'RESIN_MODEL_SIZE');
+  const prepared = prepareResinGeometry(original, { format: path.extname(inputPath).slice(1).toLowerCase(), units: { 1: 'mm', 25.4: 'in', 1000: 'm' }[unitScale], sizing, limits: { maxBytes: MAX_MODEL_BYTES } });
   const loaded = await loadProfile(profilePath);
   const { profile, profileSha256 } = loaded;
+  const targetGeometry = { ...profile.expected, machineZMm: Number(loaded.ini.max_print_height) };
   const version = await run(prusaExecutable, ['--help'], { signal, timeoutMs: 15000 });
   if (!/^PrusaSlicer-[\d.]+/m.test(version) || !version.includes('--export-sla')) throw fail('PrusaSlicer SLA interface was not recognized.', 'RESIN_ENGINE_CONFIGURATION');
   const coreVersion = (await run(uvtoolsExecutable, ['--core-version'], { signal, timeoutMs: 15000 })).trim();
@@ -150,6 +201,7 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     ['uvtools-console', uvtoolsExecutable], ['uvtools-command', path.join(path.dirname(uvtoolsExecutable), 'UVtoolsCmd.dll')], ['uvtools-core', path.join(path.dirname(uvtoolsExecutable), 'UVtools.Core.dll')],
     ['quickprint-resin-engine', __filename], ['quickprint-goo-validator', path.join(__dirname, 'goo.js')],
     ['quickprint-resin-profiles', path.join(__dirname, 'resin-profiles.js')],
+    ['quickprint-resin-geometry', path.join(__dirname, 'resin-geometry.js')],
     ['quickprint-process-runner', path.join(__dirname, 'index.js')],
     ['quickprint-archive-validator', path.join(__dirname, 'psam', 'zip-inspection.js')],
   ]) binaryManifest.push({ name, sha256: hash(await fs.readFile(filename)) });
@@ -157,21 +209,34 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   await fs.mkdir(outputDir, { recursive: true });
   const workDir = await fs.mkdtemp(path.join(outputDir, 'resin-'));
   const sourceCopy = path.join(workDir, `source${path.extname(inputPath).toLowerCase()}`);
+  const preparedInput = path.join(workDir, 'prepared-input.stl');
   const presetCopy = path.join(workDir, 'preset.ini');
   await fs.writeFile(sourceCopy, original, { flag: 'wx' });
+  await fs.writeFile(preparedInput, prepared.stl, { flag: 'wx' });
   await fs.writeFile(presetCopy, loaded.preset, { flag: 'wx' });
-  const attempts = [];
+  const inputGeometry = { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds };
+  const attempts = [], rejectedOrientations = [];
   for (let index = 0; index < profile.orientationCandidates.length; index++) {
     signal?.throwIfAborted();
+    const inputBytes = await assertPreparedGeometry(inputGeometry, prepared.plan.triangleCount);
+    signal?.throwIfAborted();
+    const orientation = profile.orientationCandidates[index];
+    const sourceOrientationGeometry = measureResinOrientation(inputBytes, { format: 'stl', units: 'mm', orientation });
+    const targetDimensions = { x: targetGeometry.displayWidthMm, y: targetGeometry.displayHeightMm, z: targetGeometry.machineZMm };
+    if (Object.keys(targetDimensions).some(axis => sourceOrientationGeometry.dimensionsMm[axis] - targetDimensions[axis] > float32Tolerance(targetDimensions[axis]))) {
+      rejectedOrientations.push({ orientation, sourceOrientationGeometry, reason: 'RESIN_MODEL_OUT_OF_BOUNDS' });
+      continue;
+    }
     const directory = path.join(workDir, `attempt-${index + 1}`);
     await fs.mkdir(directory);
     const sl1Path = path.join(directory, 'prepared.sl1'), gooPath = path.join(directory, 'prepared.goo');
-    const orientation = profile.orientationCandidates[index];
     const logs = {};
-    logs.slicing = await run(prusaExecutable, ['--load', presetCopy, '--config-compatibility', 'disable', '--scale', String(unitScale), '--rotate-x', String(orientation.x), '--rotate-y', String(orientation.y), '--rotate', String(orientation.z), '--export-sla', '--output', sl1Path, sourceCopy], { signal, timeoutMs });
+    // Unit conversion, uniform resizing and one global origin translation are
+    // already in these measured STL bytes. Prusa receives rotations only.
+    logs.slicing = await run(prusaExecutable, ['--load', presetCopy, '--config-compatibility', 'disable', '--scale', '1', '--rotate-x', String(orientation.x), '--rotate-y', String(orientation.y), '--rotate', String(orientation.z), '--export-sla', '--output', sl1Path, preparedInput], { signal, timeoutMs });
     const sl1Stat = await fs.stat(sl1Path);
     if (sl1Stat.size > MAX_BYTES) throw fail('SLA output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
-    const sl1 = inspectSl1(await fs.readFile(sl1Path), profile.expected);
+    const sl1 = inspectSl1(await fs.readFile(sl1Path), targetGeometry);
     for (const key of ['supports_enable', 'pad_enable', 'hollowing_enable', 'layer_height', 'initial_layer_height', 'exposure_time', 'initial_exposure_time']) if (Number(sl1.effective[key]) !== Number(loaded.ini[key])) throw fail(`The slicer changed the requested ${key}.`, 'RESIN_EFFECTIVE_PROFILE_MISMATCH', 502);
     logs.conversion = await run(uvtoolsExecutable, ['--quiet', 'convert', sl1Path, 'GooFile', gooPath, '--no-overwrite'], uvOptions);
     const scriptPath = path.join(directory, 'target-parameters.cs'), receiptPath = path.join(directory, 'target-parameters.receipt');
@@ -180,7 +245,7 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     if ((await fs.readFile(receiptPath, 'utf8')) !== profileSha256) throw fail('Target parameters were not applied by the conversion engine.', 'RESIN_CONVERSION_MISMATCH', 502);
     const gooStat = await fs.stat(gooPath);
     if (gooStat.size > MAX_BYTES) throw fail('GOO output exceeds 512 MiB.', 'RESIN_OUTPUT_SIZE');
-    const inspection = inspectGoo(await fs.readFile(gooPath), { limits: { maxFileBytes: MAX_BYTES }, expected: { ...profile.expected, machineName: profile.printerModel, exposureTimeSeconds: profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: profile.uvtoolsProperties.BottomLayerCount } });
+    const inspection = inspectGoo(await fs.readFile(gooPath), { limits: { maxFileBytes: MAX_BYTES }, expected: { ...targetGeometry, machineName: profile.printerModel, exposureTimeSeconds: profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: profile.uvtoolsProperties.BottomLayerCount } });
     if (inspection.perLayerSettings) throw fail('This engine requires a global exposure/movement profile; per-layer parameter changes need separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
     assertTargetProperties(inspection, profile.uvtoolsProperties);
     if (inspection.layerCount !== sl1.layerCount) throw fail('Conversion changed the layer count.', 'RESIN_CONVERSION_MISMATCH', 502);
@@ -190,20 +255,22 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     if (finalHash !== inspection.sha256) throw fail('The resin artifact changed during analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
     // One submitted source instance; this does not count disconnected geometry,
     // physical parts, or accepted production units. No duplication flags are used.
-    const attempt = { modelCopiesPerRun: 1, orientation, analysis, inspection, filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: finalHash, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256 };
+    const attempt = { modelCopiesPerRun: 1, sizingPlan: prepared.plan, inputGeometry, sourceOrientationGeometry, orientation, analysis, inspection, filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: finalHash, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256 };
     attempts.push(attempt);
     await fs.writeFile(path.join(directory, 'evidence.json'), JSON.stringify({ ...attempt, tool, profileSha256, logs }, null, 2));
     if (analysis.passed) break;
   }
+  if (!attempts.length) throw fail('No requested orientation fits the selected printer’s rectangular XY bed and machine height.', 'RESIN_MODEL_OUT_OF_BOUNDS');
   const selected = attempts.find(attempt => attempt.analysis.passed) || attempts.reduce((best, attempt) => attempt.analysis.count < best.analysis.count ? attempt : best);
   signal?.throwIfAborted();
   // A later orientation's provider work must not invalidate an earlier winner.
   // Recheck the artifact we actually return, not only the last attempted file.
   const selectedStat = await fs.stat(selected.filePath);
   if (!selectedStat.isFile() || selectedStat.size !== selected.bytes || selectedStat.size > MAX_BYTES || hash(await fs.readFile(selected.filePath)) !== selected.sha256) throw fail('The selected resin artifact changed after analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
+  await assertPreparedGeometry(inputGeometry, prepared.plan.triangleCount);
   if (hash(await fs.readFile(inputPath)) !== hash(original)) throw fail('The source model changed during resin slicing.', 'ORIGINAL_CHANGED', 409);
   signal?.throwIfAborted();
-  return { ...selected, status: selected.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, format: 'goo', sourceSha256: hash(original), profileSha256, printerId: profile.printerId, printerModel: profile.printerModel, material: profile.material, tool, attempts: attempts.map(({ filePath, orientation, analysis }) => ({ filePath, orientation, analysis })), createdAt: new Date().toISOString() };
+  return { ...selected, status: selected.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, format: 'goo', sourceSha256: hash(original), profileSha256, printerId: profile.printerId, printerModel: profile.printerModel, material: profile.material, tool, rejectedOrientations, attempts: attempts.map(({ filePath, orientation, analysis, sourceOrientationGeometry }) => ({ filePath, orientation, analysis, sourceOrientationGeometry })), createdAt: new Date().toISOString() };
 }
 
 module.exports = { prepareResin, loadProfile, parseIni, parseIssueReport, inspectSl1, parameterScript, assertTargetProperties };

@@ -86,3 +86,57 @@ test('the send hook cannot change the durably saved request body', async t => {
   } });
   assert.equal(sent.data.remoteId, f.start.data.remoteId); assert.equal(f.outbox.status()[0].state, 'confirmed');
 });
+
+test('withdrawal persists exact review details and replays a lost response without losing counted production', async t => {
+  const f = await fixture(t), reason = 'Review supports before the remaining order unit.';
+  const command = { ...f.start, action: 'withdraw_preparation', data: { ticketFingerprint: f.start.data.ticketFingerprint, receiptId: f.start.data.receiptId, reason } };
+  const entry = await f.outbox.enqueue(command, 'withdraw-current-preparation'), bodies = [];
+  const result = body => ({ ticket: { id: body.id, version: body.version + 1, status: 'preparing', ticketFingerprint: body.data.ticketFingerprint,
+    production: { progress: { requestedParts: 2, printedParts: 1, remainingParts: 1, completedRuns: 1, failedRuns: 0 }, run: { status: 'completed' } } } });
+  await f.outbox.process([CONFIG], { client: { postEvidence: async (_, body) => { bodies.push(JSON.stringify(body)); throw new Error('Reply lost after remote commit.'); } } });
+  assert.equal(f.outbox.get(entry.operationId).state, 'pending');
+  const restored = new LayrOutbox({ dataDir: f.dataDir, now: () => Date.now() + 60000 }); await restored.init();
+  await restored.process([CONFIG], { client: { postEvidence: async (_, body) => { bodies.push(JSON.stringify(body)); return result(body); } } });
+  assert.equal(bodies[0], bodies[1]); assert.equal(restored.get(entry.operationId).state, 'confirmed');
+  assert.equal(restored.get(entry.operationId).confirmation.progress.printedParts, 1);
+  assert.ok(!JSON.stringify(restored.status()).includes(reason), 'safe public summary does not expose the saved reason/body');
+  for (const patch of [{ reason: '' }, { reason: 'line\nbreak' }, { reason: 'x'.repeat(2001) }, { receiptId: 'invalid' }, { replacementQuantity: 1 }]) {
+    await assert.rejects(restored.enqueue({ ...command, data: { ...command.data, ...patch } }, `invalid-${JSON.stringify(patch)}`));
+  }
+});
+
+test('replacement confirmations bind target identity and current quantity independently of the frozen original quantity', async t => {
+  const f = await fixture(t), targetId = randomUUID();
+  const command = { ...f.finish, data: { ...f.finish.data, targetId } };
+  const result = body => {
+    const value = f.result(body, { status: 'post_processing', printedParts: 1, completedRuns: 1 });
+    value.ticket.production.target = { id: targetId, kind: 'replacement', cycle: 1, requiredParts: 1, authorizedAt: new Date().toISOString(), qcOperationId: targetId };
+    value.ticket.production.progress.requestedParts = 1; value.ticket.production.progress.remainingParts = 0; value.ticket.production.run.targetId = targetId;
+    return value;
+  };
+  const entry = await f.outbox.enqueue(command, 'replacement-result');
+  await f.outbox.process([CONFIG], { client: { postEvidence: async (_, body) => result(body) } });
+  assert.equal(f.outbox.get(entry.operationId).state, 'confirmed');
+  assert.deepEqual(f.outbox.get(entry.operationId).confirmation.target, { id: targetId, kind: 'replacement', cycle: 1, requiredParts: 1 });
+  const restored = new LayrOutbox({ dataDir: f.dataDir }); await restored.init(); assert.deepEqual(restored.status(), f.outbox.status());
+  for (const mutate of [
+    value => { value.ticket.production.run.targetId = f.start.id; },
+    value => { delete value.ticket.production.run.targetId; },
+    value => { value.ticket.production.progress.requestedParts = 2; value.ticket.production.progress.remainingParts = 1; },
+    value => { value.ticket.production.target.qcOperationId = randomUUID(); },
+  ]) {
+    const other = await fixture(t), queued = await other.outbox.enqueue({ ...command, id: other.start.id }, randomUUID());
+    await other.outbox.process([CONFIG], { client: { postEvidence: async (_, body) => { const value = result(body); value.ticket.id = body.id; mutate(value); return value; } } });
+    assert.equal(other.outbox.get(queued.operationId).state, 'pending');
+  }
+});
+
+test('withdrawal cannot confirm retained approval or an active physical run', async t => {
+  for (const patch of [{ approvedReceiptId: randomUUID() }, { approvedTargetId: randomUUID() }, { run: { status: 'printing' } }]) {
+    const f = await fixture(t), command = { ...f.start, action: 'withdraw_preparation', data: { ticketFingerprint: f.start.data.ticketFingerprint, receiptId: f.start.data.receiptId, reason: 'Requires fresh preparation review.' } };
+    const entry = await f.outbox.enqueue(command, 'false-withdrawal');
+    await f.outbox.process([CONFIG], { client: { postEvidence: async (_, saved) => ({ ticket: { id: saved.id, version: saved.version + 1, status: 'preparing', ticketFingerprint: saved.data.ticketFingerprint,
+      production: { progress: { requestedParts: 2, printedParts: 1, remainingParts: 1, completedRuns: 1, failedRuns: 0 }, ...patch } } }) } });
+    assert.equal(f.outbox.get(entry.operationId).state, 'pending'); assert.equal(f.outbox.get(entry.operationId).confirmation, undefined);
+  }
+});

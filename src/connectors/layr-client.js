@@ -134,7 +134,7 @@ function isPreparationJob(job) {
       job.payment.amountCents !== ticket.quote.amountCents || !Number.isFinite(Date.parse(job.payment.confirmedAt))) return false;
   const file = specs.file;
   if (typeof file.name !== 'string' || file.name.length > 255 || /[\/\\\u0000-\u001f\u007f]/.test(file.name) ||
-      !['stl', 'obj'].includes(file.format) || !file.name.toLowerCase().endsWith(`.${file.format}`) ||
+      !['stl', 'obj', 'step', 'stp'].includes(file.format) || !file.name.toLowerCase().endsWith(`.${file.format}`) ||
       !Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 1 ||
       !['mm', 'in', 'm'].includes(file.units) ||
       !Number.isSafeInteger(specs.project.quantity) || specs.project.quantity < 1 || specs.project.quantity > 500 ||

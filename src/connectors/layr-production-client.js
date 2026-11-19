@@ -9,12 +9,12 @@ const MAX_MODEL_BYTES = 100 * 1024 * 1024;
 const MAX_JSON_BYTES = 4 * 1024 * 1024;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/;
-const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'start_print', 'finish_print', 'fail_print']);
-const EXPECTED_STATUS = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
+const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'withdraw_preparation', 'start_print', 'finish_print', 'fail_print']);
+const EXPECTED_STATUS = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], withdraw_preparation: ['preparing'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
 const PORTAL_CODES = new Set(['production_not_configured', 'production_origin', 'production_unauthorized', 'invalid_data', 'production_job_not_found', 'invalid_transition',
   'ticket_changed', 'invalid_cursor', 'invalid_limit', 'invalid_production_record', 'invalid_bindings', 'invalid_receipt', 'source_changed', 'preparation_unqualified',
   'invalid_evidence', 'production_scope', 'operation_conflict', 'version_conflict', 'printer_binding_mismatch', 'run_conflict', 'run_mismatch', 'invalid_content_type',
-  'body_too_large', 'invalid_json', 'model_changed', 'receipt_not_found', 'method_not_allowed', 'production_unavailable', 'quantity_plan_mismatch']);
+  'body_too_large', 'invalid_json', 'model_changed', 'receipt_not_found', 'method_not_allowed', 'production_unavailable', 'quantity_plan_mismatch', 'run_active', 'preparation_mismatch', 'target_mismatch']);
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 function failure(message, status = 502, extra = {}) {
   const code = status === 401 || status === 403 ? 'LAYR_AUTH' : status === 413 ? 'LAYR_TOO_LARGE' : status === 409 ? 'LAYR_CONFLICT' : 'LAYR_TRANSPORT';
@@ -46,21 +46,49 @@ function projection(job) {
       !object(specs) || specs.production?.printType !== 'resin' || !object(specs.project) || !object(file) ||
       !Number.isSafeInteger(specs.project.quantity) || specs.project.quantity < 1 || specs.project.quantity > 500 ||
       typeof file.name !== 'string' || file.name.length > 255 || /[\\/\u0000-\u001f\u007f]/.test(file.name) ||
-      !['stl', 'obj'].includes(file.format) || !file.name.toLowerCase().endsWith(`.${file.format}`) ||
+      !['stl', 'obj', 'step', 'stp'].includes(file.format) || !file.name.toLowerCase().endsWith(`.${file.format}`) ||
       !Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 1 || !['mm', 'in', 'm'].includes(file.units)) {
     fail('PrintByLayr returned an invalid resin production ticket.');
   }
   ticketFingerprint(job);
+  if (job.production?.target !== undefined) productionProgress(job);
   return job;
 }
 function productionProgress(job) {
   const value = job.production?.progress;
-  if (!object(value) || Object.keys(value).sort().join(',') !== 'completedRuns,failedRuns,printedParts,remainingParts,requestedParts' ||
-      value.requestedParts !== job.ticket.specifications.project.quantity || !Number.isSafeInteger(value.printedParts) || value.printedParts < 0 || value.printedParts > value.requestedParts ||
-      value.remainingParts !== value.requestedParts - value.printedParts || !Number.isSafeInteger(value.completedRuns) || value.completedRuns < 0 || !Number.isSafeInteger(value.failedRuns) || value.failedRuns < 0) {
+  const target = productionTarget(job);
+  const valid = (progress, required) => object(progress) && Object.keys(progress).sort().join(',') === 'completedRuns,failedRuns,printedParts,remainingParts,requestedParts' &&
+    progress.requestedParts === required && Number.isSafeInteger(progress.printedParts) && progress.printedParts >= 0 && progress.printedParts <= required &&
+    progress.remainingParts === required - progress.printedParts && Number.isSafeInteger(progress.completedRuns) && progress.completedRuns >= 0 && Number.isSafeInteger(progress.failedRuns) && progress.failedRuns >= 0;
+  if (!valid(value, target?.requiredParts ?? job.ticket.specifications.project.quantity)) {
     fail('PrintByLayr returned inconsistent production quantities.');
   }
+  if (target) {
+    const history = job.production.targetHistory, totals = job.production.totals;
+    if (!Array.isArray(history) || history.length !== target.cycle || !object(totals) || Object.keys(totals).sort().join(',') !== 'completedRuns,failedRuns,printedParts') fail('PrintByLayr returned incomplete production target history.');
+    const sum = { printedParts: value.printedParts, completedRuns: value.completedRuns, failedRuns: value.failedRuns }, ids = new Set([target.id]);
+    for (let cycle = 0; cycle < history.length; cycle++) {
+      const entry = history[cycle];
+      if (!object(entry)) fail('PrintByLayr returned invalid production target history.');
+      const { progress: previous, ...prior } = entry;
+      productionTarget({ ...job, production: { target: prior } });
+      if (prior.cycle !== cycle || ids.has(prior.id) || !valid(previous, prior.requiredParts)) fail('PrintByLayr returned inconsistent production target history.');
+      ids.add(prior.id);
+      for (const key of Object.keys(sum)) sum[key] += previous[key];
+    }
+    if (Object.keys(sum).some(key => !Number.isSafeInteger(totals[key]) || totals[key] !== sum[key])) fail('PrintByLayr returned inconsistent lifetime production totals.');
+  }
   return value;
+}
+function productionTarget(job) {
+  const target = job.production?.target;
+  if (target === undefined) return null; // An older portal can only authorize the original order.
+  const original = job.ticket.specifications.project.quantity;
+  if (!object(target) || Object.keys(target).sort().join(',') !== 'authorizedAt,cycle,id,kind,qcOperationId,requiredParts' || !UUID.test(target.id || '') ||
+      !Number.isSafeInteger(target.cycle) || target.cycle < 0 || !Number.isSafeInteger(target.requiredParts) || target.requiredParts < 0 || target.requiredParts > original || !Number.isFinite(isoTime(target.authorizedAt)) ||
+      (target.cycle === 0 ? target.id !== job.id || target.kind !== 'order' || target.requiredParts !== original || target.qcOperationId !== null :
+        target.kind !== 'replacement' || target.qcOperationId !== target.id)) fail('PrintByLayr returned an invalid production target.');
+  return target;
 }
 function isoTime(value) {
   if (typeof value !== 'string' || value.length > 40) return NaN;
@@ -177,6 +205,7 @@ async function getAuthorization(input, { id, receiptId, deviceFingerprint } = {}
   const result = await request(config, { action: 'authorization', id, receiptId, deviceFingerprint }, options);
   const job = projection(result.ticket), receipt = result.receipt, authorization = result.authorization;
   const quantities = productionProgress(job);
+  const target = productionTarget(job);
   const clock = typeof now === 'function' ? now() : now;
   const checkedAt = isoTime(authorization?.checkedAt), expiresAt = isoTime(authorization?.expiresAt);
   if (!Number.isSafeInteger(clock) || !object(receipt) || !object(authorization) || job.id !== id || job.status !== 'queued' || job.production.approvedReceiptId !== receiptId ||
@@ -191,6 +220,8 @@ async function getAuthorization(input, { id, receiptId, deviceFingerprint } = {}
       authorization.sourceSha256 !== receipt.sourceSha256 || authorization.artifactSha256 !== receipt.artifact.sha256 || authorization.profileSha256 !== receipt.profileSha256 || authorization.engineSha256 !== receipt.tool.executableSha256 ||
       authorization.printerId !== receipt.printerId || authorization.printerModel !== receipt.printerModel || authorization.material !== receipt.material || authorization.format !== receipt.artifact.format ||
       authorization.partsPerRun !== receipt.partsPerRun || authorization.plannedParts !== receipt.partsPerRun || authorization.remainingParts !== quantities.remainingParts ||
+      (target && (authorization.targetId !== target.id || authorization.targetKind !== target.kind || authorization.targetCycle !== target.cycle || authorization.targetParts !== target.requiredParts ||
+        (job.production.approvedTargetId || (target.cycle === 0 ? job.id : null)) !== target.id)) ||
       !SHA256.test(authorization.qualificationFingerprint || '') || !Number.isFinite(checkedAt) || !Number.isFinite(expiresAt) || expiresAt <= checkedAt || expiresAt - checkedAt > 30000 ||
       checkedAt > clock + 5000 || checkedAt < clock - 30000 || expiresAt <= clock) {
     fail('The portal did not provide a fresh authorization matching this device, ticket, receipt and remaining production plan.', 409);
@@ -236,6 +267,9 @@ async function postEvidence(input, command, options = {}) {
   if (command.action === 'start_print' && (!SHA256.test(command.data.deviceFingerprint || '') || !Number.isSafeInteger(command.data.plannedParts) || command.data.plannedParts < 1 || command.data.plannedParts > 500)) fail('Physical start evidence requires an explicit device and planned part count.', 400);
   if (command.action === 'finish_print' && (!Number.isSafeInteger(command.data.printedParts) || command.data.printedParts < 1 || command.data.printedParts > 500)) fail('Print completion requires an explicit reported printed part count.', 400);
   if (command.action === 'fail_print' && command.data.printedParts !== undefined && command.data.printedParts !== 0) fail('Failed print evidence cannot credit printed parts.', 400);
+  if (command.data.targetId !== undefined && !UUID.test(command.data.targetId)) fail('Production target identity must be a UUID.', 400);
+  if (command.action === 'withdraw_preparation' && (Object.keys(command.data).sort().join(',') !== 'reason,receiptId,ticketFingerprint' || !UUID.test(command.data.receiptId || '') ||
+      typeof command.data.reason !== 'string' || !command.data.reason.trim() || command.data.reason !== command.data.reason.trim() || command.data.reason.length > 2000 || /[\u0000-\u001f\u007f]/.test(command.data.reason))) fail('Withdraw the current approved receipt with an explicit review reason.', 400);
   const result = await request(config, null, options, body);
   let job;
   try { job = projection(result.ticket); }
@@ -245,8 +279,9 @@ async function postEvidence(input, command, options = {}) {
   }
   if (['start_print', 'finish_print', 'fail_print'].includes(command.action)) {
     try {
-      const quantities = productionProgress(job), run = job.production.run;
+      const quantities = productionProgress(job), run = job.production.run, target = productionTarget(job);
       if (!object(run) || run.runId !== command.data.runId || run.remoteId !== command.data.remoteId) throw new Error();
+      if ((target && run.targetId !== target.id) || (command.data.targetId !== undefined && (run.targetId !== command.data.targetId || (target && target.id !== command.data.targetId)))) throw new Error();
       if (command.action === 'start_print' && (run.receiptId !== command.data.receiptId || run.artifactSha256 !== command.data.artifactSha256 || run.printerId !== command.data.printerId || run.deviceFingerprint !== command.data.deviceFingerprint ||
           run.plannedParts !== command.data.plannedParts || run.status !== 'printing' || isoTime(run.startedAt) !== Date.parse(command.data.observedAt))) throw new Error();
       if (command.action !== 'start_print') {
@@ -256,6 +291,12 @@ async function postEvidence(input, command, options = {}) {
         if (completed && job.status !== (quantities.remainingParts === 0 ? 'post_processing' : quantities.remainingParts >= run.plannedParts ? 'queued' : 'preparing')) throw new Error();
       }
     } catch { fail('The portal did not confirm consistent physical run quantities and identities.', 502, { ambiguous: true }); }
+  }
+  if (command.action === 'withdraw_preparation') {
+    try {
+      productionProgress(job);
+      if (job.production.approvedReceiptId != null || job.production.approvedTargetId != null || job.production.run?.status === 'printing') throw new Error();
+    } catch { fail('The portal did not confirm preparation withdrawal without an active run.', 502, { ambiguous: true }); }
   }
   if (['record_preprocessing', 'record_slice'].includes(command.action)) {
     if (!object(result.receipt) || result.receipt.id !== command.operationId || result.receipt.jobId !== command.id ||

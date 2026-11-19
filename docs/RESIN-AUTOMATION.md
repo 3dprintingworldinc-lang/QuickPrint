@@ -28,9 +28,10 @@ private-source test setup and deployment boundary.
    Imported models are limited to 100 MiB; signed download links are not retained.
 3. Configure PrusaSlicer and UVtools paths and reviewed named resin/profile slots
    in **Settings -> Resin model preparation**. Select a slot for each ticket and
-   resolve its requirements before confirming the model's declared units/current
-   size. Only mm, inches and metres have deterministic conversion; customer
-   free-text sizing is not interpreted or applied automatically.
+   resolve its requirements. Use **Measure model**, then keep its current size,
+   choose a uniform numeric factor or set one source-axis dimension in mm.
+   Declared mm/in/m units are converted explicitly. Confirm the chosen plan;
+   customer free-text sizing is not interpreted automatically.
 4. **Slice resin model** evaluates the profile's explicit orientation candidates,
    generates supports/pad according to the preset, exports SL1, converts to GOO,
    applies reviewed target parameters, validates every GOO layer and runs the six
@@ -47,6 +48,12 @@ private-source test setup and deployment boundary.
    dispatch locally, then confirm readiness for each individual run. Matched
    printer task/file completion and an operator count feed durable portal
    writeback; remaining units require separate starts.
+7. Use **Reopen preparation** to withdraw a queued approval before revising
+   sizing/profile settings, once physical evidence is resolved. Counts and run
+   history remain. Studio QC can explicitly authorize a separate replacement
+   target; use **Review current target -> Prepare replacement target** to adopt
+   it locally before revision/new approval. Machine credentials cannot increase
+   that allowance.
 
 The legacy OAuth/PKCE MCP input remains available. It uses read tools and the
 portal's broad `studio` consent; its newest-100-jobs window remains a limitation
@@ -75,6 +82,13 @@ selects an existing SDCP printer UUID; printer model, geometry and mirrors remai
 in the reviewed profile. Each new
 profile fingerprint requires qualification for its actual printer/resin use.
 
+Source bytes remain unchanged while a separate normalized millimetre STL embodies
+the numeric sizing plan. The engine and service check its hash, bounds, triangle
+count and float32 representation independently. Exact Z -> X -> Y candidate
+extents must fit the strict zero-origin rectangular SLA bed and maximum height.
+STEP/STP intake stays in review; resin tessellation is not implemented. See
+[model sizing](RESIN-SIZING.md) for the mesh subset, limits and 6 mm reproduction.
+
 The engine records `modelCopiesPerRun: 1`, meaning one submitted source instance,
 not a physical-part or mesh-component count. The single-unit repeat plan requires an
 operator to declare that the whole model represents one order unit. Each run
@@ -99,6 +113,18 @@ again after upload, and binds each acknowledged start to its own SDCP task and
 filename. A missing/uncertain physical start acknowledgement is held without
 hardware retry, including across restart.
 
+Withdrawal clears only the current preparation approval and requires a new
+approval operation after review. It preserves the frozen order, payment, current
+target, all counts and run ledger. After a completed target fails studio QC,
+explicit `replacementQuantity` from zero through the original quantity creates a
+new target/cycle. Zero authorizes finishing-only work; positive targets need new
+local target review/adoption, approval and individually confirmed runs. Adoption
+archives old counters and clears old local plan holds without requiring an
+intact previous slice/profile, writing to the portal or qualifying hardware.
+Current-target progress and
+lifetime machine totals remain separate. Neither withdrawal nor replacement
+authorization grants quality acceptance.
+
 SatelLite 1.0.2.18 exposes evaluation, repair and hollowing CLI flags, but no
 supported unattended slicing/export CLI was established. Synthetic probes exited
 0 without output while a user-owned instance was running; singleton forwarding
@@ -111,15 +137,15 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 | Stage | Implemented and observed | Remaining work |
 | --- | --- | --- |
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
-| Units and sizing | Explicit mm/in/m conversion; instructions preserved; required human size confirmation | Interpret/resolve requested scale and target dimensions, then supply geometry that embodies them |
-| Mesh/solid policy | STL/OBJ input; original preservation; solid-only slicer policy; SatelLite probe | Mesh repair qualification; detect existing cavities; drain-hole/wall and hollow-part validation |
+| Units and sizing | mm/in/m conversion; measured source axes; explicit uniform factor or one-axis target; normalized input hash/bounds | Resolve free text and unsupported nonuniform/complex CAD changes |
+| Mesh/solid policy | STL/triangulated OBJ measurement; preserved original; solid-only slicer policy; STEP/STP intake review; SatelLite probe | STEP tessellation, mesh repair qualification, existing cavities and drain-hole/wall validation |
 | Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; one source instance per file | Customer support/finish requirements, physical support strength, arbitrary orientation and validated plate packing |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
 | Profile customization | Named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |
 | Evidence synchronization | Durable slice/approval/start/result operations; exact UUID/body/version replay; optional automatic slice receipts | Deploy portal migration/API, provision scoped token and qualified bindings, verify live reconciliation |
 | Printer LAN | Conditional qualified resin run path; current server authority, local opt-in, per-run readiness, owned task/file identity; real read-only V1.5.6 calls | Actual upload/start/control and printer/resin/profile qualification; generic resin dispatch stays blocked |
 | Wash/cure/support removal | Requirements and portal production states remain available | Machine/operator evidence for the actual post-processing operations |
-| QC/delivery | Printed/remaining units tracked separately from generic file-copy/QC counts; all requested prints advance portal to post-processing | Physical acceptance, delivery evidence and explicit replacement/rework target contract after QC failure |
+| QC/delivery | Studio-authorized bounded replacement targets; distinct current/lifetime print totals; finishing-only zero targets | Actual inspection, post-processing and acceptance/delivery evidence; no automatic QC credit |
 
 Read-only SDCP implementation calls succeeded against the actual printer. No
 upload, remote start, pause, resume or stop was performed on that printer.

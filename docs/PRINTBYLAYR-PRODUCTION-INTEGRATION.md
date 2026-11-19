@@ -5,7 +5,7 @@ integration in the private `3dprintingworldinc-lang/printbylayr` repository. The
 reviewable source is [draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15).
 The pushed portal branch is
 `codex/quickprint-production-api`, commit
-`0ffd31eabe47de83e8e76f4e6cc69e8874b82af8`, based on main commit
+`039cfaa38aa0890e59e3b160278d7333551739a0`, based on main commit
 `492e67198c4dc7f4161887877711456a4aed31cc`.
 
 No portal migration or production deployment has been performed. The private
@@ -19,7 +19,7 @@ repository and materialize the reviewed commit in a separate private directory:
 ```powershell
 git clone https://github.com/3dprintingworldinc-lang/printbylayr.git <private-checkout>
 git -C <private-checkout> fetch origin codex/quickprint-production-api
-git -C <private-checkout> switch --detach 0ffd31eabe47de83e8e76f4e6cc69e8874b82af8
+git -C <private-checkout> switch --detach 039cfaa38aa0890e59e3b160278d7333551739a0
 git -C <private-checkout> diff --check
 $env:QUICKPRINT_PORTAL_SOURCE = '<absolute-private-checkout>'
 node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js
@@ -32,6 +32,17 @@ The v2 run/quantity contract adds `0006_production_quantities.sql` after
 `0005_production.sql`; the actual-server test fixtures apply both locally.
 Deployment requires reviewed application of both migrations in the target
 environment, not only updating the server code.
+
+The same reviewed commit adds preparation withdrawal and explicit studio QC
+replacement targets. These use the existing production tables and immutable
+operation ledger; they add no migration beyond 0005 and 0006. Each replacement
+cycle has its own bounded print allowance and progress, with lifetime totals
+kept separately. See [the production workflow](RESIN-PRODUCTION.md).
+
+Both portal clients preserve STL, OBJ, STEP and STP sources and their receipt
+hashes during import. Local measurement and slicing support STL and triangulated
+OBJ. STEP/STP tickets remain visible for review with conversion required; intake
+does not certify or tessellate their CAD geometry.
 
 Without a materialized private source, the production-client suite clearly
 skips its actual-server tests and continues running its standalone transport

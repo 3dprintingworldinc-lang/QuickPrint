@@ -35,7 +35,8 @@ function fakePortal() {
   const ticket = {
     id, reference: `PBL-${id}`, version: 5, status: 'preparing', ticketFingerprint: 'a'.repeat(64),
     ticket: { specifications: { project: { name: 'Two units', quantity: 2, notes: 'Review supports.' }, production: { printType: 'resin', supports: 'allowed', colour: 'grey' }, file: { name: 'production.stl', format: 'stl', sizeBytes: MODEL.length, units: 'mm' } } },
-    production: { progress: { requestedParts: 2, printedParts: 0, remainingParts: 2, completedRuns: 0, failedRuns: 0 } },
+    production: { target: { id, kind: 'order', cycle: 0, requiredParts: 2, authorizedAt: new Date().toISOString(), qcOperationId: null },
+      progress: { requestedParts: 2, printedParts: 0, remainingParts: 2, completedRuns: 0, failedRuns: 0 }, totals: { printedParts: 0, completedRuns: 0, failedRuns: 0 }, targetHistory: [] },
   };
   const receipts = new Map(), operations = new Map();
   let binding;
@@ -43,6 +44,20 @@ function fakePortal() {
   const error = (code, status = 409) => Response.json({ code }, { status });
   const api = {
     id, close() {}, qualify(value) { binding = clone(value); }, revoke() { binding = null; },
+    async studio(command, data = {}) {
+      if (command === 'finish_processing') { assert.equal(ticket.status, 'post_processing'); ticket.status = 'quality_check'; }
+      else {
+        assert.equal(command, 'qc_fail'); assert.equal(ticket.status, 'quality_check');
+        assert.ok(Number.isInteger(data.replacementQuantity) && data.replacementQuantity >= 0 && data.replacementQuantity <= 2);
+        ticket.production.targetHistory.push({ ...clone(ticket.production.target), progress: clone(ticket.production.progress) });
+        const targetId = randomUUID(), count = data.replacementQuantity;
+        ticket.production.target = { id: targetId, kind: 'replacement', cycle: ticket.production.target.cycle + 1, requiredParts: count, authorizedAt: new Date().toISOString(), qcOperationId: targetId };
+        ticket.production.progress = { requestedParts: count, printedParts: 0, remainingParts: count, completedRuns: 0, failedRuns: 0 };
+        delete ticket.production.approvedReceiptId; delete ticket.production.approvedTargetId;
+        ticket.status = count ? 'preparing' : 'post_processing'; ticket.preparation = null;
+      }
+      ticket.version++; return clone(ticket);
+    },
     async handle(address, options) {
       if (address.pathname === '/api/intake') return new Response(MODEL);
       const action = address.searchParams.get('action');
@@ -66,6 +81,7 @@ function fakePortal() {
             engineSha256: receipt.tool.executableSha256, deviceFingerprint: receipt.deviceFingerprint,
             printerId: receipt.printerId, printerModel: receipt.printerModel, material: receipt.material, format: receipt.artifact.format,
             partsPerRun: 1, plannedParts: 1, remainingParts: ticket.production.progress.remainingParts, qualificationFingerprint: sha256(JSON.stringify(binding)),
+            targetId: ticket.production.target.id, targetKind: ticket.production.target.kind, targetCycle: ticket.production.target.cycle, targetParts: ticket.production.target.requiredParts,
           } });
         }
         assert.fail(`Unexpected production read ${action}`);
@@ -85,12 +101,17 @@ function fakePortal() {
         receipt = receipts.get(data.receiptId);
         if (!qualified(receipt)) return error('preparation_unqualified');
         if (ticket.status !== 'preparing') return error('invalid_transition');
-        ticket.status = 'queued'; ticket.production.approvedReceiptId = receipt.id; ticket.preparation = { receiptId: receipt.id }; receipt = null;
+        ticket.status = 'queued'; ticket.production.approvedReceiptId = receipt.id; ticket.production.approvedTargetId = ticket.production.target.id; ticket.preparation = { receiptId: receipt.id }; receipt = null;
+      } else if (command.action === 'withdraw_preparation') {
+        if (ticket.status !== 'queued' || ticket.production.approvedReceiptId !== data.receiptId || ticket.production.run?.status === 'printing') return error('invalid_transition');
+        assert.equal(typeof data.reason, 'string'); ticket.status = 'preparing'; ticket.preparation = null;
+        delete ticket.production.approvedReceiptId; delete ticket.production.approvedTargetId;
       } else if (command.action === 'start_print') {
         const approved = receipts.get(ticket.production.approvedReceiptId);
         if (!qualified(approved)) return error('preparation_unqualified');
         if (ticket.status !== 'queued') return error('invalid_transition');
         assert.equal(data.plannedParts, 1); assert.equal(data.deviceFingerprint, approved.deviceFingerprint);
+        assert.equal(data.targetId, ticket.production.target.id);
         ticket.status = 'printing'; ticket.production.run = { ...clone(data), status: 'printing', startedAt: data.observedAt };
       } else {
         const run = ticket.production.run;
@@ -102,7 +123,9 @@ function fakePortal() {
         ticket.production.progress.printedParts += data.printedParts;
         ticket.production.progress.remainingParts -= data.printedParts;
         ticket.production.progress[completed ? 'completedRuns' : 'failedRuns']++;
-        ticket.status = completed && ticket.production.progress.remainingParts === 0 ? 'post_processing' : 'queued';
+        ticket.production.totals.printedParts += data.printedParts; ticket.production.totals[completed ? 'completedRuns' : 'failedRuns']++;
+        ticket.status = completed ? ticket.production.progress.remainingParts === 0 ? 'post_processing' : 'queued' : 'preparing';
+        if (!completed) { delete ticket.production.approvedReceiptId; delete ticket.production.approvedTargetId; ticket.preparation = null; }
       }
       ticket.version++;
       const result = { ticket: clone(ticket), ...(receipt ? { receipt: clone(receipt) } : {}) };
@@ -133,6 +156,7 @@ async function actualPortal() {
   await action('issue_quote', { amountCents: 2500, leadTimeDays: 5, expiresAt: new Date(now + 86400000).toISOString(), summary: 'Fixture quote', fulfilment: 'pickup' });
   await action('accept_quote', {}, 'customer'); await action('confirm_payment', { amountCents: 2500, reference: 'fixture-payment' });
   return { id, database, env, qualify(binding) { env.PRODUCTION_QUALIFIED_BINDINGS = JSON.stringify([binding]); }, revoke() { env.PRODUCTION_QUALIFIED_BINDINGS = '[]'; }, close() { database.database.close(); },
+    async studio(command, data = {}) { const current = await workflow.getJob(env, id); return workflow.commandJob(env, { id, version: current.version, operationId: randomUUID(), command, data, actor: 'studio', now: Date.now() }); },
     handle(address, options) {
       if (address.pathname === '/api/production') return production.handleProduction(new Request(address, options), env, { now: Date.now, log: () => {} });
       return intake.handleIntake(new Request(address, options), env, { now: Date.now, storageFetch: b2.fetch, log: () => {} });
@@ -460,4 +484,135 @@ test('ambiguous approval preserves its preparation hold and permits exact replay
   assert.equal(f.outbox.get(operation.operationId).state, 'confirmed');
   assert.ok(['pending', 'approved'].includes(f.current().resinProduction.plan.approvalState)); noHardwareWrites(f);
   await f.enable(); assert.notEqual((await f.json(f.base + '/dispatch', { confirmedReady: true })).status, 200); noHardwareWrites(f);
+});
+
+async function replacementFlow(t, options) {
+  const f = await prepared(t, options), initialTarget = (await f.ticket()).ticket.production.target.id;
+  const firstApproval = f.outbox.status().find(entry => entry.action === 'approve_preparation');
+  const withdrawn = await f.ok(f.base + '/withdraw', { reason: 'Recheck support placement before releasing production.' });
+  assert.equal(withdrawn.state, 'confirmed'); assert.equal((await f.ticket()).ticket.status, 'preparing');
+  assert.equal(f.current().resinProduction.plan.approvalState, 'withdrawn'); noHardwareWrites(f);
+  await f.ok(`/api/jobs/${f.id}/resin/slice`, CONFIRMED);
+  assert.equal((await f.syncSlice()).state, 'confirmed', 'an unchanged immutable receipt can be reused after local reslicing');
+  const reapproved = await f.approve(); assert.equal(reapproved.state, 'confirmed'); assert.notEqual(reapproved.operationId, firstApproval.operationId);
+  assert.equal(f.current().resinProduction.plan.approvalOperationId, reapproved.operationId);
+  await f.poll();
+  assert.equal(f.current().resinProduction.plan.approvalState, 'approved', 'old confirmed withdrawal cannot clear the newer approval generation');
+  const production = require('../src/connectors/layr-production');
+  await production.releaseDismissedApproval({ service: f.app.service, outbox: f.outbox }, { ...firstApproval, state: 'dismissed' }, f.outbox.command(firstApproval.operationId));
+  assert.equal(f.current().resinProduction.plan.approvalState, 'approved', 'stale dismissal cannot release a newer operation for the same receipt');
+  assert.equal((await f.json(`/api/jobs/${f.id}/resin/slice`, CONFIRMED)).status, 409);
+  await f.enable();
+  for (let index = 0; index < 2; index++) { await f.ok(f.base + '/dispatch', { confirmedReady: true }); await f.finish(); }
+  let remote = (await f.ticket()).ticket;
+  assert.equal(remote.status, 'post_processing'); assert.equal(remote.production.totals.printedParts, 2); noQC(f.current());
+  await f.portal.studio('finish_processing');
+  await f.portal.studio('qc_fail', { notes: 'One inspected unit failed. Authorize exactly one replacement.', replacementQuantity: 1 });
+  remote = (await f.ticket()).ticket;
+  const replacement = remote.production.target;
+  assert.notEqual(replacement.id, initialTarget); assert.equal(replacement.cycle, 1); assert.equal(replacement.requiredParts, 1);
+  const review = await f.ok(f.base, undefined, 'GET');
+  assert.equal(review.requestedParts, 1); assert.equal(review.originalRequestedParts, 2); assert.equal(review.remainingParts, 1); assert.equal(review.planReviewed, false);
+  // A new studio target must unlock preparation before another approval. The
+  // old artifact/profile may be exactly what needs replacing after failed QC.
+  const originalRuns = clone(f.current().runs), writesBeforeAdoption = f.writes.length, hardwareBeforeAdoption = f.adapter.calls.length;
+  const notificationsBefore = f.portal.database ? Number(f.portal.database.database.prepare('SELECT COUNT(*) n FROM workflow_notifications').get().n) : null;
+  assert.equal(f.current().resinProduction.plan.approvalState, 'approved');
+  await fs.unlink(f.current().resinSlice.filePath);
+  const revisedProfile = JSON.parse(await fs.readFile(f.settings.profilePath, 'utf8'));
+  revisedProfile.material = 'Reviewed replacement fixture resin'; await fs.writeFile(f.settings.profilePath, JSON.stringify(revisedProfile));
+  const targetReview = await f.ok(f.base + '/target', undefined, 'GET');
+  assert.equal(targetReview.canAdopt, true); assert.equal(targetReview.needsAdoption, true); assert.equal(targetReview.hasActiveRun, false);
+  assert.equal(targetReview.target.id, replacement.id); assert.equal(targetReview.progress.remainingParts, 1);
+  assert.equal((await f.json(f.base + '/target', {})).status, 409);
+  assert.equal((await f.json(f.base + '/target', { confirmedTarget: true })).status, 409);
+  assert.equal((await f.json(f.base + '/target', { confirmedTarget: true, targetId: randomUUID() })).status, 409);
+  assert.equal(f.current().resinProduction.target.id, initialTarget);
+  assert.equal((await f.json(f.base + '/target', { confirmedTarget: true, ticket: remote })).status, 409, 'HTTP cannot supply a replacement authorization projection');
+  const adopted = await f.ok(f.base + '/target', { confirmedTarget: true, targetId: targetReview.target.id });
+  assert.equal(adopted.resinProduction.target.id, replacement.id); assert.equal(adopted.resinProduction.plan, undefined);
+  assert.deepEqual(adopted.runs, originalRuns); assert.equal(adopted.resinProduction.lifetimeLocalPrintedParts, 2);
+  assert.equal(adopted.resinProduction.printedParts, 0); assert.equal(adopted.resinProduction.remainingParts, 1);
+  const repeated = await f.ok(f.base + '/target', { confirmedTarget: true, targetId: targetReview.target.id });
+  assert.equal(repeated.resinProduction.targetHistory.length, adopted.resinProduction.targetHistory.length);
+  assert.equal(f.writes.length, writesBeforeAdoption); assert.equal(f.adapter.calls.length, hardwareBeforeAdoption);
+  if (f.portal.database) assert.equal(Number(f.portal.database.database.prepare('SELECT COUNT(*) n FROM workflow_notifications').get().n), notificationsBefore);
+  assert.equal((await f.ticket()).ticket.version, remote.version, 'local target adoption does not change the portal version');
+  await f.ok(`/api/jobs/${f.id}/resin/slice`, CONFIRMED);
+  const replacementSlice = f.current().resinSlice;
+  assert.equal(replacementSlice.material, revisedProfile.material);
+  f.portal.qualify({ ...f.binding, profileSha256: replacementSlice.profileSha256, material: replacementSlice.material });
+  const replacementReceipt = await f.syncSlice(); assert.equal(replacementReceipt.state, 'confirmed');
+  const approved = await f.approve(); assert.equal(approved.state, 'confirmed'); assert.notEqual(approved.operationId, reapproved.operationId);
+  assert.equal(f.outbox.command(approved.operationId).data.receiptId, replacementReceipt.confirmation.receiptId);
+  const beforeRepeatedAdoption = f.writes.length;
+  assert.ok([200, 409].includes((await f.json(f.base + '/target', { confirmedTarget: true, targetId: targetReview.target.id })).status));
+  assert.equal(f.current().resinProduction.plan.approvalState, 'approved'); assert.equal(f.current().resinProduction.plan.approvalOperationId, approved.operationId);
+  assert.equal(f.writes.length, beforeRepeatedAdoption, 'a stale same-target request cannot create or withdraw an approval');
+  assert.equal(f.current().resinProduction.target.id, replacement.id);
+  assert.equal(f.current().resinProduction.printedParts, 0); assert.equal(f.current().resinProduction.remainingParts, 1);
+  await f.ok(f.base + '/dispatch', { confirmedReady: true });
+  assert.equal(f.current().runs.at(-1).targetId, replacement.id);
+  await f.finish();
+  remote = (await f.ticket()).ticket;
+  assert.equal(remote.status, 'post_processing'); assert.equal(remote.production.progress.printedParts, 1); assert.equal(remote.production.totals.printedParts, 3);
+  assert.equal(remote.ticket.specifications.project.quantity, 2); assert.equal(remote.production.targetHistory[0].progress.printedParts, 2);
+  const current = f.current();
+  assert.equal(current.resinProduction.printedParts, 1); assert.equal(current.resinProduction.remainingParts, 0); assert.equal(current.resinProduction.lifetimeLocalPrintedParts, 3);
+  assert.equal(current.runs.length, 3); assert.equal(f.adapter.calls.filter(value => value.action === 'start').length, 3); noQC(current);
+  const physical = f.writes.map(body => JSON.parse(body)).filter(command => ['start_print', 'finish_print'].includes(command.action));
+  assert.deepEqual(physical.map(command => command.data.targetId), [initialTarget, initialTarget, initialTarget, initialTarget, replacement.id, replacement.id]);
+  if (f.portal.database) assert.equal(Number(f.portal.database.database.prepare('SELECT COUNT(*) n FROM production_run_results').get().n), 3);
+  await f.portal.studio('finish_processing');
+  await f.portal.studio('qc_fail', { notes: 'Finishing-only correction. No replacement print is authorized.', replacementQuantity: 0 });
+  const noReprint = await f.ok(f.base, undefined, 'GET');
+  assert.equal(noReprint.target.cycle, 2); assert.equal(noReprint.requestedParts, 0); assert.equal(noReprint.remainingParts, 0); assert.equal(noReprint.portalStatus, 'post_processing');
+  const zeroReview = await f.ok(f.base + '/target', undefined, 'GET');
+  assert.equal(zeroReview.canAdopt, true); assert.equal(zeroReview.target.requiredParts, 0);
+  const writesBeforeZero = f.writes.length, hardwareBeforeZero = f.adapter.calls.length, runsBeforeZero = clone(f.current().runs);
+  const zero = await f.ok(f.base + '/target', { confirmedTarget: true, targetId: zeroReview.target.id });
+  assert.equal(zero.resinProduction.target.id, noReprint.target.id); assert.equal(zero.resinProduction.requestedParts, 0); assert.equal(zero.resinProduction.remainingParts, 0);
+  assert.equal(zero.resinProduction.lifetimeLocalPrintedParts, 3); assert.equal(zero.resinProduction.plan, undefined); assert.deepEqual(zero.runs, runsBeforeZero);
+  assert.equal(f.writes.length, writesBeforeZero); assert.equal(f.adapter.calls.length, hardwareBeforeZero);
+  const before = f.adapter.calls.length;
+  assert.notEqual((await f.json(f.base + '/approve', { confirmedWholeModel: true })).status, 200);
+  assert.notEqual((await f.json(f.base + '/dispatch', { confirmedReady: true })).status, 200);
+  assert.equal(f.adapter.calls.length, before); assert.equal((await f.ticket()).ticket.production.totals.printedParts, 3); noQC(f.current());
+}
+
+test('withdrawal and explicit replacement targets preserve three physical units across an original two-unit order', t => replacementFlow(t, { actual: false }));
+test('actual portal recovery and studio QC cycle authorize one replacement after two original units with no QC credit', { skip: portalAvailable ? false : sourceSkip }, t => replacementFlow(t, { actual: true }));
+
+async function lostWithdrawal(t, options) {
+  const f = await prepared(t, options); f.faults.loseReply = 'withdraw_preparation';
+  const entry = await f.ok(f.base + '/withdraw', { reason: 'Repair the preparation after external file changes.' });
+  assert.equal(entry.state, 'pending'); assert.equal((await f.ticket()).ticket.status, 'preparing');
+  assert.equal(f.current().resinProduction.plan.approvalState, 'approved');
+  assert.equal((await f.json(`/api/jobs/${f.id}/resin/slice`, CONFIRMED)).status, 409);
+  await fs.appendFile(f.current().inputPath, 'externally changed model after an ambiguous withdrawal');
+  await f.restart(); f.advanceRetries(); await f.poll();
+  const copies = f.writes.filter(body => JSON.parse(body).action === 'withdraw_preparation');
+  assert.equal(copies.length, 2); assert.equal(copies[0], copies[1]); assert.equal(f.outbox.get(entry.operationId).state, 'confirmed');
+  assert.equal(f.current().resinProduction.plan.approvalState, 'withdrawn'); assert.equal(f.current().resinProduction.plan.withdrawalOperationId, entry.operationId);
+  noHardwareWrites(f); noQC(f.current());
+}
+test('ambiguous withdrawal replays after restart and safely releases its hold even if local bytes changed', t => lostWithdrawal(t, { actual: false }));
+test('actual portal withdrawal replay releases only confirmed local preparation without requiring intact files', { skip: portalAvailable ? false : sourceSkip }, t => lostWithdrawal(t, { actual: true }));
+
+test('withdrawal can repair changed files but cannot bypass an unresolved physical start', async t => {
+  await t.test('changed profile and artifact', async child => {
+    const f = await prepared(child);
+    await fs.appendFile(f.current().inputPath, 'changed source'); await fs.appendFile(f.current().resinSlice.filePath, 'changed artifact');
+    await fs.writeFile(f.settings.profilePath, 'invalid profile pending repair');
+    const withdrawn = await f.ok(f.base + '/withdraw', { reason: 'Repair damaged preparation files.' });
+    assert.equal(withdrawn.state, 'confirmed'); assert.equal(f.current().resinProduction.plan.approvalState, 'withdrawn'); noHardwareWrites(f);
+  });
+  await t.test('uncertain physical start', async child => {
+    const f = await prepared(child); await f.enable(); f.adapter.startMode = 'uncertain';
+    assert.ok((await f.json(f.base + '/dispatch', { confirmedReady: true })).status >= 500);
+    const before = f.adapter.calls.length;
+    assert.equal((await f.json(f.base + '/withdraw', { reason: 'This unresolved physical start must stay held.' })).status, 409);
+    assert.equal(f.adapter.calls.length, before); assert.ok(!f.writes.some(body => JSON.parse(body).action === 'withdraw_preparation'));
+    assert.ok(f.current().currentRunId); assert.equal((await f.ticket()).ticket.status, 'queued');
+  });
 });

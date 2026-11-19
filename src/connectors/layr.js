@@ -1,6 +1,6 @@
 'use strict';
 
-const { verifyQueuedProductionEvidence, sendProductionRequest } = require('./layr-production');
+const { processOutbox } = require('./layr-production');
 
 // Imports preparation tickets only. Portal workflow mutations are deliberately
 // separate from local model receipt and from physical manufacturing evidence.
@@ -18,11 +18,7 @@ async function pollLayr(manager, config, checkpoint) {
     }
     const options = { signal: controller.signal };
     const failures = [];
-    const processEvidence = production ? () => manager.outbox.process(manager.service.getConnectors({ secrets: true }), {
-      client, signal: controller.signal, getConfigs: () => manager.service.getConnectors({ secrets: true }),
-      beforeSend: (entry, command) => verifyQueuedProductionEvidence(manager, entry, command),
-      sendRequest: (entry, command, send) => sendProductionRequest(manager, entry, command, send),
-    }) : null;
+    const processEvidence = production ? () => processOutbox(manager, controller.signal) : null;
     // Pending writes may already have committed. Reconcile them independently
     // of listing/import failures so a large or broken model cannot starve them.
     if (processEvidence) { try { await processEvidence(); } catch (error) { failures.push(error); } }

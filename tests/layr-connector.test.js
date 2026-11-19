@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { QuickPrintService } = require('../src/core/service');
 const { ConnectorManager } = require('../src/connectors');
 const transport = require('../src/connectors/layr-client');
@@ -332,6 +332,76 @@ test('transport mode has its own polling checkpoint while the service deduplicat
   assert.equal(production.writes, 0);
   await manager.pollNow(f.id);
   assert.equal(production.downloads, 1);
+});
+
+function mixedFormatPortal(format) {
+  const step = portalJob(), stl = portalJob(); step.id = randomUUID(); stl.id = randomUUID();
+  const stepBytes = Buffer.from('ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n');
+  const records = [step, stl], bodies = new Map([[step.id, stepBytes], [stl.id, MODEL]]), downloads = [];
+  for (const job of records) job.reference = `PBL-${job.id}`;
+  Object.assign(step.ticket.specifications.file, { name: `assembly.${format.toUpperCase()}`, format, sizeBytes: stepBytes.length });
+  step.ticket.model.size = stepBytes.length;
+  const project = job => ({ id: job.id, reference: job.reference, version: job.version, status: job.status, ticketFingerprint: transport.ticketFingerprint(job),
+    ticket: { specifications: structuredClone(job.ticket.specifications) }, production: null });
+  const link = job => `${PORTAL}/api/intake?download=${job.id}.signature`;
+  const fetchImpl = async (address, options) => {
+    const url = new URL(address);
+    assert.equal(url.origin, PORTAL); assert.equal(options.redirect, 'error');
+    if (url.pathname === '/api/intake') {
+      assert.equal(options.headers, undefined, 'model downloads never receive either bearer');
+      const id = url.searchParams.get('download').split('.')[0]; downloads.push(id); return new Response(bodies.get(id));
+    }
+    assert.equal(options.headers.Authorization, `Bearer ${TOKEN}`);
+    if (url.pathname === '/mcp') {
+      const request = JSON.parse(options.body), { name, arguments: args } = request.params;
+      let value;
+      if (name === 'list_jobs') value = { count: records.length, jobs: records.map(job => ({ id: job.id, status: job.status, version: job.version })) };
+      else {
+        const job = records.find(item => item.id === args.job); assert.ok(job);
+        if (name === 'get_job') value = job;
+        else { assert.equal(name, 'model_download_link'); value = { file: job.ticket.specifications.file.name, url: link(job) }; }
+      }
+      return Response.json({ jsonrpc: '2.0', id: request.id, result: { content: [{ type: 'text', text: JSON.stringify(value) }] } });
+    }
+    assert.equal(url.pathname, '/api/production'); assert.equal(options.method, 'GET');
+    const action = url.searchParams.get('action');
+    if (action === 'tickets') return Response.json(url.searchParams.has('cursor') ? { tickets: [project(stl)], nextCursor: null } : { tickets: [project(step)], nextCursor: 'second_page' });
+    const job = records.find(item => item.id === url.searchParams.get('id')); assert.ok(job);
+    if (action === 'ticket') return Response.json({ ticket: project(job) });
+    assert.equal(action, 'download');
+    return Response.json({ name: job.ticket.specifications.file.name, sizeBytes: bodies.get(job.id).length, url: link(job) });
+  };
+  const layrClient = { ...transport,
+    listPreparationJobs: (config, options) => transport.listPreparationJobs(config, { ...options, fetchImpl }),
+    downloadModel: (config, job, options) => transport.downloadModel(config, job, { ...options, fetchImpl }) };
+  const layrProductionClient = { ...productionTransport,
+    listPreparationJobs: (config, options) => productionTransport.listPreparationJobs(config, { ...options, fetchImpl }),
+    downloadModel: (config, job, options) => productionTransport.downloadModel(config, job, { ...options, fetchImpl }) };
+  return { layrClient, layrProductionClient, records, bodies, downloads };
+}
+
+test('STEP-first and later STL paid tickets import together through MCP and paginated production without converting their sources', async t => {
+  for (const apiMode of ['mcp', 'production']) for (const format of ['step', 'stp']) await t.test(`${apiMode} ${format}`, async child => {
+    const portal = mixedFormatPortal(format);
+    const f = await fixture(child, { portal, layrProductionClient: portal.layrProductionClient, config: { apiMode } });
+    const manager = await f.makeManager();
+    assert.equal((await manager.pollNow(f.id)).state, 'idle');
+    const jobs = f.service.snapshot().jobs;
+    assert.equal(jobs.length, 2); assert.deepEqual(portal.downloads, portal.records.map(job => job.id));
+    for (const original of portal.records) {
+      const job = jobs.find(item => item.order.portalJobId === original.id), bytes = portal.bodies.get(original.id);
+      assert.ok(job); assert.equal(job.technology, 'resin'); assert.equal(job.status, 'review');
+      assert.equal(job.quantity, 1); assert.equal(job.acceptedQuantity, 0); assert.equal(job.order.requestedQuantity, 12);
+      assert.equal(job.order.ticketFingerprint, transport.ticketFingerprint(original));
+      assert.equal(job.sha256, hash(bytes)); assert.equal(job.order.modelSha256, hash(bytes));
+      assert.equal(job.fileName, original.ticket.specifications.file.name); assert.deepEqual(await fs.readFile(job.inputPath), bytes);
+      assert.equal(job.resinSlice, undefined); assert.equal(job.artifact, undefined); assert.deepEqual(job.runs, []);
+    }
+    await manager.pollNow(f.id);
+    const reopened = await f.reopen(); await reopened.pollNow(f.id);
+    assert.equal(portal.downloads.length, 2, 'both receipt identities survive polling and restart before another download');
+    assert.equal(f.service.snapshot().jobs.length, 2);
+  });
 });
 
 test('connector validation accepts default or explicit MCP and production, and refuses unknown API modes', () => {

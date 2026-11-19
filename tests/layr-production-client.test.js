@@ -338,7 +338,7 @@ function contractFixture() {
       case 'download':
         assert.equal(parsed.searchParams.get('version'), String(ticket.version));
         assert.equal(parsed.searchParams.get('ticketFingerprint'), ticket.ticketFingerprint);
-        return Response.json({ name: 'part.stl', sizeBytes: MODEL.length, url: customLink || `${ORIGIN}/api/intake?download=private.signature` });
+        return Response.json({ name: ticket.ticket.specifications.file.name, sizeBytes: ticket.ticket.specifications.file.sizeBytes, url: customLink || `${ORIGIN}/api/intake?download=private.signature` });
       case 'receipt': {
         const recorded = operations.get(parsed.searchParams.get('receiptId'));
         return recorded ? Response.json({ receipt: recorded.result.receipt }) : Response.json({ code: 'receipt_not_found' }, { status: 404 });
@@ -366,6 +366,33 @@ test('standalone contract transports tickets and models with production bearer c
   assert.equal(result.order.ticketFingerprint, ticket.ticketFingerprint);
   assert.equal(result.order.apiMode, 'production');
   assert.equal(f.calls.at(-1).options.headers, undefined);
+});
+
+test('standalone production transport accepts STEP and STP source tickets without claiming mesh conversion', async () => {
+  const bytes = Buffer.from('ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n');
+  for (const format of ['step', 'stp']) {
+    const f = contractFixture();
+    Object.assign(f.ticket.ticket.specifications.file, { name: `assembly.${format.toUpperCase()}`, format, sizeBytes: bytes.length });
+    f.setModel(() => new Response(bytes));
+    const [ticket] = await client.listPreparationJobs(CONFIG, f.options);
+    const result = await client.downloadModel(CONFIG, ticket, f.options);
+    assert.equal(result.name, ticket.ticket.specifications.file.name); assert.deepEqual(result.data, bytes);
+    assert.equal(result.order.modelSha256, sha256(bytes)); assert.equal(result.order.requestedQuantity, 12);
+    assert.equal(result.order.portalJobId, ticket.id); assert.equal(result.order.apiMode, 'production');
+  }
+});
+
+test('unknown and malformed formats reject the entire production scan after an earlier valid page', async () => {
+  for (const file of [{ name: 'part.dxf', format: 'dxf' }, { name: 'part.step', format: 'stp' }, { name: '../part.stp', format: 'stp' }]) {
+    const first = contractFixture().ticket, later = structuredClone(first); later.id = randomUUID();
+    Object.assign(later.ticket.specifications.file, file);
+    const actions = [];
+    await assert.rejects(client.listPreparationJobs(CONFIG, { fetchImpl: async url => {
+      const address = new URL(url); actions.push(address.searchParams.get('action'));
+      return Response.json(address.searchParams.has('cursor') ? { tickets: [later], nextCursor: null } : { tickets: [first], nextCursor: 'second_page' });
+    } }), { code: 'LAYR_TRANSPORT' });
+    assert.deepEqual(actions, ['tickets', 'tickets']);
+  }
 });
 
 test('standalone contract preserves ambiguous writes for exact retry and receipt reconciliation', async () => {
@@ -470,9 +497,18 @@ portalTest('actual fresh authorization is revoked independently of an immutable 
     artifact: { sha256: 'd'.repeat(64), sizeBytes: 100, format: 'goo' } };
   const capture = await client.postEvidence(CONFIG, command, f.options);
   assert.equal(capture.receipt.qualifiedAtCapture, true);
-  const approval = await client.postEvidence(CONFIG, { action: 'approve_preparation', id: job.id, version: capture.ticket.version, operationId: randomUUID(),
+  let approval = await client.postEvidence(CONFIG, { action: 'approve_preparation', id: job.id, version: capture.ticket.version, operationId: randomUUID(),
     data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id } }, f.options);
   const params = { id: job.id, receiptId: capture.receipt.id, deviceFingerprint };
+  const withdraw = { action: 'withdraw_preparation', id: job.id, version: approval.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id, reason: 'Review current qualification before releasing this plan.' } };
+  const withdrawn = await client.postEvidence(CONFIG, withdraw, f.options);
+  assert.equal(withdrawn.ticket.status, 'preparing');
+  assert.equal(withdrawn.ticket.production.target.id, job.id);
+  await assert.rejects(client.getAuthorization(CONFIG, params, { ...f.options, now: () => NOW }), { status: 409 });
+  approval = await client.postEvidence(CONFIG, { action: 'approve_preparation', id: job.id, version: withdrawn.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id } }, f.options);
+  assert.deepEqual(await client.postEvidence(CONFIG, withdraw, f.options), withdrawn, 'exact withdrawal replay stays historic after reapproval');
   const proof = await client.getAuthorization(CONFIG, params, { ...f.options, now: () => NOW });
   assert.equal(proof.authorization.jobVersion, approval.ticket.version);
   assert.equal(proof.authorization.remainingParts, 2);
@@ -496,6 +532,27 @@ portalTest('actual fresh authorization is revoked independently of an immutable 
     current = finished.ticket;
   }
   assert.equal(Number(f.database.database.prepare('SELECT COUNT(*) n FROM production_run_results').get().n), 2);
+  let serverJob = await f.workflow.getJob(f.env, job.id);
+  serverJob = await f.workflow.commandJob(f.env, { id: job.id, version: serverJob.version, operationId: randomUUID(), command: 'finish_processing', actor: 'studio', now: NOW });
+  const qcOperationId = randomUUID();
+  await f.workflow.commandJob(f.env, { id: job.id, version: serverJob.version, operationId: qcOperationId, command: 'qc_fail', actor: 'studio', now: NOW,
+    data: { notes: 'One replacement required after physical inspection.', replacementQuantity: 1 } });
+  current = (await client.getTicket(CONFIG, job.id, f.options)).ticket;
+  assert.equal(current.production.target.id, qcOperationId); assert.equal(current.production.progress.requestedParts, 1);
+  assert.equal(current.ticket.specifications.project.quantity, 2); assert.equal(current.production.totals.printedParts, 2);
+  approval = await client.postEvidence(CONFIG, { action: 'approve_preparation', id: job.id, version: current.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id } }, f.options);
+  const replacement = await client.getAuthorization(CONFIG, params, { ...f.options, now: () => NOW });
+  assert.equal(replacement.authorization.targetId, qcOperationId); assert.equal(replacement.authorization.targetParts, 1);
+  const runId = randomUUID(), remoteId = `replacement-${runId}`;
+  const started = await client.postEvidence(CONFIG, { action: 'start_print', id: job.id, version: approval.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, targetId: qcOperationId, receiptId: capture.receipt.id, runId, remoteId, observedAt: new Date(NOW).toISOString(),
+      artifactSha256: command.data.artifact.sha256, printerId: binding.printerId, plannedParts: 1, deviceFingerprint } }, f.options);
+  const completed = await client.postEvidence(CONFIG, { action: 'finish_print', id: job.id, version: started.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, targetId: qcOperationId, runId, remoteId, observedAt: new Date(NOW).toISOString(), printedParts: 1 } }, f.options);
+  assert.equal(completed.ticket.status, 'post_processing'); assert.equal(completed.ticket.production.totals.printedParts, 3);
+  assert.equal(completed.ticket.production.progress.printedParts, 1); assert.equal(completed.ticket.ticket.specifications.project.quantity, 2);
+  assert.equal(Number(f.database.database.prepare('SELECT COUNT(*) n FROM production_run_results').get().n), 3);
 });
 
 test('physical completion confirmation accepts nonfinal queued progress but rejects premature finishing or quantity credit', async () => {
@@ -515,6 +572,94 @@ test('physical completion confirmation accepts nonfinal queued progress but reje
     value => { value.ticket.production.run.runId = randomUUID(); },
     value => { value.ticket.production.run.plannedParts = 0; },
     value => { value.ticket.production.progress.acceptedParts = 1; },
+  ]) {
+    const value = structuredClone(result); mutate(value);
+    await assert.rejects(client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(value) }), error => error.ambiguous === true);
+  }
+});
+
+test('standalone withdrawal preserves the exact saved operation and refuses incomplete or active-run confirmations', async () => {
+  const fixture = contractFixture(), receiptId = randomUUID();
+  const command = { action: 'withdraw_preparation', id: fixture.ticket.id, version: fixture.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: fixture.ticket.ticketFingerprint, receiptId, reason: 'Review the revised profile before another physical unit.' } };
+  const result = { ticket: { ...fixture.ticket, version: fixture.ticket.version + 1, status: 'preparing', production: {
+    progress: { requestedParts: 12, printedParts: 2, remainingParts: 10, completedRuns: 2, failedRuns: 0 },
+    run: { runId: randomUUID(), status: 'completed', printedParts: 1 },
+  } } };
+  let calls = 0;
+  const options = { fetchImpl: async (url, init) => {
+    calls++; assert.equal(init.body, JSON.stringify(command)); assert.equal(init.redirect, 'error');
+    if (calls === 1) throw new Error('The remote commit may have succeeded.');
+    return Response.json(result);
+  } };
+  await assert.rejects(client.postEvidence(CONFIG, command, options), error => error.ambiguous === true);
+  assert.equal(calls, 1, 'transport does not generate or retry a withdrawal');
+  assert.deepEqual(await client.postEvidence(CONFIG, command, options), result);
+  for (const patch of [{ reason: '' }, { reason: 'line\nbreak' }, { reason: 'x'.repeat(2001) }, { receiptId: 'invalid' }, { replacementQuantity: 1 }]) {
+    await assert.rejects(client.postEvidence(CONFIG, { ...command, data: { ...command.data, ...patch } }, options), { status: 400 });
+  }
+  assert.equal(calls, 2);
+  for (const patch of [{ approvedReceiptId: receiptId }, { approvedTargetId: fixture.ticket.id }, { run: { status: 'printing' } }]) {
+    const value = structuredClone(result); Object.assign(value.ticket.production, patch);
+    await assert.rejects(client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(value) }), error => error.ambiguous === true);
+  }
+});
+
+function replacementContract() {
+  const fixture = authorizationContract(), { ticket, authorization } = fixture.result;
+  const id = randomUUID(), original = ticket.ticket.specifications.project.quantity;
+  const initial = { id: ticket.id, kind: 'order', cycle: 0, requiredParts: original, authorizedAt: new Date(NOW - 60000).toISOString(), qcOperationId: null };
+  ticket.production.target = { id, kind: 'replacement', cycle: 1, requiredParts: 2, authorizedAt: new Date(NOW).toISOString(), qcOperationId: id };
+  ticket.production.targetHistory = [{ ...initial, progress: { requestedParts: original, printedParts: original, remainingParts: 0, completedRuns: original, failedRuns: 1 } }];
+  ticket.production.progress = { requestedParts: 2, printedParts: 0, remainingParts: 2, completedRuns: 0, failedRuns: 0 };
+  ticket.production.totals = { printedParts: original, completedRuns: original, failedRuns: 1 };
+  ticket.production.approvedTargetId = id;
+  Object.assign(authorization, { targetId: id, targetKind: 'replacement', targetCycle: 1, targetParts: 2, remainingParts: 2 });
+  return fixture;
+}
+
+test('replacement authorization binds its explicit studio target while retaining original order and lifetime counts', async () => {
+  const fixture = replacementContract();
+  const read = value => client.getAuthorization(CONFIG, fixture.params, { now: () => NOW, fetchImpl: async () => Response.json(value) });
+  const result = await read(fixture.result);
+  assert.equal(result.ticket.ticket.specifications.project.quantity, 12);
+  assert.equal(result.ticket.production.progress.requestedParts, 2);
+  assert.equal(result.ticket.production.totals.printedParts, 12);
+  assert.equal(result.authorization.targetId, result.ticket.production.target.id);
+  for (const mutate of [
+    value => { delete value.authorization.targetId; },
+    value => { value.authorization.targetId = value.ticket.id; },
+    value => { value.authorization.targetKind = 'order'; },
+    value => { value.authorization.targetCycle = 0; },
+    value => { value.authorization.targetParts = 12; },
+    value => { delete value.ticket.production.approvedTargetId; },
+    value => { value.ticket.production.target.qcOperationId = randomUUID(); },
+    value => { value.ticket.production.target.requiredParts = 13; },
+    value => { value.ticket.production.progress.requestedParts = 12; },
+    value => { value.ticket.production.targetHistory = []; },
+    value => { value.ticket.production.totals.printedParts = 0; },
+  ]) {
+    const value = structuredClone(fixture.result); mutate(value);
+    await assert.rejects(read(value));
+  }
+});
+
+test('replacement completion acknowledgments must retain the exact target and lifetime evidence', async () => {
+  const fixture = replacementContract(), ticket = fixture.result.ticket, targetId = ticket.production.target.id;
+  const command = { action: 'finish_print', id: ticket.id, version: ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: ticket.ticketFingerprint, targetId, runId: randomUUID(), remoteId: 'replacement-completed', observedAt: new Date(NOW).toISOString(), printedParts: 1 } };
+  const result = { ticket: structuredClone(ticket) };
+  result.ticket.status = 'queued'; result.ticket.version++;
+  result.ticket.production.progress = { requestedParts: 2, printedParts: 1, remainingParts: 1, completedRuns: 1, failedRuns: 0 };
+  result.ticket.production.totals.printedParts++; result.ticket.production.totals.completedRuns++;
+  result.ticket.production.run = { runId: command.data.runId, remoteId: command.data.remoteId, targetId, plannedParts: 1, printedParts: 1, status: 'completed', finishedAt: command.data.observedAt };
+  assert.equal((await client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(result) })).ticket.status, 'queued');
+  for (const mutate of [
+    value => { delete value.ticket.production.run.targetId; },
+    value => { value.ticket.production.run.targetId = ticket.id; },
+    value => { value.ticket.production.target.id = randomUUID(); },
+    value => { value.ticket.status = 'post_processing'; },
+    value => { value.ticket.production.totals.printedParts = 1; },
   ]) {
     const value = structuredClone(result); mutate(value);
     await assert.rejects(client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(value) }), error => error.ambiguous === true);

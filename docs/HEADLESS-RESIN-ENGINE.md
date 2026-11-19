@@ -19,8 +19,9 @@ The completed local verification used **PrusaSlicer 2.9.7** and **UVtools 7.1.2*
 on Windows x64. Configure `prusa-slicer-console.exe` and `UVtoolsCmd.exe`, keeping
 each provider's adjacent libraries and resources intact. The engine fingerprints
 the Prusa console/core DLL and UVtools console/command/core DLLs. Its QuickPrint
-manifest covers `resin-engine.js`, `goo.js`, `resin-profiles.js`, the process
-runner in `slicing/index.js`, and `psam/zip-inspection.js`. These selected hashes
+manifest covers `resin-engine.js`, `goo.js`, `resin-profiles.js`,
+`resin-geometry.js`, the process runner in `slicing/index.js`, and
+`psam/zip-inspection.js`. These selected hashes
 are not a complete manifest of every runtime dependency in the provider
 installations.
 
@@ -97,10 +98,14 @@ The full-resolution local receipt is
 
 1. Read and hash the original STL/OBJ, JSON profile and standalone INI. Copy the
    original and preset into a new work directory; never overwrite the original.
-2. For each configured candidate, invoke Prusa with the copied preset, explicit
-   unit conversion and X/Y/Z rotations, `--export-sla`, and a managed
-   `prepared.sl1` output path. Configuration compatibility substitutions are
-   disabled.
+   Measure the source, apply its explicit unit conversion/uniform sizing and one
+   global origin shift, then emit and reread a separate millimetre binary STL.
+   Retain the canonical `sizingPlan` and hashed `inputGeometry` proof.
+2. For each configured candidate, independently measure exact source-vertex
+   bounds after Z -> X -> Y rotation and reject candidates exceeding the reviewed
+   rectangular bed or maximum height. Invoke Prusa with the copied preset,
+   normalized STL, `--scale 1`, rotations, `--export-sla`, and managed
+   `prepared.sl1` output. Configuration compatibility substitutions are disabled.
 3. Inspect the SL1 archive. Require bounded `prusaslicer.ini` and `config.ini`,
    contiguous `prepared00000.png` layer names, consistent layer counts, expected
    PNG header dimensions, and matching effective geometry, mirrors, orientation,
@@ -130,6 +135,9 @@ The full-resolution local receipt is
    A process, integrity or profile failure stops the operation; it is not hidden
    by trying more orientations.
 
+If every source orientation is out of bounds, fail with
+`RESIN_MODEL_OUT_OF_BOUNDS` before native slicing. These fit checks exclude
+generated supports/pad, which still need layer/issue analysis and qualification.
 The candidate search is finite and preset-driven. It does not infer customer
 intent, search arbitrary orientations, repair every mesh defect, or establish
 that one orientation is aesthetically or mechanically best.
@@ -167,8 +175,11 @@ Required `expected` fields map to the standalone preset as follows:
 
 Each pixel dimension is at most 20000 and their product is at most 100 million.
 The GOO reader applies its own numeric/layout bounds in addition to profile
-validation. `machineZMm` may additionally bind expected GOO build height; the
-standalone preset's `max_print_height` should reflect the same reviewed target.
+validation. The standalone preset must provide positive `max_print_height`;
+`machineZMm`, when supplied, must match it exactly. `bed_shape` must follow the
+four zero-origin boundary corners for the selected display dimensions, with an
+optional closing fifth point and either winding. Unsupported/shifted beds fail
+profile validation, and the effective exported bed/height are checked again.
 The wrapper does not silently derive physical display dimensions from a model
 name, a filename, or a firmware advertisement.
 
@@ -232,16 +243,20 @@ Credential-bearing preset keys such as API keys, passwords, tokens, access codes
 or secrets must be empty. Slicing does not need printer/account credentials.
 The wrapper does not accept an alternate command string from the preset or model.
 
-Inputs are nonempty `.stl` or `.obj` files up to 100 MiB. Models are treated as
+Inputs are nonempty `.stl` or triangulated `.obj` files up to 100 MiB. OBJ polygons
+and external/free-form geometry are rejected. STEP/STP intake remains for review;
+resin STEP tessellation is not implemented. Models are treated as
 solid: `hollowing_enable=0` is mandatory because there is no qualified drain-hole
 plan or hollow-part inspection contract in this engine. This restriction does
 not detect a cavity already modeled into an uploaded mesh.
 
-Only deterministic unit conversions are supported: millimetres `1`, inches
-`25.4`, or metres `1000`. There is no arbitrary customer scale factor or
-target-dimension transformation. Candidate X/Y/Z angles are degrees in
-`[-360, 360]`. The supplied profile supports two candidates; up to four can be
-configured. Real provider evidence in this document used millimetre input.
+Declared units convert deterministically: millimetres `1`, inches `25.4`, or
+metres `1000`. An explicit numeric plan keeps the current size, applies a uniform
+factor, or sets one source-axis dimension in millimetres while preserving
+proportions. Free-text requirements remain unparsed. Source-axis sizing precedes
+orientation/supports/pad; see [measurement and sizing](RESIN-SIZING.md) for limits,
+normalization, proof fields and the reproducible 3 mm -> 6 mm provider check.
+Candidate angles are degrees in `[-360, 360]`; up to four are configured.
 
 ### Source copies and production quantity
 
@@ -351,20 +366,24 @@ The authenticated API equivalent is `POST /api/jobs/:id/resin/slice` with:
 ```json
 {
   "confirmedRequirements": true,
-  "confirmedOriginalSize": true,
-  "profileSlotId": "standard-grey"
+  "confirmedSizing": true,
+  "profileSlotId": "standard-grey",
+  "sizing": { "mode": "dimension", "axis": "z", "millimeters": 6 }
 }
 ```
 
-This request accepts only those review fields; model/output/profile paths come
-from the imported job and local Settings. The authenticated download route is
+This request accepts the explicit sizing plan and review fields;
+model/output/profile paths come from the imported job and local Settings.
+The authenticated download route is
 `GET /api/jobs/:id/resin/slice/download`.
 
-The required size confirmation states that requested
-dimensions/scale are already embodied in the uploaded geometry and that only
-its declared unit conversion will be applied. QuickPrint preserves the ticket's
-free-text instructions; it does not interpret them as transformation commands.
-Clarify unresolved requirements or replace the model/profile before confirming.
+Use **Measure model** to inspect source dimensions, choose the current size,
+uniform factor or one source-axis target, and confirm the chosen plan. Original
+mode also accepts the existing `confirmedOriginalSize` confirmation; resizing
+requires `confirmedSizing`. The service independently verifies canonical plan,
+normalized input hash, bounds and managed-file identity before capture and
+qualified production. Ticket free text remains an operator-reviewed instruction.
+Clarify unresolved requirements before confirming the numeric transformation.
 
 The service keeps the job in `review`, stores the full result under `resinSlice`,
 and leaves reported issues visible. Successful capture is
@@ -377,6 +396,10 @@ qualification** for the separate studio binding, whole-model one-unit declaratio
 portal approval and per-run authorization. **Enable qualified resin dispatch**
 defaults to false. The engine's unqualified result flags remain unchanged even
 when that separate run path is available; see the [production guide](RESIN-PRODUCTION.md).
+Pending/approved plans hold replacement slicing. Use confirmed queued-preparation
+withdrawal, or explicitly adopt a newer studio QC replacement target, before
+revising that preparation. Both preserve earlier production evidence; neither
+grants a new print authorization or QC credit.
 
 Native resin slicing and the SatelLite preprocessing probe share one service
 engine lock. Duplicate preparations for the same job are rejected. Active work
@@ -406,9 +429,10 @@ operation uses the configured 1-second to 1-hour timeout. The process runner
 captures bounded log output and terminates process trees on abort/timeout.
 Overlong or truncated issue reports fail rather than being treated as clean.
 
-The work directory retains shared source/preset copies. Each completed attempt
+The work directory retains original/preset copies and the independently measured,
+hashed `prepared-input.stl`. Each completed attempt
 retains its SL1/GOO, parameter script, receipt and `evidence.json` with target
-inspection, issue report, hashes and bounded process logs. The top-level
+inspection, sizing/input/orientation proof, issue report, hashes and bounded process logs. The top-level
 verification JSON records the selected
 attempt and attempted orientations. Evidence directories are retained for review;
 the engine does not automatically delete failed attempts or manage long-term

@@ -7,9 +7,9 @@ const { atomicWrite } = require('../core/store');
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const HASH = /^[a-f0-9]{64}$/;
-const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'start_print', 'finish_print', 'fail_print']);
+const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'withdraw_preparation', 'start_print', 'finish_print', 'fail_print']);
 const STATES = new Set(['pending', 'paused', 'auth_required', 'conflict', 'rejected', 'confirmed', 'dismissed']);
-const EXPECTED = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
+const EXPECTED = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], withdraw_preparation: ['preparing'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -42,9 +42,10 @@ function validateCommand(command, { legacy = false } = {}) {
     record_preprocessing: ['ticketFingerprint', 'sourceSha256', 'tool', 'outputs', 'operations'],
     record_slice: ['ticketFingerprint', 'sourceSha256', 'tool', 'profileSha256', 'printerId', 'printerModel', 'material', 'artifact', 'partsPerRun', 'deviceFingerprint'],
     approve_preparation: ['ticketFingerprint', 'receiptId'],
-    start_print: ['ticketFingerprint', 'receiptId', 'runId', 'artifactSha256', 'printerId', 'remoteId', 'observedAt', 'plannedParts', 'deviceFingerprint'],
-    finish_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts'],
-    fail_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts'],
+    withdraw_preparation: ['ticketFingerprint', 'receiptId', 'reason'],
+    start_print: ['ticketFingerprint', 'receiptId', 'runId', 'artifactSha256', 'printerId', 'remoteId', 'observedAt', 'plannedParts', 'deviceFingerprint', 'targetId'],
+    finish_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts', 'targetId'],
+    fail_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts', 'targetId'],
   };
   keys(data, fields[command.action]);
   if (['record_preprocessing', 'record_slice'].includes(command.action)) {
@@ -71,9 +72,11 @@ function validateCommand(command, { legacy = false } = {}) {
         !Number.isSafeInteger(data.artifact.sizeBytes) || data.artifact.sizeBytes < 1 || data.artifact.sizeBytes > 512 * 1024 * 1024 || !text(data.artifact.format, 40)) fail('Slice evidence requires the bound profile, printer, material and artifact hashes.');
     if (data.partsPerRun !== undefined && (!Number.isSafeInteger(data.partsPerRun) || data.partsPerRun < 1 || data.partsPerRun > 500)) fail('The slice unit count must be a whole number from 1 to 500.');
     if (data.deviceFingerprint != null && !HASH.test(data.deviceFingerprint)) fail('The physical printer signature must be a SHA-256 digest.');
-  } else if (command.action === 'approve_preparation') {
+  } else if (['approve_preparation', 'withdraw_preparation'].includes(command.action)) {
     if (!UUID.test(data.receiptId || '')) fail('Preparation approval requires a receipt identity.');
+    if (command.action === 'withdraw_preparation' && !text(data.reason, 2000)) fail('Preparation withdrawal requires a reason of 1 to 2000 characters.');
   } else {
+    if (data.targetId !== undefined && !UUID.test(data.targetId)) fail('Printer evidence requires a valid production target identity.');
     if (!UUID.test(data.runId || '') || !text(data.remoteId) || !text(data.observedAt, 40) || !Number.isFinite(Date.parse(data.observedAt))) fail('Printer evidence requires an explicit identified run and observation.');
     if (command.action === 'start_print' && (!UUID.test(data.receiptId || '') || !HASH.test(data.artifactSha256 || '') || !text(data.printerId))) fail('Printer start evidence must identify its approved receipt, printer and artifact.');
     if (!legacy && command.action === 'start_print' && (!HASH.test(data.deviceFingerprint || '') || !Number.isSafeInteger(data.plannedParts) || data.plannedParts < 1 || data.plannedParts > 500)) fail('Printer start evidence requires its qualified device signature and planned unit count.');
@@ -99,13 +102,26 @@ function publicEntry(entry) {
 function validProgress(progress) {
   return object(progress) && Object.keys(progress).every(key => ['requestedParts', 'printedParts', 'remainingParts', 'completedRuns', 'failedRuns'].includes(key)) &&
     ['requestedParts', 'printedParts', 'remainingParts', 'completedRuns', 'failedRuns'].every(key => Number.isSafeInteger(progress[key]) && progress[key] >= 0) &&
-    progress.requestedParts >= 1 && progress.requestedParts <= 500 && progress.printedParts <= progress.requestedParts && progress.remainingParts === progress.requestedParts - progress.printedParts;
+    progress.requestedParts <= 500 && progress.printedParts <= progress.requestedParts && progress.remainingParts === progress.requestedParts - progress.printedParts;
+}
+function validTarget(target) {
+  return object(target) && Object.keys(target).sort().join(',') === 'cycle,id,kind,requiredParts' && UUID.test(target.id || '') &&
+    Number.isSafeInteger(target.cycle) && target.cycle >= 0 && Number.isSafeInteger(target.requiredParts) && target.requiredParts >= 0 && target.requiredParts <= 500 &&
+    (target.cycle === 0 ? target.kind === 'order' && target.requiredParts > 0 : target.kind === 'replacement');
 }
 function confirmation(result, entry, now) {
   const ticket = result?.ticket;
   const command = JSON.parse(entry.bodyJson);
   if (!object(ticket) || ticket.id !== entry.id || ticket.version !== entry.version + 1 || !EXPECTED[entry.action].includes(ticket.status) || ticket.ticketFingerprint !== command.data.ticketFingerprint) fail('The portal response did not confirm the saved production operation.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
   const summary = { version: ticket.version, status: ticket.status, confirmedAt: new Date(now).toISOString() };
+  const rawTarget = ticket.production?.target, originalParts = ticket.ticket?.specifications?.project?.quantity;
+  if (rawTarget !== undefined) {
+    const target = { id: rawTarget?.id, kind: rawTarget?.kind, cycle: rawTarget?.cycle, requiredParts: rawTarget?.requiredParts };
+    if (!validTarget(target) || !Number.isSafeInteger(originalParts) || target.requiredParts > originalParts ||
+        (target.cycle === 0 ? target.id !== entry.id || target.requiredParts !== originalParts || rawTarget.qcOperationId !== null : rawTarget.qcOperationId !== target.id) ||
+        !validProgress(ticket.production?.progress) || ticket.production.progress.requestedParts !== target.requiredParts) fail('The portal did not confirm consistent production target evidence.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    summary.target = target;
+  }
   if (['record_preprocessing', 'record_slice'].includes(entry.action)) {
     const receipt = result.receipt;
     if (!object(receipt) || receipt.id !== entry.operationId || receipt.jobId !== entry.id || receipt.ticketFingerprint !== command.data.ticketFingerprint ||
@@ -114,8 +130,10 @@ function confirmation(result, entry, now) {
   }
   if (['start_print', 'finish_print', 'fail_print'].includes(entry.action) && (command.data.plannedParts !== undefined || command.data.printedParts !== undefined)) {
     const run = ticket.production?.run, progress = ticket.production?.progress, data = command.data;
-    if (!validProgress(progress) || progress.requestedParts !== ticket.ticket?.specifications?.project?.quantity || !object(run) || run.runId !== data.runId || run.remoteId !== data.remoteId ||
+    if (!validProgress(progress) || progress.requestedParts !== (summary.target?.requiredParts ?? originalParts) || progress.requestedParts < 1 || !object(run) || run.runId !== data.runId || run.remoteId !== data.remoteId ||
         !Number.isSafeInteger(run.plannedParts) || run.plannedParts < 1 || run.plannedParts > progress.requestedParts) fail('The portal did not confirm this identified run and its production quantities.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    if ((summary.target && run.targetId !== summary.target.id) || (data.targetId !== undefined && (run.targetId !== data.targetId || (summary.target && data.targetId !== summary.target.id))) ||
+        (summary.target?.cycle > 0 && data.targetId === undefined)) fail('The portal did not confirm this run for its saved production target.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
     if (entry.action === 'start_print' && (run.status !== 'printing' || run.receiptId !== data.receiptId || run.artifactSha256 !== data.artifactSha256 || run.printerId !== data.printerId ||
         run.deviceFingerprint !== data.deviceFingerprint || run.plannedParts !== data.plannedParts || Date.parse(run.startedAt) !== Date.parse(data.observedAt))) fail('The portal did not confirm the saved physical start evidence.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
     if (entry.action !== 'start_print') {
@@ -126,6 +144,11 @@ function confirmation(result, entry, now) {
           (!completed && (run.printedParts !== 0 || progress.failedRuns < 1))) fail('The portal did not confirm this run result and remaining production work.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
     }
     summary.progress = structuredClone(progress);
+  }
+  if (entry.action === 'withdraw_preparation') {
+    const production = ticket.production;
+    if (!object(production) || !validProgress(production.progress) || production.approvedReceiptId != null || production.approvedTargetId != null || production.run?.status === 'printing') fail('The portal did not confirm preparation withdrawal without an active physical run.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    summary.progress = structuredClone(production.progress);
   }
   return summary;
 }
@@ -158,8 +181,9 @@ class LayrOutbox {
               fingerprint(commandContent(entry, body)) !== entry.contentFingerprint) throw new Error('Outbox identity mismatch');
           ids.add(entry.operationId); dedup.add(entry.dedupKeyHash);
           // Persisted public confirmation must also be a narrow, safe summary.
-          if (entry.confirmation && (!object(entry.confirmation) || Object.keys(entry.confirmation).some(key => !['version', 'status', 'confirmedAt', 'receiptId', 'qualified', 'progress'].includes(key)) ||
-              entry.confirmation.version !== entry.version + 1 || !EXPECTED[entry.action].includes(entry.confirmation.status) || (entry.confirmation.progress !== undefined && !validProgress(entry.confirmation.progress)))) throw new Error('Invalid confirmation');
+          if (entry.confirmation && (!object(entry.confirmation) || Object.keys(entry.confirmation).some(key => !['version', 'status', 'confirmedAt', 'receiptId', 'qualified', 'progress', 'target'].includes(key)) ||
+              entry.confirmation.version !== entry.version + 1 || !EXPECTED[entry.action].includes(entry.confirmation.status) || (entry.confirmation.progress !== undefined && !validProgress(entry.confirmation.progress)) ||
+              (entry.confirmation.target !== undefined && (!validTarget(entry.confirmation.target) || (entry.confirmation.progress && entry.confirmation.progress.requestedParts !== entry.confirmation.target.requiredParts))))) throw new Error('Invalid confirmation');
           if ((entry.state === 'confirmed') !== Boolean(entry.confirmation)) throw new Error('Missing confirmation');
           if ((entry.state === 'dismissed') !== Boolean(entry.resolution) || (entry.resolution && (!object(entry.resolution) ||
               Object.keys(entry.resolution).sort().join(',') !== 'at,reason' || typeof entry.resolution.reason !== 'string' || !entry.resolution.reason.trim() || entry.resolution.reason.length > 500 ||

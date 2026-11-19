@@ -150,9 +150,12 @@ class ConnectorManager {
     try { return await operation; } finally { this.inFlight.delete(key); this.productionRequests.delete(key); }
   }
   reviewResinProduction(id, request) { return this._resinProductionAction('reviewProduction', id, request); }
+  reviewResinTarget(id) { return this._resinProductionAction('reviewTarget', id); }
+  prepareResinTarget(id, request) { return this._resinProductionAction('prepareTarget', id, request); }
   approveResinProduction(id, request) { return this._resinProductionAction('approvePreparation', id, request); }
   dispatchResinProduction(id, request) { return this._resinProductionAction('dispatchProduction', id, request); }
   reconcileResinProduction(id, request) { return this._resinProductionAction('reconcileProduction', id, request); }
+  withdrawResinProduction(id, request) { return this._resinProductionAction('withdrawPreparation', id, request); }
   syncResinProductionEvidence(id) { return this._resinProductionAction('syncRunEvidence', id); }
 
   async pollNow(id) {

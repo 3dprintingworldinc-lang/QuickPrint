@@ -123,9 +123,13 @@ async function startServer(options = {}) {
   app.get('/api/state', (req, res) => res.json({ ...service.snapshot(), adapterCatalog: adapterModule.adapterCatalog(), connectorStatus: connectors.status(), productionOutbox: connectors.outbox.status(), intakeStatus: { listening: Boolean(intakeServer), error: intakeError }, version }));
   app.post('/api/jobs/:id/resin/sync', async (req, res) => res.json(await connectors.queueSliceEvidence(req.params.id, { connectorId: req.body.connectorId, version: req.body.version })));
   app.get('/api/jobs/:id/resin/production', async (req, res) => res.json(await connectors.reviewResinProduction(req.params.id)));
+  app.get('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.reviewResinTarget(req.params.id)));
+  app.post('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.prepareResinTarget(req.params.id, req.body)));
+  app.get('/api/jobs/:id/resin/geometry', async (req, res) => res.json(await service.inspectResinGeometry(req.params.id)));
   app.post('/api/jobs/:id/resin/production/approve', async (req, res) => res.json(await connectors.approveResinProduction(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/production/dispatch', async (req, res) => res.json(await connectors.dispatchResinProduction(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/production/reconcile', async (req, res) => res.json(await connectors.reconcileResinProduction(req.params.id, req.body)));
+  app.post('/api/jobs/:id/resin/production/withdraw', async (req, res) => res.json(await connectors.withdrawResinProduction(req.params.id, req.body)));
   app.post('/api/integrations/layr/outbox/:id/dismiss', async (req, res) => res.json(await connectors.dismissOperation(req.params.id, { reason: req.body.reason })));
   app.post('/api/integrations/layr/connect', async (req, res) => {
     const existing = req.body.id ? service.getConnectors().find(item => item.id === req.body.id && item.type === 'layr') : null;

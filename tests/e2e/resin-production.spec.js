@@ -25,13 +25,14 @@ const test = base.extend({
     const adapter = {
       capabilities: { upload: true, start: true, pause: true, resume: true, cancel: true, formats: ['goo'], discovery: false },
       attrs: { MainboardID: '0123456789abcdef', BrandName: 'ELEGOO', MachineName: 'Synthetic SDCP model', ProtocolVersion: 'V3.0.0', FirmwareVersion: 'V1.5.6', Resolution: '4x2', XYZsize: '41x21x30', Capabilities: ['FILE_TRANSFER', 'PRINT_CONTROL'], SupportFileType: ['GOO'] },
-      telemetry: { state: 'idle' }, calls: [], serial: 0,
+      telemetry: { state: 'idle' }, calls: [], serial: 0, uncertainStart: false,
       async attributes() { this.calls.push(['attributes']); return { ...this.attrs, observedAt: new Date().toISOString() }; },
       async status() { this.calls.push(['status']); return { ...this.telemetry, observedAt: new Date().toISOString() }; },
       async upload(input) { this.calls.push(['upload', input]); this.remotePath = input.fileName; await this.onUpload?.(); return { remotePath: input.fileName }; },
       async start(input) {
         this.calls.push(['start', input]); this.remoteId = `fixture-task-${++this.serial}`;
         this.telemetry = { state: 'printing', remoteId: this.remoteId, currentFile: this.remotePath };
+        if (this.uncertainStart) throw Object.assign(new Error('Fixture physical start acknowledgement is uncertain.'), { status: 504, code: 'SDCP_START_UNCERTAIN', uncertain: true });
         return { acknowledged: true, ...this.telemetry, observedAt: new Date().toISOString() };
       },
       async pause() { this.calls.push(['pause']); return { acknowledged: true }; },
@@ -49,11 +50,21 @@ const test = base.extend({
     };
     const fingerprint = ticketFingerprint(source);
     const remote = { version: 5, status: 'preparing', printedParts: 0, completedRuns: 0, failedRuns: 0,
-      approvedReceiptId: null, receipt: null, run: null, qualified: true, writes: [], reads: [], operations: new Map() };
-    const progress = () => ({ requestedParts: 2, printedParts: remote.printedParts, remainingParts: 2 - remote.printedParts, completedRuns: remote.completedRuns, failedRuns: remote.failedRuns });
+      target: { id: source.id, kind: 'order', cycle: 0, requiredParts: 2, authorizedAt: new Date().toISOString(), qcOperationId: null },
+      targetHistory: [], totals: { printedParts: 0, completedRuns: 0, failedRuns: 0 },
+      approvedReceiptId: null, approvedTargetId: null, receipt: null, run: null, qualified: true, writes: [], reads: [], operations: new Map() };
+    const progress = () => ({ requestedParts: remote.target.requiredParts, printedParts: remote.printedParts, remainingParts: remote.target.requiredParts - remote.printedParts, completedRuns: remote.completedRuns, failedRuns: remote.failedRuns });
     const ticket = () => ({ id: source.id, reference: source.reference, version: remote.version, status: remote.status, ticketFingerprint: fingerprint,
       ticket: { specifications: structuredClone(source.ticket.specifications) },
-      production: { progress: progress(), approvedReceiptId: remote.approvedReceiptId, run: structuredClone(remote.run) } });
+      production: { target: structuredClone(remote.target), targetHistory: structuredClone(remote.targetHistory), totals: structuredClone(remote.totals),
+        progress: progress(), approvedReceiptId: remote.approvedReceiptId, approvedTargetId: remote.approvedTargetId, run: structuredClone(remote.run) } });
+    remote.authorizeReplacement = count => {
+      expect(remote.status).toBe('post_processing'); expect(progress().remainingParts).toBe(0);
+      remote.targetHistory.push({ ...structuredClone(remote.target), progress: progress() });
+      const id = randomUUID(); remote.target = { id, kind: 'replacement', cycle: remote.target.cycle + 1, requiredParts: count, authorizedAt: new Date().toISOString(), qcOperationId: id };
+      remote.printedParts = 0; remote.completedRuns = 0; remote.failedRuns = 0; remote.approvedReceiptId = null; remote.approvedTargetId = null;
+      remote.status = count ? 'preparing' : 'post_processing'; remote.version++;
+    };
     const checkConfig = config => { expect(config.portalUrl).toBe(PORTAL); expect(config.token).toBe(MACHINE_TOKEN); };
     const client = {
       ticketFingerprint: productionClient.ticketFingerprint,
@@ -74,7 +85,8 @@ const test = base.extend({
           jobVersion: remote.version, ticketFingerprint: fingerprint, receiptId: receipt.id, sourceSha256: receipt.sourceSha256,
           artifactSha256: receipt.artifact.sha256, profileSha256: receipt.profileSha256, engineSha256: receipt.tool.executableSha256,
           printerId: receipt.printerId, printerModel: receipt.printerModel, material: receipt.material, format: 'goo', deviceFingerprint: receipt.deviceFingerprint,
-          partsPerRun: 1, plannedParts: 1, remainingParts: progress().remainingParts, qualificationFingerprint: 'f'.repeat(64) } };
+          partsPerRun: 1, plannedParts: 1, remainingParts: progress().remainingParts, qualificationFingerprint: 'f'.repeat(64),
+          targetId: remote.target.id, targetKind: remote.target.kind, targetCycle: remote.target.cycle, targetParts: remote.target.requiredParts } };
       },
       async postEvidence(config, command) {
         checkConfig(config);
@@ -89,17 +101,22 @@ const test = base.extend({
             break;
           case 'approve_preparation':
             expect(remote.status).toBe('preparing'); expect(data.receiptId).toBe(remote.receipt.id); expect(remote.qualified).toBe(true);
-            remote.approvedReceiptId = data.receiptId; remote.status = 'queued'; break;
+            remote.approvedReceiptId = data.receiptId; remote.approvedTargetId = remote.target.id; remote.status = 'queued'; break;
+          case 'withdraw_preparation':
+            expect(remote.status).toBe('queued'); expect(data.receiptId).toBe(remote.approvedReceiptId); expect(remote.run?.status).not.toBe('printing');
+            remote.approvedReceiptId = null; remote.approvedTargetId = null; remote.status = 'preparing'; break;
           case 'start_print':
             expect(remote.status).toBe('queued'); expect(data.plannedParts).toBe(1); expect(data.receiptId).toBe(remote.approvedReceiptId);
-            expect(adapter.calls.filter(([action]) => action === 'start')).toHaveLength(remote.completedRuns + 1);
+            expect(adapter.calls.filter(([action]) => action === 'start')).toHaveLength(remote.totals.completedRuns + 1);
+            expect(data.targetId).toBe(remote.target.id);
             expect(data.remoteId).toBe(adapter.remoteId); expect(data.deviceFingerprint).toBe(remote.receipt.deviceFingerprint);
             remote.run = { ...structuredClone(data), status: 'printing', startedAt: data.observedAt }; remote.status = 'printing'; break;
           case 'finish_print':
             expect(remote.status).toBe('printing'); expect(data.runId).toBe(remote.run.runId); expect(data.remoteId).toBe(remote.run.remoteId); expect(data.printedParts).toBe(1);
-            remote.printedParts++; remote.completedRuns++;
+            expect(data.targetId).toBe(remote.target.id);
+            remote.printedParts++; remote.completedRuns++; remote.totals.printedParts++; remote.totals.completedRuns++;
             remote.run = { ...remote.run, status: 'completed', printedParts: 1, finishedAt: data.observedAt };
-            remote.status = remote.printedParts === 2 ? 'post_processing' : 'queued'; break;
+            remote.status = progress().remainingParts === 0 ? 'post_processing' : 'queued'; break;
           default: throw new Error(`Unexpected production mutation ${command.action}`);
         }
         remote.version++; remote.writes.push(structuredClone(command));
@@ -231,6 +248,49 @@ test('two resin units require separate physical confirmations and counted runs, 
   expect(dispatchBodies).toEqual([{ confirmedReady: true }, { confirmedReady: true }]);
   expect(mutations(workspace.adapter).map(([action]) => action)).toEqual(['upload', 'start', 'upload', 'start']);
   expect(errors).toEqual([]);
+  // The studio can authorize a separately identified replacement target. The
+  // browser must show its quantity while retaining the frozen two-unit order.
+  workspace.remote.authorizeReplacement(1);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await openJob(page, workspace); await review(page);
+  await expect(page.getByText('QC replacement 1 · 1 units', { exact: true })).toBeVisible();
+  await expect(page.getByText('0 printed · 1 remaining', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Approve one-unit run plan', exact: true })).toBeVisible();
+  expect(workspace.service.getJob(workspace.job.id).order.requestedQuantity).toBe(2);
+  expect(workspace.remote.totals.printedParts).toBe(2);
+  expect(workspace.adapter.calls.filter(([action]) => action === 'start')).toHaveLength(2);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await openJob(page, workspace);
+  await expect(page.getByRole('button', { name: 'Slice resin model', exact: true })).toBeDisabled();
+  const previousSlice = workspace.service.getJob(workspace.job.id).resinSlice;
+  const profilePath = workspace.service.getSettings().resinEngine.profilePath;
+  const profile = JSON.parse(await fs.readFile(profilePath)); profile.material = 'Revised replacement fixture';
+  await fs.writeFile(profilePath, JSON.stringify(profile));
+  workspace.remote.qualified = false;
+  const readsBeforeTarget = workspace.adapter.calls.length;
+  await page.getByRole('button', { name: 'Review current target', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Review current production target', exact: true })).toBeVisible();
+  await expect(page.getByText('QC replacement 1 · 1 units', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Prepare replacement target', exact: true }).click();
+  expect(workspace.service.getJob(workspace.job.id).resinProduction.target.kind).toBe('order');
+  await page.locator('[name="confirmedTarget"]').check();
+  await page.getByRole('button', { name: 'Prepare replacement target', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Slice resin model', exact: true })).toBeEnabled();
+  expect(workspace.adapter.calls.length).toBe(readsBeforeTarget);
+  expect(workspace.remote.writes.filter(value => value.action === 'approve_preparation')).toHaveLength(1);
+  expect(workspace.service.getJob(workspace.job.id)).toMatchObject({ runs: [expect.any(Object), expect.any(Object)], acceptedQuantity: 0, resinProduction: { target: { kind: 'replacement', cycle: 1 }, printedParts: 0, remainingParts: 1, lifetimeLocalPrintedParts: 2 } });
+  await page.locator('[name="confirmedRequirements"]').check();
+  await page.locator('[name="confirmedOriginalSize"]').check();
+  const replacementResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${workspace.job.id}/resin/slice`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Slice resin model', exact: true }).click();
+  expect((await replacementResponse).ok()).toBe(true);
+  await expect(page.getByText('Slice captured for qualification', { exact: true })).toBeVisible();
+  const replacementSlice = workspace.service.getJob(workspace.job.id).resinSlice;
+  expect(replacementSlice.profileSha256).not.toBe(previousSlice.profileSha256);
+  expect(replacementSlice.material).toBe('Revised replacement fixture');
+  expect(await fs.readFile(workspace.service.getJob(workspace.job.id).inputPath)).toEqual(MODEL);
+  expect(workspace.remote.totals.printedParts).toBe(2); expect(errors).toEqual([]);
 });
 
 test('a current qualification revocation is visible and cannot approve or start a resin order', async ({ page, workspace }) => {
@@ -243,4 +303,75 @@ test('a current qualification revocation is visible and cannot approve or start 
   expect(workspace.remote.writes.map(value => value.action)).toEqual(['record_slice']);
   expect(mutations(workspace.adapter)).toEqual([]);
   expect(workspace.service.getJob(workspace.job.id)).toMatchObject({ status: 'review', acceptedQuantity: 0, runs: [] });
+});
+
+test('confirmed withdrawal reopens slicing and reapproval creates a new operation with the same order target and counts', async ({ page, workspace }) => {
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  await approve(page, workspace);
+  const initial = workspace.remote.writes.find(value => value.action === 'approve_preparation');
+  const target = structuredClone(workspace.remote.target), counts = structuredClone(workspace.remote.totals);
+  await expect(page.getByText('Original order · 2 units', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Close', exact: true }).click(); await openJob(page, workspace);
+  await expect(page.getByRole('button', { name: 'Slice resin model', exact: true })).toBeDisabled();
+  await review(page);
+  await page.getByRole('button', { name: 'Reopen preparation', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Reopen resin preparation', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Withdraw preparation', exact: true }).click();
+  expect(workspace.remote.writes.filter(value => value.action === 'withdraw_preparation')).toHaveLength(0);
+  const reason = 'Recheck support placement and prepare the reviewed model again.';
+  await page.getByLabel('Reason for reopening preparation').fill(reason);
+  const withdrawalResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${workspace.job.id}/resin/production/withdraw`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Withdraw preparation', exact: true }).click();
+  const withdrawn = await withdrawalResponse; expect(withdrawn.ok()).toBe(true);
+  expect(withdrawn.request().postDataJSON()).toEqual({ receiptId: workspace.remote.receipt.id, reason });
+  await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Slice resin model', exact: true })).toBeEnabled();
+  expect(workspace.remote.status).toBe('preparing');
+  expect(workspace.service.getJob(workspace.job.id).resinProduction.plan.approvalState).toBe('withdrawn');
+  expect(workspace.remote.target).toEqual(target); expect(workspace.remote.totals).toEqual(counts);
+  const oldCapture = workspace.service.getJob(workspace.job.id).resinSlice.filePath;
+  await page.locator('[name="confirmedRequirements"]').check();
+  await page.locator('[name="confirmedOriginalSize"]').check();
+  const sliceResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${workspace.job.id}/resin/slice`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Slice resin model', exact: true }).click();
+  expect((await sliceResponse).ok()).toBe(true);
+  await expect.poll(() => workspace.service.getJob(workspace.job.id).resinSlice.filePath).not.toBe(oldCapture);
+  await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
+  const receiptResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${workspace.job.id}/resin/sync`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Queue slice receipt', exact: true }).click();
+  expect((await receiptResponse).ok()).toBe(true);
+  await workspace.api(`/api/connectors/${workspace.connector.id}/poll`, {});
+  await expect(page.getByRole('button', { name: 'Review production qualification', exact: true })).toBeVisible();
+  await review(page); await page.locator('[name="confirmedWholeModel"]').check();
+  await page.getByRole('button', { name: 'Approve one-unit run plan', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Reopen preparation', exact: true })).toBeVisible();
+  const approvals = workspace.remote.writes.filter(value => value.action === 'approve_preparation');
+  expect(approvals).toHaveLength(2); expect(approvals[1].operationId).not.toBe(initial.operationId); expect(approvals[1].version).toBeGreaterThan(initial.version);
+  expect(approvals[1].data.receiptId).toBe(initial.data.receiptId);
+  expect(workspace.remote.target).toEqual(target); expect(workspace.remote.totals).toEqual(counts);
+  expect(workspace.service.getJob(workspace.job.id)).toMatchObject({ quantity: 1, acceptedQuantity: 0, runs: [], order: { requestedQuantity: 2 }, resinProduction: { printedParts: 0, remainingParts: 2, plan: { approvalState: 'approved', approvalOperationId: approvals[1].operationId } } });
+  expect(mutations(workspace.adapter)).toEqual([]); expect(errors).toEqual([]);
+});
+
+for (const mode of ['active', 'uncertain']) test(`${mode} physical resin run cannot expose preparation withdrawal`, async ({ page, workspace }) => {
+  await approve(page, workspace); await enableDispatch(page); await openJob(page, workspace); await review(page);
+  workspace.adapter.uncertainStart = mode === 'uncertain';
+  await page.getByRole('button', { name: 'Start one resin unit', exact: true }).click();
+  await page.getByRole('checkbox', { name: /The correct resin is loaded, the build plate is clear/ }).check();
+  const dispatchResponse = page.waitForResponse(response => response.url().endsWith(`/api/jobs/${workspace.job.id}/resin/production/dispatch`) && response.request().method() === 'POST');
+  await page.getByRole('button', { name: 'Start one resin unit', exact: true }).click();
+  const response = await dispatchResponse;
+  expect(response.status()).toBe(mode === 'active' ? 200 : 504);
+  if (mode === 'active') await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
+  else await expect(page.getByRole('alert')).toContainText('Fixture physical start acknowledgement is uncertain.');
+  const guarded = await page.request.post(`${workspace.url}/api/jobs/${workspace.job.id}/resin/production/withdraw`, { headers: { Authorization: `Bearer ${workspace.token}` }, data: { receiptId: workspace.remote.receipt.id, reason: 'This physical run is still unresolved.' } });
+  expect(guarded.status()).toBe(409);
+  await page.getByRole('button', { name: 'Close dialog', exact: true }).click();
+  await openJob(page, workspace); await review(page);
+  await expect(page.getByRole('button', { name: 'Reopen preparation', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Start one resin unit', exact: true })).toHaveCount(0);
+  const current = workspace.service.getJob(workspace.job.id);
+  expect(current.currentRunId).toBeTruthy(); expect(current.status).toBe(mode === 'active' ? 'printing' : 'needs_attention');
+  expect(workspace.remote.writes.filter(value => value.action === 'withdraw_preparation')).toHaveLength(0);
+  expect(workspace.adapter.calls.filter(([action]) => action === 'start')).toHaveLength(1);
 });

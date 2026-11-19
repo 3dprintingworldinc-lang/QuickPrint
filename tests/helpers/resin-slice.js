@@ -1,11 +1,12 @@
 'use strict';
 const fs = require('node:fs/promises');
+const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { loadProfile } = require('../../src/slicing/resin-engine');
 const { inspectGoo } = require('../../src/slicing/goo');
 const { buildOrderMetadata } = require('../../src/connectors/layr-client');
-const MODEL = Buffer.from('solid resin_source\nendsolid resin_source\n');
+const MODEL = readFileSync(path.join(__dirname, '..', 'fixtures', 'resin', 'verification-cube.stl'));
 const CONFIRMED = { confirmedRequirements: true, confirmedOriginalSize: true };
 const hash = data => crypto.createHash('sha256').update(data).digest('hex');
 
@@ -19,7 +20,7 @@ async function createProfile(root) {
     uvtoolsProperties: { MachineName: 'QuickPrint Test', LayerHeight: 0.05, ExposureTime: 2, BottomExposureTime: 20, BottomLayerCount: 1, BottomLiftHeight: 5, LiftHeight: 5, BottomLiftSpeed: 100, LiftSpeed: 100, RetractSpeed: 100, BottomRetractSpeed: 100, LightPWM: 255, BottomLightPWM: 255 },
   };
   await fs.writeFile(profilePath, JSON.stringify(profile));
-  await fs.writeFile(presetPath, 'printer_technology=SLA\nsla_archive_format=SL1\nhollowing_enable=0\ndisplay_pixels_x=4\ndisplay_pixels_y=2\ndisplay_width=40\ndisplay_height=20\ndisplay_mirror_x=0\ndisplay_mirror_y=1\ndisplay_orientation=landscape\nsupports_enable=1\npad_enable=1\nlayer_height=0.05\ninitial_layer_height=0.05\nexposure_time=2\ninitial_exposure_time=20\nmax_print_height=30\n');
+  await fs.writeFile(presetPath, 'printer_technology=SLA\nsla_archive_format=SL1\nhollowing_enable=0\ndisplay_pixels_x=4\ndisplay_pixels_y=2\ndisplay_width=40\ndisplay_height=20\nbed_shape=0x0,40x0,40x20,0x20\ndisplay_mirror_x=0\ndisplay_mirror_y=1\ndisplay_orientation=landscape\nsupports_enable=1\npad_enable=1\nlayer_height=0.05\ninitial_layer_height=0.05\nexposure_time=2\ninitial_exposure_time=20\nmax_print_height=30\n');
   return { prusaExecutable: path.join(root, 'prusa-console.exe'), uvtoolsExecutable: path.join(root, 'UVtoolsCmd.exe'), profilePath, timeoutMs: 10000 };
 }
 
@@ -50,7 +51,9 @@ async function makeSlice(input, { issues = 0 } = {}) {
   const directory = await fs.mkdtemp(path.join(input.outputDir, 'capture-'));
   const filePath = path.join(directory, 'prepared.goo'), bytes = goo(); await fs.writeFile(filePath, bytes);
   const loaded = await loadProfile(input.profilePath);
-  return { filePath, fileName: 'prepared.goo', bytes: bytes.length, format: 'goo', modelCopiesPerRun: 1, sha256: hash(bytes), sourceSha256: hash(await fs.readFile(input.inputPath)), profileSha256: loaded.profileSha256, printerId: loaded.profile.printerId, printerModel: loaded.profile.printerModel, material: loaded.profile.material, tool: { name: 'Fixture engine', version: 'test', executableSha256: 'e'.repeat(64) }, inspection: inspectGoo(bytes), analysis: { count: issues, passed: issues === 0, checks: ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'], issues: Array.from({ length: issues }, (_, index) => `Island ${index + 1}`) }, attempts: [], printReady: true, printerCompatible: true };
+  const prepared = require('../../src/slicing/resin-geometry').prepareResinGeometry(await fs.readFile(input.inputPath), { format: path.extname(input.inputPath).slice(1).toLowerCase(), units: { 1: 'mm', 25.4: 'in', 1000: 'm' }[input.unitScale || 1], sizing: input.sizing || { mode: 'original' } });
+  const preparedInput = path.join(directory, 'prepared-input.stl'); await fs.writeFile(preparedInput, prepared.stl, { flag: 'wx' });
+  return { filePath, fileName: 'prepared.goo', bytes: bytes.length, format: 'goo', modelCopiesPerRun: 1, sizingPlan: prepared.plan, inputGeometry: { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds }, sha256: hash(bytes), sourceSha256: prepared.plan.sourceSha256, profileSha256: loaded.profileSha256, printerId: loaded.profile.printerId, printerModel: loaded.profile.printerModel, material: loaded.profile.material, tool: { name: 'Fixture engine', version: 'test', executableSha256: 'e'.repeat(64) }, inspection: inspectGoo(bytes), analysis: { count: issues, passed: issues === 0, checks: ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'], issues: Array.from({ length: issues }, (_, index) => `Island ${index + 1}`) }, attempts: [], printReady: true, printerCompatible: true };
 }
 
 async function importTicket(service, { units = 'mm', project = {} } = {}) {

@@ -8,11 +8,10 @@ const { startServer } = require('../../src/server');
 const { LayrOAuth } = require('../../src/connectors/layr-oauth');
 const { buildOrderMetadata, ticketFingerprint } = require('../../src/connectors/layr-client');
 const productionClient = require('../../src/connectors/layr-production-client');
-const { createProfile, makeSlice } = require('../helpers/resin-slice');
+const { MODEL, createProfile, makeSlice } = require('../helpers/resin-slice');
 
 const PORTAL = 'https://printbylayr.example';
 const CODE = 'a'.repeat(43);
-const MODEL = Buffer.from('solid fixture\nendsolid fixture\n');
 const PROJECT = 'Resin <Fixture> & assembly';
 const NOTES = 'Keep <b data-fixture-injection="yes">detail</b> & no visible supports.';
 const PROBE_ERROR = 'Fixture SatelLite evaluation produced no validated output.';

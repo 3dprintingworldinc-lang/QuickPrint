@@ -44,9 +44,18 @@ profile is not a production calibration.
 
 Connect the scoped production machine API under **Inputs** and import a paid
 resin ticket awaiting preparation. Resolve scale, target dimensions, supports,
-finish and other free-text requirements before slicing. Confirm that the desired
-size is already embodied in the model geometry; the engine applies only the
-declared mm/in/m unit conversion. It does not infer those instructions.
+finish and other free-text requirements before slicing. Use **Measure model**,
+then choose **Current model size**, **Uniform scale factor** or **Set one
+source-axis dimension**. The latter choices scale the whole model uniformly
+after its declared mm/in/m conversion. Review the millimetre preview and confirm
+the chosen plan. Text instructions are not interpreted automatically.
+
+Original bytes are preserved; a separate normalized and hashed millimetre STL
+embodies the numeric plan. Exact candidate-vertex extents after Z -> X -> Y
+rotation must fit the reviewed rectangular SLA bed and maximum height. See
+[model sizing](RESIN-SIZING.md) for source-axis meaning, parser/float32 bounds and
+reproduction. STEP/STP can arrive for review but needs reviewed tessellation
+before this STL/triangulated-OBJ resin path.
 
 Select the reviewed slot and choose **Slice resin model**. The engine evaluates
 the configured rotations, captures GOO, validates its layers and target values,
@@ -118,8 +127,8 @@ explicit readiness confirmation.
 The service then:
 
 1. Reconciles saved portal evidence and reads fresh authorization for the exact
-   queued ticket, receipt, device and remaining quantity.
-2. Rechecks original/GOO/profile hashes, local printer binding, device attributes,
+   queued ticket, receipt, device, current production target and remaining quantity.
+2. Rechecks original/normalized-input/GOO/profile hashes, sizing proof, local printer binding, device attributes,
    GOO capabilities and fresh idle status. It creates a short-lived, one-use
    internal permit; HTTP-supplied `qualified`/approval flags cannot create one.
 3. Durably records a new run ID and unique remote filename, then uploads that
@@ -151,13 +160,76 @@ The manager durably synchronizes `finish_print` or `fail_print`. With one unit
 recorded on a two-unit ticket, the portal returns to `queued` with one remaining;
 it does not start the next run. Reopen production review, check readiness and
 explicitly start that unit. Each run has a new local run ID, remote filename and
-identified printer task. When all requested printed units are recorded, the
+identified printer task. Starts/results also bind the current target identity.
+When all units of that target are recorded, the
 portal advances to `post_processing`.
 
 These are printed-unit counts, not quality acceptance. Generic file-copy
 quantity stays separate, and no local `acceptedQuantity`/QC credit is granted.
 Washing, curing, support removal, physical inspection and delivery still need
 their own evidence and studio workflow.
+
+## 7. Reopen queued preparation for revision
+
+With no active or uncertain local run and no unresolved physical evidence, open
+**Review production qualification -> Reopen preparation**. Enter a required
+reason and choose **Withdraw preparation**. This sends `withdraw_preparation`
+for the exact queued receipt/current version and returns the portal to
+`preparing`. It clears approval while preserving payment, the frozen ticket,
+current target, printed/remaining counts and immutable run history.
+
+Wait for a confirmed operation and fresh same-target portal read before the local
+hold releases. A lost reply retains the hold and replays the same UUID/body after
+restart. Withdrawal can recover a preparation whose local source/profile/artifact
+is damaged; it supplies no qualification for those files. Restore the verified
+source or follow the reviewed source-change workflow, then revise numeric sizing
+or profile settings and capture the intended slice. Updating an original file in
+place still violates its hash binding.
+
+Review the receipt and approve again. A new approval operation is required even
+if the same receipt is reused; an older acknowledgement cannot approve a newer
+preparation generation. Withdrawal does not stop a printer, reset production
+counts, cancel the order or award QC acceptance.
+
+## 8. Follow an explicit studio QC replacement target
+
+After the current target is completed and its physical evidence is reconciled,
+the studio completes post-processing and performs quality inspection. A studio
+`qc_fail` requires inspection notes and an explicit `replacementQuantity` integer
+from **0 through the original frozen order quantity**. An empty input is not
+assumed to be zero. Active runs or an incomplete managed target block that
+decision. Machine credentials cannot create or enlarge replacement allowances.
+
+A positive quantity creates a new `replacement` target/cycle and returns the
+portal to `preparing`; its target ID is that QC operation's UUID. Use **Review
+current target**, confirm the studio-defined allowance, then choose **Prepare
+replacement target**. This fetches a fresh, unapproved, stopped target and adopts
+the newer QC cycle locally. Confirmation submits the target ID returned by the
+review; a different current target must be refreshed and reviewed rather than
+silently adopted. It archives previous-target counters, retains source,
+captured slice and run history, and clears only the previous target's local plan
+hold. It sends no portal write and supplies no preparation approval or device
+qualification. Repeating adoption of the same target cannot release a later
+approval.
+
+Target review/adoption does not require an intact old slice/profile or device
+qualification, so it can reopen preparation for a revised sizing/profile.
+Measure/reslice as needed, confirm the intended device-bound receipt, and approve
+the new target's plan explicitly before separately confirming each run.
+Every fresh authorization, start and result must name that target. Old run
+evidence cannot be reused as replacement credit. Zero explicitly authorizes
+no replacement printing and returns to `post_processing` for finishing-only
+correction and another studio inspection; use **Record finishing-only target**
+to adopt that local record without authorizing any physical start.
+
+The original order quantity stays frozen. `production.progress` and the local
+production review count only the current target; `production.totals` preserves
+lifetime machine evidence and `targetHistory` preserves earlier targets. For
+example, an original two-unit order followed by one authorized replacement has
+three lifetime printed units, while the replacement target is one requested,
+one printed, zero remaining. This is not a three-unit customer order or QC
+acceptance. Washing, curing, inspection and explicit studio acceptance remain
+separate from those counts.
 
 ## Uncertainty and synchronization recovery
 
@@ -181,7 +253,10 @@ All routes require the local QuickPrint access token:
 | Route | Operation |
 | --- | --- |
 | `GET /api/jobs/:id/resin/production` | Read current receipt/device qualification, binding JSON, plan and quantities |
+| `GET .../production/target` | Read the current studio target without slice/device qualification |
+| `POST .../production/target` | `{confirmedTarget:true, targetId}` using the UUID returned by GET; locally adopt that newer stopped, unapproved replacement/finishing target; no portal write |
 | `POST .../production/approve` | `{receiptId, confirmedWholeModel:true}`; review the exact plan and queue portal approval |
+| `POST .../production/withdraw` | `{receiptId?, reason}`; withdraw the exact stopped queued approval without resetting counts |
 | `POST .../production/dispatch` | `{confirmedReady:true}`; authorize and attempt one physical run |
 | `POST .../production/reconcile` | `{runId, outcome, printedParts, notes}`; record the exact stopped run and synchronize evidence |
 
@@ -197,9 +272,8 @@ No case uploads to or starts a real printer.
 ## Remaining production work
 
 Live portal migration/deployment/token setup and actual hardware qualification
-remain. The engine does not resolve arbitrary sizing instructions, hollow/drain
-plans, existing mesh cavities, arbitrary supports/finish requirements or packing.
-Post-processing and QC remain separate. If all requested units are printed but
-later fail QC, replacement work needs a new explicit replacement/rework target
-contract; this flow does not silently increase the frozen ticket quantity or
-reuse completed run evidence as replacement credit.
+remain. The engine does not interpret free-text sizing, perform resin STEP
+tessellation, establish hollow/drain plans or cavity safety, infer arbitrary
+supports/finish requirements, or pack multiple source instances. Post-processing,
+QC decisions, replacement allowance and delivery remain explicit studio/operator
+work; no automatic quality acceptance is inferred from printed-unit evidence.

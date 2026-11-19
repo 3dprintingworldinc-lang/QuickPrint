@@ -7,14 +7,17 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');
+const { spawnSync } = require('node:child_process');
 const AdmZip = require('adm-zip');
 const { prepareResin, loadProfile, parseIni, parseIssueReport, inspectSl1, parameterScript, assertTargetProperties } = require('../src/slicing/resin-engine');
+const { measureResinGeometry, prepareResinGeometry, float32Tolerance } = require('../src/slicing/resin-geometry');
 
 const sha = data => crypto.createHash('sha256').update(data).digest('hex');
 const HEADER_SIZE = 195477;
 const PRESET = {
   printer_technology: 'SLA', sla_archive_format: 'SL1', hollowing_enable: '0',
   display_pixels_x: '4', display_pixels_y: '2', display_width: '40', display_height: '20',
+  bed_shape: '0x0,40x0,40x20,0x20',
   display_mirror_x: '0', display_mirror_y: '1', display_orientation: 'landscape',
   supports_enable: '1', pad_enable: '1', layer_height: '0.05', initial_layer_height: '0.05',
   exposure_time: '2', initial_exposure_time: '20', max_print_height: '30',
@@ -83,7 +86,7 @@ function goo() {
 async function fixture(t, changes = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'quickprint-resin-engine-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const original = Buffer.from('solid original\nendsolid original\n');
+  const original = await fs.readFile(path.join(__dirname, 'fixtures', 'resin', 'verification-cube.stl'));
   const profile = {
     schemaVersion: 1, printerId: 'fixture-printer', printerModel: 'QuickPrint Test', material: 'Synthetic fixture', presetPath: 'preset.ini',
     expected: { resolutionX: 4, resolutionY: 2, displayWidthMm: 40, displayHeightMm: 20, layerHeightMm: 0.05, mirrorX: false, mirrorY: true },
@@ -101,7 +104,7 @@ async function fixture(t, changes = {}) {
   return { root, options, profile, original };
 }
 
-function provider({ version = '7.1.2', issues = [0], archiveOptions, noGoo = false, noReceipt = false, wrongReceipt = false, mutateProperties, error, mutateOnAnalysis, mutateSource, exitOne = false } = {}) {
+function provider({ version = '7.1.2', issues = [0], archiveOptions, noGoo = false, noReceipt = false, wrongReceipt = false, mutateProperties, error, mutateOnAnalysis, mutateSource, inspectInput, exitOne = false } = {}) {
   const calls = [];
   const run = async (executable, args, options) => {
     calls.push({ executable, args, options });
@@ -110,6 +113,9 @@ function provider({ version = '7.1.2', issues = [0], archiveOptions, noGoo = fal
     if (args[0] === '--core-version') return version;
     if (error) throw error;
     if (args.includes('--export-sla')) {
+      assert.equal(path.basename(args.at(-1)), 'prepared-input.stl');
+      assert.equal(args[args.indexOf('--scale') + 1], '1', 'all unit and sizing transforms must be embodied in input bytes');
+      if (inspectInput) await inspectInput(args.at(-1), args);
       const output = args[args.indexOf('--output') + 1];
       await fs.writeFile(output, sl1(archiveOptions));
       if (mutateSource) await mutateSource();
@@ -161,6 +167,33 @@ test('profile rejects inherited/unsafe hollow presets and invalid orientation ca
   await assert.rejects(loadProfile(f.options.profilePath), { code: 'RESIN_PROFILE_INVALID' });
 });
 
+test('profile bed follows a reviewed zero-origin rectangle and explicitly bounds machine height', async t => {
+  const f = await fixture(t);
+  for (const bed_shape of ['0x0,40x0,40x20,0x20', '40x20,40x0,0x0,0x20,40x20', '0x20,0x0,40x0,40x20', '0.0000001x0,40x0,40x20,0x20']) {
+    await fs.writeFile(path.join(f.root, 'preset.ini'), ini({ ...PRESET, bed_shape }));
+    assert.equal((await loadProfile(f.options.profilePath)).ini.bed_shape, bed_shape);
+  }
+  for (const bed_shape of [undefined, '', '0x0,39x0,39x20,0x20', '0x0,41x0,41x20,0x20', '1x0,41x0,41x20,1x20', '0x0,40x20,40x0,0x20', '0x0,40x0,40x20,0x20,1x0', '0x0,40x0,40x20,0x0', '0x0,40x0,40x20', '0x0,Infinityx0,40x20,0x20']) {
+    const preset = { ...PRESET, bed_shape }; if (bed_shape === undefined) delete preset.bed_shape;
+    await fs.writeFile(path.join(f.root, 'preset.ini'), ini(preset));
+    const mock = provider();
+    await assert.rejects(prepareResin(f.options, mock), { code: 'RESIN_PROFILE_INVALID' });
+    assert.equal(mock.calls.length, 0);
+  }
+  for (const max_print_height of [undefined, '', 'NaN', 'Infinity', '0', '-1', '10001']) {
+    const preset = { ...PRESET, max_print_height }; if (max_print_height === undefined) delete preset.max_print_height;
+    await fs.writeFile(path.join(f.root, 'preset.ini'), ini(preset));
+    await assert.rejects(loadProfile(f.options.profilePath), { code: 'RESIN_PROFILE_INVALID' });
+  }
+  await fs.writeFile(path.join(f.root, 'preset.ini'), ini(PRESET));
+  for (const machineZMm of [29, '30', null]) {
+    await fs.writeFile(f.options.profilePath, JSON.stringify({ ...f.profile, expected: { ...f.profile.expected, machineZMm } }));
+    await assert.rejects(loadProfile(f.options.profilePath), { code: 'RESIN_PROFILE_INVALID' });
+  }
+  await fs.writeFile(f.options.profilePath, JSON.stringify({ ...f.profile, expected: { ...f.profile.expected, machineZMm: 30 } }));
+  assert.equal((await loadProfile(f.options.profilePath)).profile.expected.machineZMm, 30);
+});
+
 test('a credential-bearing preset is rejected before providers run or a job snapshot is written', async t => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.root, 'preset.ini'), ini({ ...PRESET, printhost_apikey: 'private-fixture-key' }));
@@ -172,12 +205,12 @@ test('a credential-bearing preset is rejected before providers run or a job snap
 });
 
 test('SLA archive checks effective layer counts, PNG dimensions, technology, height and sequence', () => {
-  const expected = { resolutionX: 4, resolutionY: 2, displayWidthMm: 40, displayHeightMm: 20, layerHeightMm: 0.05, mirrorX: false, mirrorY: true };
+  const expected = { resolutionX: 4, resolutionY: 2, displayWidthMm: 40, displayHeightMm: 20, machineZMm: 30, layerHeightMm: 0.05, mirrorX: false, mirrorY: true };
   assert.equal(inspectSl1(sl1(), expected).layerCount, 2);
   for (const options of [{ gap: true }, { dimensions: [8, 2] }, { config: { numFast: '3' } }, { effective: { printer_technology: 'FFF' } }, { config: { layerHeight: '0.1' } }, { missingPreset: true }]) {
     assert.throws(() => inspectSl1(sl1(options), expected), { code: 'RESIN_ARCHIVE_INVALID' });
   }
-  for (const effective of [{ display_width: '41' }, { display_pixels_x: '8' }, { display_mirror_y: '0' }, { display_orientation: 'portrait' }]) {
+  for (const effective of [{ display_width: '41' }, { display_pixels_x: '8' }, { display_mirror_y: '0' }, { display_orientation: 'portrait' }, { bed_shape: '0x0,39x0,39x20,0x20' }, { bed_shape: '0x0,40x20,40x0,0x20' }, { max_print_height: '29' }, { max_print_height: 'NaN' }]) {
     assert.throws(() => inspectSl1(sl1({ effective }), expected), { code: 'RESIN_EFFECTIVE_PROFILE_MISMATCH' });
   }
 });
@@ -212,13 +245,124 @@ test('orientation search stops at first issue-free artifact and preserves source
   'single-instance evidence must never invoke Prusa duplication or grid duplication');
   const slice = mock.calls.find(call => call.args.includes('--export-sla'));
   assert.notEqual(slice.args.at(-1), f.options.inputPath);
-  assert.deepEqual(await fs.readFile(slice.args.at(-1)), f.original);
+  assert.equal(slice.args.at(-1), result.inputGeometry.filePath);
+  assert.deepEqual(await fs.readFile(path.join(path.dirname(result.inputGeometry.filePath), 'source.stl')), f.original);
+  assert.equal(result.inputGeometry.sha256, sha(await fs.readFile(slice.args.at(-1))));
+  assert.equal(result.sizingPlan.sourceSha256, sha(f.original));
+  assert.deepEqual(result.sizingPlan.dimensionsMm, { x: 3, y: 3, z: 3 });
+  assert.deepEqual(evidence.inputGeometry, result.inputGeometry);
+  assert.deepEqual(evidence.sizingPlan, result.sizingPlan);
+  assert.ok(result.tool.binaryManifest.some(item => item.name === 'quickprint-resin-geometry'));
 });
 
 test('all failing orientations remain analysis_failed and select the fewest reported issues', async t => {
   const f = await fixture(t); const result = await prepareResin(f.options, provider({ issues: [3, 1, 2] }));
   assert.equal(result.status, 'analysis_failed'); assert.equal(result.analysis.count, 1);
   assert.equal(result.attempts.length, 3); assert.equal(result.printReady, false);
+});
+
+test('unit conversion and requested uniform sizing are measurable in the exact STL supplied to every SLA candidate', async t => {
+  const f = await fixture(t);
+  for (const [unitScale, sizing, millimeters] of [
+    [1, { mode: 'scale', factor: 2 }, 6],
+    [25.4, { mode: 'scale', factor: 0.1 }, 7.62],
+    [1000, { mode: 'scale', factor: 0.001 }, 3],
+  ]) {
+    let checked = 0;
+    const mock = provider({ issues: [1, 0], inspectInput: async filename => {
+      checked++;
+      const measured = measureResinGeometry(await fs.readFile(filename), { format: 'stl', units: 'mm' });
+      for (const axis of ['x', 'y', 'z']) assert.ok(Math.abs(measured.sourceDimensionsMm[axis] - millimeters) <= float32Tolerance(millimeters));
+    } });
+    const result = await prepareResin({ ...f.options, unitScale, sizing }, mock);
+    assert.equal(checked, 2);
+    assert.deepEqual(result.sizingPlan.requestedSizing, sizing);
+    assert.equal(result.sizingPlan.unitScale, unitScale);
+    assert.equal(result.sizingPlan.uniformScale, sizing.factor);
+    assert.equal(result.inputGeometry.bytes, 84 + 12 * 50);
+    assert.notEqual(result.sourceSha256, result.inputGeometry.sha256);
+    assert.deepEqual(await fs.readFile(f.options.inputPath), f.original);
+  }
+});
+
+test('dimension sizing uses source axes before rotations and preserves all components with one global origin translation', async t => {
+  const f = await fixture(t);
+  const original = Buffer.from(f.original.toString().replace(/vertex ([^\s]+) ([^\s]+) ([^\s]+)/g, (_, x, y, z) => `vertex ${Number(x) + 120} ${Number(y) * 2 - 25} ${Number(z) * 3 + 9}`));
+  await fs.writeFile(f.options.inputPath, original);
+  const sizing = { mode: 'dimension', axis: 'y', millimeters: 12 };
+  const expected = prepareResinGeometry(original, { format: 'stl', units: 'mm', sizing });
+  const result = await prepareResin({ ...f.options, sizing }, provider({ issues: [1, 0], inspectInput: async filename => {
+    assert.deepEqual(await fs.readFile(filename), expected.stl);
+  } }));
+  assert.deepEqual(result.sizingPlan.sourceBounds, { min: { x: 120, y: -25, z: 9 }, max: { x: 123, y: -19, z: 18 } });
+  assert.deepEqual(result.sizingPlan.sourceDimensionsMm, { x: 3, y: 6, z: 9 });
+  assert.deepEqual(result.sizingPlan.dimensionsMm, { x: 6, y: 12, z: 18 });
+  assert.deepEqual(result.inputGeometry.bounds, { min: { x: 0, y: 0, z: 0 }, max: { x: 6, y: 12, z: 18 } });
+  assert.equal(result.sizingPlan.uniformScale, 2);
+  assert.deepEqual(await fs.readFile(f.options.inputPath), original);
+});
+
+test('triangulated OBJ is normalized to measured STL and malformed source or sizing is rejected before provider calls', async t => {
+  const f = await fixture(t);
+  const vertices = [...f.original.toString().matchAll(/vertex ([^\s]+) ([^\s]+) ([^\s]+)/g)].map(match => match.slice(1).join(' '));
+  const obj = Buffer.from(vertices.map(vertex => `v ${vertex}`).join('\n') + '\n' + Array.from({ length: vertices.length / 3 }, (_, index) => `f ${index * 3 + 1} ${index * 3 + 2} ${index * 3 + 3}`).join('\n'));
+  const inputPath = path.join(f.root, 'original.obj'); await fs.writeFile(inputPath, obj);
+  const result = await prepareResin({ ...f.options, inputPath, sizing: { mode: 'dimension', axis: 'z', millimeters: 9 } }, provider({ inspectInput: async filename => {
+    assert.equal(path.extname(filename), '.stl');
+    assert.deepEqual(measureResinGeometry(await fs.readFile(filename), { format: 'stl', units: 'mm' }).sourceDimensionsMm, { x: 9, y: 9, z: 9 });
+  } }));
+  assert.equal(result.sourceSha256, sha(obj));
+  assert.deepEqual(await fs.readFile(inputPath), obj);
+  for (const sizing of [null, {}, { mode: 'scale', factor: 0 }, { mode: 'dimension', axis: 'w', millimeters: 5 }, { mode: 'original', factor: 2 }]) {
+    const mock = provider();
+    await assert.rejects(prepareResin({ ...f.options, sizing }, mock), { code: 'RESIN_SIZING_INVALID' });
+    assert.equal(mock.calls.length, 0);
+  }
+  await fs.writeFile(f.options.inputPath, 'solid empty\nendsolid empty\n');
+  const mock = provider();
+  await assert.rejects(prepareResin(f.options, mock), { code: 'RESIN_GEOMETRY_INVALID' });
+  assert.equal(mock.calls.length, 0);
+});
+
+test('a changed prepared mesh is refused before a later candidate and before the final result', async t => {
+  const f = await fixture(t);
+  for (const [issues, mutation] of [[[1, 0], 'coordinate'], [[0], 'coordinate'], [[0], 'length']]) {
+    let inputPath;
+    const mock = provider({ issues, inspectInput: async filename => { inputPath = filename; }, mutateOnAnalysis: async () => {
+      const bytes = await fs.readFile(inputPath);
+      if (mutation === 'coordinate') { bytes.writeFloatLE(bytes.readFloatLE(96) + 0.5, 96); await fs.writeFile(inputPath, bytes); }
+      else await fs.appendFile(inputPath, Buffer.from([0]));
+    } });
+    await assert.rejects(prepareResin(f.options, mock), { code: 'RESIN_INPUT_GEOMETRY_CHANGED' });
+    assert.equal(mock.calls.filter(call => call.args.includes('--export-sla')).length, 1);
+  }
+});
+
+test('rotated whole-source extents reject clipping candidates while allowing a fitting alternative', async t => {
+  const f = await fixture(t, { orientationCandidates: [{ x: 0, y: 0, z: 90 }, { x: 0, y: 0, z: 0 }] });
+  const original = Buffer.from(f.original.toString().replace(/vertex ([^\s]+) ([^\s]+) ([^\s]+)/g, (_, x, y, z) => `vertex ${Number(x) * 10} ${y} ${z}`));
+  await fs.writeFile(f.options.inputPath, original);
+  const mock = provider(); const result = await prepareResin(f.options, mock);
+  assert.equal(mock.calls.filter(call => call.args.includes('--export-sla')).length, 1);
+  assert.deepEqual(result.orientation, { x: 0, y: 0, z: 0 });
+  assert.equal(result.rejectedOrientations.length, 1);
+  assert.equal(result.rejectedOrientations[0].reason, 'RESIN_MODEL_OUT_OF_BOUNDS');
+  assert.ok(Math.abs(result.rejectedOrientations[0].sourceOrientationGeometry.dimensionsMm.y - 30) < 0.000001);
+  assert.deepEqual(result.sourceOrientationGeometry.dimensionsMm, { x: 30, y: 3, z: 3 });
+  assert.equal(result.sourceOrientationGeometry.sourceSha256, result.inputGeometry.sha256);
+  const evidence = JSON.parse(await fs.readFile(path.join(path.dirname(result.filePath), 'evidence.json'), 'utf8'));
+  assert.deepEqual(evidence.sourceOrientationGeometry, result.sourceOrientationGeometry);
+});
+
+test('no provider export can omit oversized source geometry merely because the output raster would have valid dimensions', async t => {
+  const f = await fixture(t, { orientationCandidates: [{ x: 0, y: 0, z: 0 }] });
+  for (const multiplier of [{ x: 14, y: 1, z: 1 }, { x: 1, y: 7, z: 1 }, { x: 1, y: 1, z: 11 }]) {
+    await fs.writeFile(f.options.inputPath, Buffer.from(f.original.toString().replace(/vertex ([^\s]+) ([^\s]+) ([^\s]+)/g, (_, x, y, z) => `vertex ${Number(x) * multiplier.x} ${Number(y) * multiplier.y} ${Number(z) * multiplier.z}`)));
+    const mock = provider();
+    await assert.rejects(prepareResin(f.options, mock), { code: 'RESIN_MODEL_OUT_OF_BOUNDS' });
+    assert.equal(mock.calls.filter(call => call.args.includes('--export-sla')).length, 0);
+    assert.equal(mock.calls.filter(call => call.args[0] === '--quiet').length, 0);
+  }
 });
 
 test('only known UVtools 4.4.3 receives legacy exit-one acceptance and still needs real outputs', async t => {
@@ -333,5 +477,25 @@ test('trusted property script quotes values and target checks include movement, 
   assertTargetProperties(actual, { MachineName: 'Printer', LayerHeight: 0.05, LiftHeight: 5, WaitTimeBeforeCure: 1.2, LightPWM: 255 });
   for (const properties of [{ LiftHeight: 6 }, { WaitTimeBeforeCure: 0 }, { LightPWM: 100 }]) {
     assert.throws(() => assertTargetProperties(actual, properties), { code: 'RESIN_CONVERSION_MISMATCH' });
+  }
+});
+
+test('verification CLI documents sizing and refuses conflicting or unsafe sizing before touching providers', () => {
+  const script = path.join(__dirname, '..', 'scripts', 'verify-resin-engine.js');
+  const help = spawnSync(process.execPath, [script, '--help'], { encoding: 'utf8' });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /source axes before orientation/);
+  assert.match(help.stdout, /--sizing-scale/);
+  const required = ['--model', 'nonexistent.stl', '--profile', 'nonexistent.json', '--prusa', 'nonexistent-prusa.exe', '--uvtools', 'nonexistent-uvtools.exe', '--output', 'nonexistent-output'];
+  for (const [args, message] of [
+    [['--sizing-scale', '2', '--dimension-z', '3'], /Choose only one/],
+    [['--dimension-x', '2', '--dimension-y', '3'], /Choose only one/],
+    [['--sizing-scale', '0.00001'], /Sizing must be positive/],
+    [['--dimension-z', 'NaN'], /Sizing must be positive/],
+  ]) {
+    const result = spawnSync(process.execPath, [script, ...required, ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, message);
+    assert.doesNotMatch(result.stderr, /ENOENT/);
   }
 });

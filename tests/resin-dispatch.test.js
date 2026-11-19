@@ -8,7 +8,8 @@ const path = require('node:path');
 const { randomUUID } = require('node:crypto');
 const { QuickPrintService } = require('../src/core/service');
 const { canonicalSDCPDevice, fingerprintSDCPDevice } = require('../src/adapters/sdcp-identity');
-const { CONFIRMED, createProfile, makeSlice, importTicket } = require('./helpers/resin-slice');
+const { CONFIRMED, hash, createProfile, makeSlice, importTicket } = require('./helpers/resin-slice');
+const { inspectGoo } = require('../src/slicing/goo');
 
 // Entirely injected SDCP/slicer fixtures: no sockets, providers or hardware.
 async function fixture(t, { enabled = true, requestedParts = 3, profilePrinterId } = {}) {
@@ -191,6 +192,21 @@ test('artifact, source, profile and actual device identity are rechecked before 
     await assert.rejects(f.dispatch(permit));
     assert.deepEqual(mutations(f), []);
   }
+});
+
+test('qualified dispatch rejects a hash-consistent GOO with machine height differing from INI before inspecting or commanding a printer', async t => {
+  const f = await fixture(t); await f.plan();
+  assert.equal(JSON.parse(await fs.readFile(f.settings.profilePath)).expected.machineZMm, undefined);
+  const slice = f.current().resinSlice, bytes = await fs.readFile(slice.filePath);
+  // Simulate faulty captured evidence with internally matching file/receipt
+  // hashes, so rejection must come from authoritative profile geometry.
+  bytes.writeFloatBE(31, 195310 + 4 + 2 + 2 + 1 + 1 + 4 + 4);
+  await fs.writeFile(slice.filePath, bytes);
+  const sha256 = hash(bytes), inspection = inspectGoo(bytes);
+  await f.service._mutate(() => { const current = f.service._job(f.job.id).resinSlice; current.sha256 = sha256; current.inspection = inspection; });
+  f.receipt.artifact.sha256 = sha256;
+  await assert.rejects(f.permit(), { code: 'GOO_PROFILE_MISMATCH' });
+  assert.deepEqual(f.adapter.calls, []); assert.deepEqual(mutations(f), []);
 });
 
 test('post-upload reauthorization rejects revocation, changed approval or device and never starts', async t => {

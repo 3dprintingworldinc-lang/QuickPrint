@@ -139,6 +139,33 @@ test('invalid ticket model specifications or wrong get_job identity are refused'
   await assert.rejects(listPreparationJobs(CONFIG, mockPortal({ getJob: () => ({ ...fixtureJob(), id: '27749df7-8282-44de-83bf-30600f802a25' }) })), /different job/);
 });
 
+test('approved STEP and STP tickets retain their exact source bytes and cannot hide later STL orders', async () => {
+  const stepBytes = Buffer.from('ISO-10303-21;\nHEADER;\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n');
+  for (const format of ['step', 'stp']) {
+    const first = fixtureJob(), later = fixtureJob(); later.id = '27749df7-8282-44de-83bf-30600f802a25';
+    Object.assign(first.ticket.specifications.file, { name: `assembly.${format.toUpperCase()}`, format, sizeBytes: stepBytes.length });
+    first.ticket.model.size = stepBytes.length;
+    const portal = mockPortal({ jobs: [first, later], modelResponse: () => new Response(stepBytes),
+      link: { file: first.ticket.specifications.file.name, url: `${CONFIG.portalUrl}/api/intake?download=private.signature` } });
+    const jobs = await listPreparationJobs(CONFIG, portal);
+    assert.deepEqual(jobs.map(job => job.id), [first.id, later.id]);
+    const model = await downloadModel(CONFIG, jobs[0], portal);
+    assert.equal(model.name, first.ticket.specifications.file.name); assert.deepEqual(model.data, stepBytes);
+    assert.equal(model.order.modelSha256, createHash('sha256').update(stepBytes).digest('hex'));
+    assert.equal(model.order.requestedQuantity, 12); assert.equal(model.order.units, 'in');
+  }
+});
+
+test('unknown or mismatched formats still reject the complete MCP preparation scan', async () => {
+  for (const file of [{ name: 'part.dxf', format: 'dxf' }, { name: 'part.step', format: 'stp' }]) {
+    const good = fixtureJob(), bad = fixtureJob(); bad.id = '27749df7-8282-44de-83bf-30600f802a25';
+    Object.assign(bad.ticket.specifications.file, file);
+    const portal = mockPortal({ jobs: [good, bad] });
+    await assert.rejects(listPreparationJobs(CONFIG, portal), { code: 'LAYR_TRANSPORT' });
+    assert.ok(!portal.tools.includes('model_download_link'));
+  }
+});
+
 test('downloads private model without bearer token and preserves approved order metadata', async () => {
   const job = fixtureJob();
   const portal = mockPortal();
