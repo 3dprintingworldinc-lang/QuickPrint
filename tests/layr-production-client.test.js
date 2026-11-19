@@ -15,8 +15,8 @@ const CONFIG = { apiMode: 'production', portalUrl: ORIGIN, token: TOKEN };
 const NOW = Date.parse('2026-11-19T16:00:00Z');
 const sha256 = data => createHash('sha256').update(data).digest('hex');
 const source = process.env.QUICKPRINT_PORTAL_SOURCE ? path.resolve(process.env.QUICKPRINT_PORTAL_SOURCE) : path.resolve(__dirname, '../integrations/printbylayr');
-const portalAvailable = ['server/production.mjs', 'tests/workflow-fixture.mjs', 'migrations/0005_production.sql'].every(file => existsSync(path.join(source, file)));
-const portalTest = (name, run) => test(name, { skip: portalAvailable ? false : 'Private portal source is absent; set QUICKPRINT_PORTAL_SOURCE or materialize the reviewed checkout. See docs/PRINTBYLAYR-PRODUCTION-INTEGRATION.md.' }, run);
+const portalAvailable = ['server/production.mjs', 'tests/workflow-fixture.mjs', 'migrations/0005_production.sql', 'migrations/0006_production_quantities.sql'].every(file => existsSync(path.join(source, file)));
+const portalTest = (name, run) => test(name, { skip: portalAvailable ? false : 'Reviewed private portal source is absent or incomplete; set QUICKPRINT_PORTAL_SOURCE or materialize the reviewed v2 checkout. See docs/PRINTBYLAYR-PRODUCTION-INTEGRATION.md.' }, run);
 let imports;
 async function modules() {
   imports ||= Promise.all([
@@ -33,6 +33,7 @@ async function fixture(t) {
   const [production, intake, workflow, { SqliteWorkflowD1 }, { FakeB2 }, { readFileSync }] = await modules();
   const database = new SqliteWorkflowD1();
   database.database.exec(readFileSync(path.join(source, 'migrations/0005_production.sql'), 'utf8'));
+  database.database.exec(readFileSync(path.join(source, 'migrations/0006_production_quantities.sql'), 'utf8'));
   t.after(() => database.database.close());
   const b2 = new FakeB2();
   const env = {
@@ -59,14 +60,14 @@ async function fixture(t) {
     } else assert.fail('Unexpected portal path');
     return transform ? transform(result, address, options) : result;
   } };
-  const create = async ({ paid = true, printType = 'resin', createdAt = new Date(NOW).toISOString() } = {}) => {
+  const create = async ({ paid = true, printType = 'resin', createdAt = new Date(NOW).toISOString(), quantity = 12 } = {}) => {
     const id = randomUUID();
     const record = {
       id, requestId: `PBL-${id.toUpperCase()}`, origin: ORIGIN, createdAt,
       model: { fileId: `private-${id}`, size: MODEL.length, sha1: createHash('sha1').update(MODEL).digest('hex') }, notification: { accepted: true },
       payload: {
         client: { fullName: 'Private Customer', email: 'private-client@example.test' },
-        project: { name: 'Production model', quantity: 12, scale: '1:100', notes: 'Review supports.' },
+        project: { name: 'Production model', quantity, scale: '1:100', notes: 'Review supports.' },
         production: { printType, qualityTier: 'presentation', supports: 'allowed', colour: 'grey', properties: 'standard' },
         file: { name: 'production.stl', format: 'stl', sizeBytes: MODEL.length, units: 'mm' },
       },
@@ -403,4 +404,119 @@ test('standalone transport redacts untrusted errors and rejects false write ackn
   await assert.rejects(client.postEvidence(CONFIG, f.command, { fetchImpl: async () => Response.json({
     ticket: { ...f.ticket, status: 'printing', version: f.ticket.version + 1 }, receipt: { id: f.command.operationId },
   }) }), error => error.ambiguous === true);
+});
+
+function authorizationContract() {
+  const ticket = contractFixture().ticket, receiptId = randomUUID(), deviceFingerprint = '6'.repeat(64);
+  ticket.status = 'queued';
+  ticket.production = { approvedReceiptId: receiptId, progress: { requestedParts: 12, printedParts: 2, remainingParts: 10, completedRuns: 2, failedRuns: 0 } };
+  const receipt = { id: receiptId, jobId: ticket.id, kind: 'slice', ticketFingerprint: ticket.ticketFingerprint, sourceSha256: 'b'.repeat(64),
+    profileSha256: 'c'.repeat(64), tool: { name: 'Fixture', version: '1', executableSha256: 'e'.repeat(64) },
+    printerId: 'qualified-printer', printerModel: 'Qualified model', material: 'Qualified resin', artifact: { sha256: 'd'.repeat(64), sizeBytes: 100, format: 'goo' },
+    deviceFingerprint, partsPerRun: 1, qualifiedAtCapture: false, qualified: false, printReady: false };
+  const authorization = { qualified: true, deviceFingerprint, checkedAt: new Date(NOW).toISOString(), expiresAt: new Date(NOW + 30000).toISOString(),
+    jobVersion: ticket.version, ticketFingerprint: ticket.ticketFingerprint, receiptId, sourceSha256: receipt.sourceSha256, artifactSha256: receipt.artifact.sha256,
+    profileSha256: receipt.profileSha256, engineSha256: receipt.tool.executableSha256, printerId: receipt.printerId, printerModel: receipt.printerModel, material: receipt.material, format: receipt.artifact.format,
+    partsPerRun: 1, plannedParts: 1, remainingParts: 10, qualificationFingerprint: 'f'.repeat(64) };
+  return { result: { ticket, receipt, authorization }, params: { id: ticket.id, receiptId, deviceFingerprint } };
+}
+
+test('standalone authorization read validates exact device/receipt/plan binding and bounded fresh expiry', async () => {
+  const fixture = authorizationContract();
+  const result = await client.getAuthorization(CONFIG, fixture.params, { now: () => NOW, fetchImpl: async (url, options) => {
+    const address = new URL(url);
+    assert.equal(address.pathname, '/api/production');
+    assert.equal(address.searchParams.get('action'), 'authorization');
+    assert.equal(address.searchParams.get('deviceFingerprint'), fixture.params.deviceFingerprint);
+    assert.equal(options.method, 'GET'); assert.equal(options.redirect, 'error');
+    return Response.json(fixture.result);
+  } });
+  assert.equal(result.authorization.qualified, true);
+  assert.equal(result.receipt.qualifiedAtCapture, false, 'current qualification is separate from historical capture status');
+  const mutations = [
+    value => { value.ticket.status = 'printing'; },
+    value => { value.ticket.production.approvedReceiptId = randomUUID(); },
+    value => { value.ticket.production.progress.remainingParts = 999; },
+    value => { value.receipt.deviceFingerprint = '0'.repeat(64); },
+    value => { value.authorization.deviceFingerprint = '0'.repeat(64); },
+    value => { value.authorization.profileSha256 = '0'.repeat(64); },
+    value => { value.authorization.engineSha256 = '0'.repeat(64); },
+    value => { value.authorization.artifactSha256 = '0'.repeat(64); },
+    value => { value.authorization.printerId = 'different-printer'; },
+    value => { delete value.receipt.material; delete value.authorization.material; },
+    value => { value.authorization.jobVersion++; },
+    value => { value.authorization.plannedParts = 2; },
+    value => { value.authorization.qualified = false; },
+    value => { value.authorization.qualificationFingerprint = 'invalid'; },
+    value => { value.authorization.expiresAt = new Date(NOW + 30001).toISOString(); },
+    value => { value.authorization.checkedAt = new Date(NOW - 40000).toISOString(); value.authorization.expiresAt = new Date(NOW - 10000).toISOString(); },
+  ];
+  for (const mutate of mutations) {
+    const value = structuredClone(fixture.result); mutate(value);
+    await assert.rejects(client.getAuthorization(CONFIG, fixture.params, { now: () => NOW, fetchImpl: async () => Response.json(value) }));
+  }
+});
+
+portalTest('actual fresh authorization is revoked independently of an immutable qualified slice receipt', async t => {
+  const f = await fixture(t);
+  const original = await f.create({ quantity: 2 });
+  const job = (await client.listPreparationJobs(CONFIG, f.options)).find(candidate => candidate.id === original.id);
+  const deviceFingerprint = '6'.repeat(64), profileSha256 = 'c'.repeat(64), engineSha256 = 'e'.repeat(64);
+  const binding = { deviceFingerprint, profileSha256, engineSha256, printerId: 'physical-printer', printerModel: 'Qualified test model', material: 'Qualified test resin', format: 'goo' };
+  f.env.PRODUCTION_QUALIFIED_BINDINGS = JSON.stringify([binding]);
+  const command = f.evidence(job); command.action = 'record_slice';
+  const { outputs, operations, ...common } = command.data;
+  command.data = { ...common, partsPerRun: 1, deviceFingerprint, profileSha256, printerId: binding.printerId, printerModel: binding.printerModel, material: binding.material,
+    artifact: { sha256: 'd'.repeat(64), sizeBytes: 100, format: 'goo' } };
+  const capture = await client.postEvidence(CONFIG, command, f.options);
+  assert.equal(capture.receipt.qualifiedAtCapture, true);
+  const approval = await client.postEvidence(CONFIG, { action: 'approve_preparation', id: job.id, version: capture.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id } }, f.options);
+  const params = { id: job.id, receiptId: capture.receipt.id, deviceFingerprint };
+  const proof = await client.getAuthorization(CONFIG, params, { ...f.options, now: () => NOW });
+  assert.equal(proof.authorization.jobVersion, approval.ticket.version);
+  assert.equal(proof.authorization.remainingParts, 2);
+  f.env.PRODUCTION_QUALIFIED_BINDINGS = '[]';
+  await assert.rejects(client.getAuthorization(CONFIG, params, { ...f.options, now: () => NOW }), error => error.status === 409 && error.portalCode === 'preparation_unqualified');
+  const receipt = await client.getReceipt(CONFIG, { id: job.id, receiptId: capture.receipt.id }, f.options);
+  assert.equal(receipt.receipt.qualifiedAtCapture, true);
+  assert.equal(receipt.qualification.qualified, false);
+
+  f.env.PRODUCTION_QUALIFIED_BINDINGS = JSON.stringify([binding]);
+  let current = approval.ticket;
+  for (let index = 0; index < 2; index++) {
+    const runId = randomUUID(), remoteId = `remote-${runId}`;
+    const started = await client.postEvidence(CONFIG, { action: 'start_print', id: job.id, version: current.version, operationId: randomUUID(),
+      data: { ticketFingerprint: job.ticketFingerprint, receiptId: capture.receipt.id, runId, remoteId, observedAt: new Date(NOW).toISOString(),
+        artifactSha256: command.data.artifact.sha256, printerId: binding.printerId, plannedParts: 1, deviceFingerprint } }, f.options);
+    const finished = await client.postEvidence(CONFIG, { action: 'finish_print', id: job.id, version: started.ticket.version, operationId: randomUUID(),
+      data: { ticketFingerprint: job.ticketFingerprint, runId, remoteId, observedAt: new Date(NOW).toISOString(), printedParts: 1 } }, f.options);
+    assert.equal(finished.ticket.status, index === 0 ? 'queued' : 'post_processing');
+    assert.equal(finished.ticket.production.progress.printedParts, index + 1);
+    current = finished.ticket;
+  }
+  assert.equal(Number(f.database.database.prepare('SELECT COUNT(*) n FROM production_run_results').get().n), 2);
+});
+
+test('physical completion confirmation accepts nonfinal queued progress but rejects premature finishing or quantity credit', async () => {
+  const fixture = contractFixture();
+  const runId = randomUUID(), remoteId = 'reported-completed-task';
+  const command = { action: 'finish_print', id: fixture.ticket.id, version: fixture.ticket.version, operationId: randomUUID(),
+    data: { ticketFingerprint: fixture.ticket.ticketFingerprint, runId, remoteId, observedAt: new Date(NOW).toISOString(), printedParts: 1 } };
+  const result = { ticket: { ...fixture.ticket, status: 'queued', version: fixture.ticket.version + 1, production: {
+    progress: { requestedParts: 12, printedParts: 1, remainingParts: 11, completedRuns: 1, failedRuns: 0 },
+    run: { runId, remoteId, plannedParts: 1, printedParts: 1, status: 'completed', finishedAt: new Date(NOW).toISOString() },
+  } } };
+  assert.equal((await client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(result) })).ticket.status, 'queued');
+  for (const mutate of [
+    value => { value.ticket.status = 'post_processing'; },
+    value => { value.ticket.production.progress.remainingParts = 0; },
+    value => { value.ticket.production.run.printedParts = 2; },
+    value => { value.ticket.production.run.runId = randomUUID(); },
+    value => { value.ticket.production.run.plannedParts = 0; },
+    value => { value.ticket.production.progress.acceptedParts = 1; },
+  ]) {
+    const value = structuredClone(result); mutate(value);
+    await assert.rejects(client.postEvidence(CONFIG, command, { fetchImpl: async () => Response.json(value) }), error => error.ambiguous === true);
+  }
 });

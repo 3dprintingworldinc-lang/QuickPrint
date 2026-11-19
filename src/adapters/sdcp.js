@@ -314,7 +314,7 @@ class SDCPAdapter {
       });
       try {
         const [, report] = await Promise.all([this._command(128, { Filename: name, StartLayer: 0 }, true), waiter.promise]);
-        return { acknowledged: true, remoteId: report.data.PrintInfo.TaskId };
+        return { acknowledged: true, remoteId: report.data.PrintInfo.TaskId, currentFile: report.data.PrintInfo.Filename, observedAt: report.observedAt };
       } catch (failure) {
         if (failure.code === 'SDCP_TELEMETRY_TIMEOUT' || failure.code === 'SDCP_CONNECTION_LOST') throw Object.assign(error('SDCP start result is uncertain. Acknowledgement alone does not identify a new print; inspect the printer before retrying.', 504, 'SDCP_START_UNCERTAIN'), { uncertain: true });
         throw failure;

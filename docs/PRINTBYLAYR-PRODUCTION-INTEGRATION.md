@@ -5,7 +5,7 @@ integration in the private `3dprintingworldinc-lang/printbylayr` repository. The
 reviewable source is [draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15).
 The pushed portal branch is
 `codex/quickprint-production-api`, commit
-`58e72102f7149362d191cf7b6478e6e06278f5b1`, based on main commit
+`0ffd31eabe47de83e8e76f4e6cc69e8874b82af8`, based on main commit
 `492e67198c4dc7f4161887877711456a4aed31cc`.
 
 No portal migration or production deployment has been performed. The private
@@ -19,15 +19,19 @@ repository and materialize the reviewed commit in a separate private directory:
 ```powershell
 git clone https://github.com/3dprintingworldinc-lang/printbylayr.git <private-checkout>
 git -C <private-checkout> fetch origin codex/quickprint-production-api
-git -C <private-checkout> switch --detach 58e72102f7149362d191cf7b6478e6e06278f5b1
+git -C <private-checkout> switch --detach 0ffd31eabe47de83e8e76f4e6cc69e8874b82af8
 git -C <private-checkout> diff --check
 $env:QUICKPRINT_PORTAL_SOURCE = '<absolute-private-checkout>'
-node --test tests/layr-production-client.test.js
+node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js
 ```
 
 Verify the checked-out SHA with `git -C <private-checkout> rev-parse HEAD` and
 review the private PR before running it. No production secret is needed for these
 tests: SQLite, model storage and notification paths use local test fixtures.
+The v2 run/quantity contract adds `0006_production_quantities.sql` after
+`0005_production.sql`; the actual-server test fixtures apply both locally.
+Deployment requires reviewed application of both migrations in the target
+environment, not only updating the server code.
 
 Without a materialized private source, the production-client suite clearly
 skips its actual-server tests and continues running its standalone transport

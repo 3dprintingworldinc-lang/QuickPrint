@@ -39,7 +39,9 @@ async function queueSliceEvidence(manager, id, { connectorId, version } = {}) {
   const configs = manager.service.getConnectors({ secrets: true }).filter(config => config.type === 'layr' && config.apiMode === 'production' && config.enabled !== false && config.portalUrl === job.order.portalUrl && (!connectorId || config.id === connectorId));
   if (configs.length !== 1) throw fail('Select one enabled production input for this ticket’s portal.', 'LAYR_PRODUCTION_INPUT_REQUIRED');
   const config = configs[0];
-  const key = ['slice', config.portalUrl, job.order.portalJobId, job.order.ticketFingerprint, slice.sha256, slice.profileSha256, slice.tool?.executableSha256].join(':');
+  let deviceFingerprint = null;
+  if (manager.service.snapshot().printers.some(printer => printer.id === slice.printerId && printer.type === 'sdcp')) deviceFingerprint = (await manager.service.inspectResinPrinter(slice.printerId)).deviceFingerprint;
+  const key = ['slice', config.portalUrl, job.order.portalJobId, job.order.ticketFingerprint, slice.sha256, slice.profileSha256, slice.tool?.executableSha256, deviceFingerprint || 'unbound', 1].join(':');
   await verifyFiles(manager, job, slice);
   let evidenceKey = key;
   let existing = manager.outbox.lookup?.(evidenceKey);
@@ -66,7 +68,7 @@ async function queueSliceEvidence(manager, id, { connectorId, version } = {}) {
   return manager.outbox.enqueue({ connectorId: config.id, portalUrl: config.portalUrl, action: 'record_slice', id: job.order.portalJobId, version,
     data: { ticketFingerprint: job.order.ticketFingerprint, sourceSha256: job.sha256,
       tool: { name: slice.tool.name, version: slice.tool.version, executableSha256: slice.tool.executableSha256 },
-      profileSha256: slice.profileSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material,
+      profileSha256: slice.profileSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, deviceFingerprint, partsPerRun: 1,
       artifact: { sha256: slice.sha256, sizeBytes: slice.bytes, format: slice.format },
     } }, evidenceKey);
 }

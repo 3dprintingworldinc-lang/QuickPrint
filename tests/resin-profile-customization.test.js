@@ -6,6 +6,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const http = require('node:http');
+const { randomUUID } = require('node:crypto');
 const { QuickPrintService } = require('../src/core/service');
 const { startServer } = require('../src/server');
 const { loadProfile } = require('../src/slicing/resin-engine');
@@ -99,6 +100,43 @@ test('customization is a pure transformation before snapshot storage and does no
   const changed = customizeProfile(loaded, patch);
   changed.profile.orientationCandidates[0].x = 99;
   assert.deepEqual(loaded.profile, initial); assert.deepEqual(loaded.preset, initialPreset); assert.deepEqual(patch, originalPatch);
+});
+
+test('binding a profile to a configured local SDCP printer changes only its printer ID metadata', async t => {
+  const f = await fixture(t);
+  const printer = await f.service.savePrinter({ name: 'Bound printer', type: 'sdcp', host: 'printer-fixture.invalid', mainboardId: '0123456789abcdef', brandId: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' });
+  const before = await f.service.getResinProfileSlot('grey');
+  const bound = await f.service.customizeResinProfileSlot('grey', { printerId: printer.id, expectedProfileSha256: before.profileSha256 });
+  assert.deepEqual(bound.profile, { ...before.profile, printerId: printer.id });
+  assert.notEqual(bound.profileSha256, before.profileSha256);
+  assert.equal((await loadProfile(bound.slot.profilePath)).profile.printerId, printer.id);
+  assert.equal((await f.service.getResinProfileSlot('tough')).profile.printerId, before.profile.printerId);
+  assert.equal(f.service.snapshot().jobs.length, 0, 'binding metadata neither creates nor dispatches a job');
+  await f.unchangedOriginals();
+});
+
+test('missing, non-SDCP and unsafe local printer bindings fail without managed files or slot changes', async t => {
+  const f = await fixture(t);
+  const other = await f.service.savePrinter({ name: 'Different transport', type: 'moonraker', host: 'printer-fixture.invalid' });
+  for (const printerId of [randomUUID(), other.id]) await assert.rejects(f.service.customizeResinProfileSlot('grey', { printerId }), { status: 409, code: 'RESIN_PROFILE_PRINTER_INVALID' });
+  for (const printerId of ['', '../printer', 123, null]) await assert.rejects(f.service.customizeResinProfileSlot('grey', { printerId }), { status: 400, code: 'RESIN_PROFILE_CUSTOMIZATION_INVALID' });
+  assert.deepEqual(f.service.getSettings().resinEngine.slots, f.slots);
+  assert.deepEqual(await fs.readdir(path.join(f.dataDir, 'profiles', 'resin')).catch(error => error.code === 'ENOENT' ? [] : Promise.reject(error)), []);
+  await f.unchangedOriginals();
+});
+
+test('removing the selected local printer during snapshot creation prevents a dangling profile binding', async t => {
+  const f = await fixture(t);
+  const printer = await f.service.savePrinter({ name: 'Removed target', type: 'sdcp', host: 'printer-fixture.invalid' });
+  const paused = pauseManagedWrite(t, f.dataDir);
+  const pending = f.service.customizeResinProfileSlot('grey', { printerId: printer.id });
+  const rejected = assert.rejects(pending, { status: 409, code: 'RESIN_PROFILE_PRINTER_INVALID' });
+  try { await paused.entered; await f.service.removePrinter(printer.id); }
+  finally { paused.release(); }
+  await rejected;
+  assert.deepEqual(f.service.getSettings().resinEngine.slots, f.slots);
+  assert.deepEqual(await fs.readdir(path.join(f.dataDir, 'profiles', 'resin')), []);
+  await f.unchangedOriginals();
 });
 
 test('unsafe types, identities, ranges, geometry changes and arbitrary paths are rejected before storing snapshots', async t => {

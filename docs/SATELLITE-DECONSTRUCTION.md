@@ -300,20 +300,47 @@ presets, current scene settings, and encoded file values must be recorded
 separately. No structural check establishes that these cure or motion values
 are physically appropriate for a particular resin or firmware.
 
+## Headless fallback and quantity evidence
+
+QuickPrint's implemented headless alternative uses PrusaSlicer SLA -> SL1 ->
+UVtools GOO, with independent layer validation and print-issue analysis. See the
+[headless engine guide](HEADLESS-RESIN-ENGINE.md) for tested versions, profiles,
+reproduction commands and physical qualification limits. This does not expose a
+new SatelLite SDK or make its private methods callable.
+
+The engine records `modelCopiesPerRun: 1`: one submitted source instance, not a
+disconnected-component, physical-part or accepted-unit count. Initial repeat
+planning requires the operator to declare that the whole model is one order
+unit. Printing and QC must supply the actual run/accepted quantities.
+
+Prusa's advertised duplication flags were exercised separately with the 3 mm
+fixture cube, a 40 x 20 mm bed and supports/pad disabled. Requests for 1, 2 and 20
+copies each exited 0; material was 0.027, 0.054 and 0.270 mL respectively. Layer
+30 contained 1, 2 and 10 separate cube footprints. The 20-copy export omitted ten
+requested cubes without a failing exit. Tagged
+[transform source](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessTransform.cpp)
+and [slicing source](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessActions.cpp)
+show duplication, arrangement and selection of bed 0. The actual SL1 metadata
+provided no instance-count/footprint contract. Ignored evidence is in
+`scratch/resin-plate-plan/`. QuickPrint therefore sends no duplication flags;
+validated multi-instance placement/counting remains future work.
+
 ## Remaining qualification work
 
 1. In an isolated Windows account/session with no existing SatelLite instance,
    repeat the small-model preparation probes and establish actual output names,
    report schema, scene side effects, and exit/error behavior.
-2. Obtain a supported batch interface or establish a repeatable desktop
+2. For unattended SatelLite use, obtain a supported batch interface or establish a repeatable desktop
    automation flow for arrange/orient, hollow/drain, supports, slice, inspect,
    and GOO export. Record each operation's settings and output hash. Private DLL
    symbols should remain investigation leads until calling contracts and
    initialization/lifetime requirements are understood.
-3. Bind a confirmed printer model, firmware, resin, plate profile, and supported
-   slice-format version. Validate files before implementing that device's
-   transfer and status adapter. Test with a real printer before describing the
-   connection as operational.
-4. Preserve order identity and preparation failures across the Layr connection;
-   carry artifact hashes and production outcomes through later stages. Physical
-   completion and accepted part quantities still require production evidence.
+3. Physically qualify a confirmed printer model, firmware, resin, plate profile
+   and slice format. The SDCP adapter's real read-only status/attribute calls
+   succeeded, but upload/start/control remain fixture-tested and unqualified on
+   hardware. Resolve the geometry discrepancy in the
+   [SDCP guide](SDCP-INTEGRATION.md#observed-geometry-discrepancy).
+4. Deploy the reviewed Layr production API and provision its scoped token and
+   qualification bindings. Local intake and preparation-evidence outbox preserve
+   ticket/artifact identities; physical completion, post-processing and accepted
+   part quantities still require production evidence.

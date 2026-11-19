@@ -154,7 +154,8 @@ test('SDCP start requires a new matching-file task and returns its printer task 
     f.ack(client, message); f.report(client); return false;
   } });
   f.status = { CurrentStatus: [0], PrintInfo: { Status: 9, ErrorNumber: 0, Filename: 'order.goo', TaskId: 'previous-task' } };
-  assert.deepEqual(await f.adapter.start({ remotePath: 'order.goo' }), { acknowledged: true, remoteId: 'new-device-task' });
+  const started = await f.adapter.start({ remotePath: 'order.goo' });
+  assert.deepEqual(started, { acknowledged: true, remoteId: 'new-device-task', currentFile: 'order.goo', observedAt: f.adapter.reports.status.observedAt });
   assert.equal(f.calls.filter(call => call.Data.Cmd === 128).length, 1);
 });
 

@@ -10,11 +10,11 @@ const MAX_JSON_BYTES = 4 * 1024 * 1024;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
 const SHA256 = /^[a-f0-9]{64}$/;
 const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'start_print', 'finish_print', 'fail_print']);
-const EXPECTED_STATUS = { record_preprocessing: 'preparing', record_slice: 'preparing', approve_preparation: 'queued', start_print: 'printing', finish_print: 'post_processing', fail_print: 'preparing' };
+const EXPECTED_STATUS = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
 const PORTAL_CODES = new Set(['production_not_configured', 'production_origin', 'production_unauthorized', 'invalid_data', 'production_job_not_found', 'invalid_transition',
   'ticket_changed', 'invalid_cursor', 'invalid_limit', 'invalid_production_record', 'invalid_bindings', 'invalid_receipt', 'source_changed', 'preparation_unqualified',
   'invalid_evidence', 'production_scope', 'operation_conflict', 'version_conflict', 'printer_binding_mismatch', 'run_conflict', 'run_mismatch', 'invalid_content_type',
-  'body_too_large', 'invalid_json', 'model_changed', 'receipt_not_found', 'method_not_allowed', 'production_unavailable']);
+  'body_too_large', 'invalid_json', 'model_changed', 'receipt_not_found', 'method_not_allowed', 'production_unavailable', 'quantity_plan_mismatch']);
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 function failure(message, status = 502, extra = {}) {
   const code = status === 401 || status === 403 ? 'LAYR_AUTH' : status === 413 ? 'LAYR_TOO_LARGE' : status === 409 ? 'LAYR_CONFLICT' : 'LAYR_TRANSPORT';
@@ -52,6 +52,20 @@ function projection(job) {
   }
   ticketFingerprint(job);
   return job;
+}
+function productionProgress(job) {
+  const value = job.production?.progress;
+  if (!object(value) || Object.keys(value).sort().join(',') !== 'completedRuns,failedRuns,printedParts,remainingParts,requestedParts' ||
+      value.requestedParts !== job.ticket.specifications.project.quantity || !Number.isSafeInteger(value.printedParts) || value.printedParts < 0 || value.printedParts > value.requestedParts ||
+      value.remainingParts !== value.requestedParts - value.printedParts || !Number.isSafeInteger(value.completedRuns) || value.completedRuns < 0 || !Number.isSafeInteger(value.failedRuns) || value.failedRuns < 0) {
+    fail('PrintByLayr returned inconsistent production quantities.');
+  }
+  return value;
+}
+function isoTime(value) {
+  if (typeof value !== 'string' || value.length > 40) return NaN;
+  const result = Date.parse(value);
+  return Number.isFinite(result) && new Date(result).toISOString() === value ? result : NaN;
 }
 function combine(signal, milliseconds) {
   const timeout = AbortSignal.timeout(milliseconds);
@@ -157,6 +171,32 @@ async function getTicket(input, id, options = {}) {
   if (ticket.id !== id) fail('PrintByLayr returned a different production ticket.');
   return { ticket };
 }
+async function getAuthorization(input, { id, receiptId, deviceFingerprint } = {}, { now = Date.now, ...options } = {}) {
+  const config = validateLayrConfig(input);
+  if (!UUID.test(id || '') || !UUID.test(receiptId || '') || !SHA256.test(deviceFingerprint || '')) fail('A job, approved receipt and physical device fingerprint are required.', 400);
+  const result = await request(config, { action: 'authorization', id, receiptId, deviceFingerprint }, options);
+  const job = projection(result.ticket), receipt = result.receipt, authorization = result.authorization;
+  const quantities = productionProgress(job);
+  const clock = typeof now === 'function' ? now() : now;
+  const checkedAt = isoTime(authorization?.checkedAt), expiresAt = isoTime(authorization?.expiresAt);
+  if (!Number.isSafeInteger(clock) || !object(receipt) || !object(authorization) || job.id !== id || job.status !== 'queued' || job.production.approvedReceiptId !== receiptId ||
+      receipt.id !== receiptId || receipt.jobId !== id || receipt.kind !== 'slice' || receipt.ticketFingerprint !== ticketFingerprint(job) || receipt.deviceFingerprint !== deviceFingerprint ||
+      !SHA256.test(receipt.sourceSha256 || '') || !SHA256.test(receipt.profileSha256 || '') || !SHA256.test(receipt.tool?.executableSha256 || '') || !SHA256.test(receipt.artifact?.sha256 || '') ||
+      !['printerId', 'printerModel', 'material'].every(key => typeof receipt[key] === 'string' && receipt[key].trim() && receipt[key].length <= 200 && !/[\u0000-\u001f\u007f]/.test(receipt[key])) ||
+      typeof receipt.artifact?.format !== 'string' || !receipt.artifact.format.trim() || receipt.artifact.format.length > 40 || !Number.isSafeInteger(receipt.artifact.sizeBytes) || receipt.artifact.sizeBytes < 1 || receipt.artifact.sizeBytes > 512 * 1024 * 1024 ||
+      !Number.isSafeInteger(receipt.partsPerRun) || receipt.partsPerRun < 1 || receipt.partsPerRun > quantities.remainingParts || receipt.printReady !== false ||
+      typeof receipt.qualified !== 'boolean' || (receipt.qualifiedAtCapture !== undefined && receipt.qualifiedAtCapture !== receipt.qualified) ||
+      authorization.qualified !== true || authorization.deviceFingerprint !== deviceFingerprint || authorization.jobVersion !== job.version ||
+      authorization.ticketFingerprint !== ticketFingerprint(job) || authorization.receiptId !== receiptId ||
+      authorization.sourceSha256 !== receipt.sourceSha256 || authorization.artifactSha256 !== receipt.artifact.sha256 || authorization.profileSha256 !== receipt.profileSha256 || authorization.engineSha256 !== receipt.tool.executableSha256 ||
+      authorization.printerId !== receipt.printerId || authorization.printerModel !== receipt.printerModel || authorization.material !== receipt.material || authorization.format !== receipt.artifact.format ||
+      authorization.partsPerRun !== receipt.partsPerRun || authorization.plannedParts !== receipt.partsPerRun || authorization.remainingParts !== quantities.remainingParts ||
+      !SHA256.test(authorization.qualificationFingerprint || '') || !Number.isFinite(checkedAt) || !Number.isFinite(expiresAt) || expiresAt <= checkedAt || expiresAt - checkedAt > 30000 ||
+      checkedAt > clock + 5000 || checkedAt < clock - 30000 || expiresAt <= clock) {
+    fail('The portal did not provide a fresh authorization matching this device, ticket, receipt and remaining production plan.', 409);
+  }
+  return result;
+}
 async function downloadModel(input, original, { fetchImpl = fetch, signal } = {}) {
   const config = validateLayrConfig(input);
   projection(original);
@@ -193,12 +233,29 @@ async function postEvidence(input, command, options = {}) {
   }
   const body = JSON.stringify(command);
   if (Buffer.byteLength(body) > 32768) fail('Production evidence exceeds 32 KiB.', 413);
+  if (command.action === 'start_print' && (!SHA256.test(command.data.deviceFingerprint || '') || !Number.isSafeInteger(command.data.plannedParts) || command.data.plannedParts < 1 || command.data.plannedParts > 500)) fail('Physical start evidence requires an explicit device and planned part count.', 400);
+  if (command.action === 'finish_print' && (!Number.isSafeInteger(command.data.printedParts) || command.data.printedParts < 1 || command.data.printedParts > 500)) fail('Print completion requires an explicit reported printed part count.', 400);
+  if (command.action === 'fail_print' && command.data.printedParts !== undefined && command.data.printedParts !== 0) fail('Failed print evidence cannot credit printed parts.', 400);
   const result = await request(config, null, options, body);
   let job;
   try { job = projection(result.ticket); }
   catch { fail('The portal did not confirm valid production evidence. Retry the same saved operation details.', 502, { ambiguous: true }); }
-  if (job.id !== command.id || job.version !== command.version + 1 || ticketFingerprint(job) !== command.data.ticketFingerprint || job.status !== EXPECTED_STATUS[command.action]) {
+  if (job.id !== command.id || job.version !== command.version + 1 || ticketFingerprint(job) !== command.data.ticketFingerprint || !EXPECTED_STATUS[command.action].includes(job.status)) {
     fail('The portal did not confirm the expected production operation.', 502, { ambiguous: true });
+  }
+  if (['start_print', 'finish_print', 'fail_print'].includes(command.action)) {
+    try {
+      const quantities = productionProgress(job), run = job.production.run;
+      if (!object(run) || run.runId !== command.data.runId || run.remoteId !== command.data.remoteId) throw new Error();
+      if (command.action === 'start_print' && (run.receiptId !== command.data.receiptId || run.artifactSha256 !== command.data.artifactSha256 || run.printerId !== command.data.printerId || run.deviceFingerprint !== command.data.deviceFingerprint ||
+          run.plannedParts !== command.data.plannedParts || run.status !== 'printing' || isoTime(run.startedAt) !== Date.parse(command.data.observedAt))) throw new Error();
+      if (command.action !== 'start_print') {
+        const completed = command.action === 'finish_print';
+        if (run.status !== (completed ? 'completed' : 'failed') || run.printedParts !== (completed ? command.data.printedParts : 0) ||
+            !Number.isSafeInteger(run.plannedParts) || run.plannedParts < 1 || run.printedParts > run.plannedParts || isoTime(run.finishedAt) !== Date.parse(command.data.observedAt)) throw new Error();
+        if (completed && job.status !== (quantities.remainingParts === 0 ? 'post_processing' : quantities.remainingParts >= run.plannedParts ? 'queued' : 'preparing')) throw new Error();
+      }
+    } catch { fail('The portal did not confirm consistent physical run quantities and identities.', 502, { ambiguous: true }); }
   }
   if (['record_preprocessing', 'record_slice'].includes(command.action)) {
     if (!object(result.receipt) || result.receipt.id !== command.operationId || result.receipt.jobId !== command.id ||
@@ -216,7 +273,11 @@ async function getReceipt(input, { id, receiptId } = {}, options = {}) {
   const receipt = result.receipt;
   if (!object(receipt) || receipt.id !== receiptId || receipt.jobId !== id || !SHA256.test(receipt.ticketFingerprint || '') || !SHA256.test(receipt.sourceSha256 || '') ||
       !['preprocessing', 'slice'].includes(receipt.kind) || typeof receipt.qualified !== 'boolean' || receipt.printReady !== false) fail('PrintByLayr returned an invalid preparation receipt.');
+  if (receipt.kind === 'slice' && (receipt.partsPerRun !== undefined || receipt.deviceFingerprint !== undefined) &&
+      (!Number.isSafeInteger(receipt.partsPerRun) || receipt.partsPerRun < 1 || receipt.partsPerRun > 500 || (receipt.deviceFingerprint !== null && !SHA256.test(receipt.deviceFingerprint || '')))) fail('PrintByLayr returned an invalid physical preparation plan.');
+  if (result.qualification !== undefined && (!object(result.qualification) || typeof result.qualification.qualified !== 'boolean' || !Number.isFinite(isoTime(result.qualification.checkedAt)) ||
+      (result.qualification.qualified ? !SHA256.test(result.qualification.qualificationFingerprint || '') : result.qualification.qualificationFingerprint !== null))) fail('PrintByLayr returned invalid current qualification details.');
   return result;
 }
 
-module.exports = { validateLayrConfig, listPreparationJobs, ticketFingerprint, getTicket, downloadModel, buildOrderMetadata, postEvidence, getReceipt, lookupReceipt: getReceipt, MAX_MODEL_BYTES };
+module.exports = { validateLayrConfig, listPreparationJobs, ticketFingerprint, getTicket, getAuthorization, downloadModel, buildOrderMetadata, postEvidence, getReceipt, lookupReceipt: getReceipt, MAX_MODEL_BYTES };

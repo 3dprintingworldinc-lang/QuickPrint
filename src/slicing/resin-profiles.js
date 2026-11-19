@@ -10,7 +10,7 @@ const UV_PROPERTIES = Object.freeze([
   'BottomWaitTimeBeforeCure', 'WaitTimeAfterCure', 'BottomWaitTimeAfterCure', 'WaitTimeAfterLift', 'BottomWaitTimeAfterLift',
 ]);
 const EXPECTED_FIELDS = ['resolutionX', 'resolutionY', 'displayWidthMm', 'displayHeightMm', 'machineZMm', 'layerHeightMm', 'mirrorX', 'mirrorY'];
-const EDIT_FIELDS = new Set(['material', 'layerHeightMm', 'uvtoolsProperties', 'supportsEnabled', 'padEnabled', 'orientationCandidates']);
+const EDIT_FIELDS = new Set(['printerId', 'material', 'layerHeightMm', 'uvtoolsProperties', 'supportsEnabled', 'padEnabled', 'orientationCandidates']);
 const plain = value => value !== null && typeof value === 'object' && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 const fail = (message, code = 'RESIN_PROFILE_CUSTOMIZATION_INVALID') => Object.assign(new Error(message), { status: 400, code });
 
@@ -59,6 +59,10 @@ function customizeProfile(loaded, patch) {
   if (!plain(patch) || !Object.keys(patch).length || Object.keys(patch).some(key => !EDIT_FIELDS.has(key))) throw fail('Supply at least one supported resin profile customization field.');
   const profile = structuredClone(loaded.profile);
   const ini = { ...loaded.ini };
+  if (Object.hasOwn(patch, 'printerId')) {
+    if (typeof patch.printerId !== 'string' || !/^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(patch.printerId)) throw fail('Choose an existing local SDCP printer identity.');
+    profile.printerId = patch.printerId;
+  }
   if (Object.hasOwn(patch, 'material')) {
     if (typeof patch.material !== 'string' || !patch.material.trim() || patch.material.length > 200 || /[\u0000-\u001f\u007f]/.test(patch.material)) throw fail('Material must be a nonempty name of at most 200 characters without control characters.');
     profile.material = patch.material.trim();

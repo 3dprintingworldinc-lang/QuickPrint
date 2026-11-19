@@ -5,6 +5,9 @@ validated GOO capture, and durable preparation-evidence synchronization with
 PrintByLayr. Every captured resin slice remains `printReady: false` and
 `printerCompatible: false`; resin production tickets cannot enter the generic
 filament preparation or printer dispatch paths.
+The separate qualified resin path conditionally authorizes one explicitly
+confirmed SDCP run at a time, with current portal qualification and the local
+dispatch switch enabled. See the [production steps](RESIN-PRODUCTION.md).
 
 The companion portal changes are available in the private
 [PrintByLayr draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15).
@@ -38,6 +41,12 @@ private-source test setup and deployment boundary.
    evidence through the durable outbox, manually or automatically on a connector
    poll. This records hashes and target metadata, not raw GOO bytes, approval for
    printing, or a completed order. Requested parts remain separate from file runs.
+6. After physical calibration outside the app, use **Review production
+   qualification** to confirm the exact studio binding, declare the whole model
+   as one ordered unit and approve the portal run plan. Enable qualified resin
+   dispatch locally, then confirm readiness for each individual run. Matched
+   printer task/file completion and an operator count feed durable portal
+   writeback; remaining units require separate starts.
 
 The legacy OAuth/PKCE MCP input remains available. It uses read tools and the
 portal's broad `studio` consent; its newest-100-jobs window remains a limitation
@@ -61,9 +70,20 @@ Named profile slots keep separate reviewed printer/resin settings while sharing
 provider executables and the timeout. Profile customization edits material,
 layer height, exposure/motion/PWM, support/pad policy and orientation candidates.
 Saving creates validated managed JSON/INI copies and updates only the selected
-slot's path; original files and other slots are preserved. Printer identity,
-geometry and mirrors are not editable through that customization form. Each new
+slot's path; original files and other slots are preserved. **Bound local printer**
+selects an existing SDCP printer UUID; printer model, geometry and mirrors remain
+in the reviewed profile. Each new
 profile fingerprint requires qualification for its actual printer/resin use.
+
+The engine records `modelCopiesPerRun: 1`, meaning one submitted source instance,
+not a physical-part or mesh-component count. The single-unit repeat plan requires an
+operator to declare that the whole model represents one order unit. Each run
+requires readiness confirmation; an identified completed run plus operator
+count can contribute one printed unit. Printed counts do not grant QC acceptance.
+Automatic packing is deliberately unavailable: a real Prusa `--duplicate 20`
+probe exited 0 but exported only ten cubes' material and ten separate footprints
+after bed-0 filtering. The [engine guide](HEADLESS-RESIN-ENGINE.md#source-copies-and-production-quantity)
+records the bounded probe and primary-source explanation.
 
 The outbox durably saves each operation UUID, expected ticket version and exact
 body before transmission. Lost responses and restart recovery replay those same
@@ -73,7 +93,11 @@ files later change. Conflicts block later evidence for the same portal job.
 Definite conflicts/rejections, and held operations that were never sent, can be
 dismissed locally with a recorded reason. An attempted operation with an uncertain
 remote outcome requires reconciliation; dismissal is not a rollback of portal
-state. The portal separately controls qualified preparation approval.
+state. The portal separately controls current qualification and preparation
+approval. The run manager obtains fresh server authority before transfer and
+again after upload, and binds each acknowledged start to its own SDCP task and
+filename. A missing/uncertain physical start acknowledgement is held without
+hardware retry, including across restart.
 
 SatelLite 1.0.2.18 exposes evaluation, repair and hollowing CLI flags, but no
 supported unattended slicing/export CLI was established. Synthetic probes exited
@@ -89,13 +113,13 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
 | Units and sizing | Explicit mm/in/m conversion; instructions preserved; required human size confirmation | Interpret/resolve requested scale and target dimensions, then supply geometry that embodies them |
 | Mesh/solid policy | STL/OBJ input; original preservation; solid-only slicer policy; SatelLite probe | Mesh repair qualification; detect existing cavities; drain-hole/wall and hollow-part validation |
-| Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks | Customer support/finish requirements, physical support strength, arbitrary orientation and plate packing |
+| Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; one source instance per file | Customer support/finish requirements, physical support strength, arbitrary orientation and validated plate packing |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
 | Profile customization | Named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |
-| Evidence synchronization | Stable operation UUID/body/version; durable retry/outbox; optional automatic issue-free slice receipts | Deploy portal migration/API, provision scoped token and qualified bindings, verify live reconciliation |
-| Printer LAN | SDCP adapter; actual read-only attributes/status on Saturn 4 Ultra 16K V1.5.6 | Actual upload/start/control qualification and artifact acceptance; resin ticket dispatch remains blocked |
+| Evidence synchronization | Durable slice/approval/start/result operations; exact UUID/body/version replay; optional automatic slice receipts | Deploy portal migration/API, provision scoped token and qualified bindings, verify live reconciliation |
+| Printer LAN | Conditional qualified resin run path; current server authority, local opt-in, per-run readiness, owned task/file identity; real read-only V1.5.6 calls | Actual upload/start/control and printer/resin/profile qualification; generic resin dispatch stays blocked |
 | Wash/cure/support removal | Requirements and portal production states remain available | Machine/operator evidence for the actual post-processing operations |
-| QC/delivery | Requested part count retained separately from runs | Physical acceptance, rejected/accepted part counts and portal completion evidence |
+| QC/delivery | Printed/remaining units tracked separately from generic file-copy/QC counts; all requested prints advance portal to post-processing | Physical acceptance, delivery evidence and explicit replacement/rework target contract after QC failure |
 
 Read-only SDCP implementation calls succeeded against the actual printer. No
 upload, remote start, pause, resume or stop was performed on that printer.
@@ -109,8 +133,9 @@ reports 218.88 x 128.88 x 220 mm, while the native target/export uses
 Local checks cover ticket eligibility/metadata, bounded model downloads,
 credential protection, receipt deduplication/restart recovery, production paging,
 actual private portal server transactions, durable outbox replay/conflicts,
-source/output identity, provider failures, profile constraints, cancellation and
-resin/filament separation. Browser and Windows development-desktop checks cover
+source/output identity, provider failures, profile constraints, cancellation,
+conditional resin permits, separate two-unit starts and exact physical-evidence
+writeback after lost replies. Browser and Windows development-desktop checks cover
 the local workflows. Hardware tests use fixtures except for the separately
 recorded native slice exports and read-only printer observations.
 

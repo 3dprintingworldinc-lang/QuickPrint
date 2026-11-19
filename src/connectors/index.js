@@ -9,6 +9,7 @@ const { pollEmail } = require('./email');
 const { pollLayr } = require('./layr');
 const { LayrOutbox } = require('./layr-outbox');
 const { queueSliceEvidence } = require('./layr-evidence');
+const resinProduction = require('./layr-production');
 
 function locationKey(config) {
   if (config.type === 'layr') return createHash('sha256').update(JSON.stringify(['layr', config.portalUrl, config.apiMode || 'mcp'])).digest('hex');
@@ -57,6 +58,7 @@ class ConnectorManager {
     this.configs = new Map();
     this.runtime = new Map();
     this.inFlight = new Map();
+    this.productionRequests = new Map();
     this.clients = new Set();
     this.writeQueue = Promise.resolve();
     this.stopping = false;
@@ -125,10 +127,33 @@ class ConnectorManager {
     const key = `outbox-dismiss:${id}`;
     if (this.inFlight.has(key)) return this.inFlight.get(key);
     const safeReason = typeof this.service._safeMessage === 'function' ? this.service._safeMessage(reason) : reason;
-    const operation = this.outbox.dismissOperation(id, { reason: safeReason });
+    const operation = this.outbox.dismissOperation(id, { reason: safeReason }).then(async entry => {
+      await resinProduction.releaseDismissedApproval(this, entry, this.outbox.command(id));
+      return entry;
+    });
     this.inFlight.set(key, operation);
     try { return await operation; } finally { this.inFlight.delete(key); }
   }
+
+  async _resinProductionAction(action, id, request) {
+    if (this.stopping || !this.started) throw Object.assign(new Error('Production inputs are stopped.'), { status: 409, code: 'LAYR_OUTBOX_STOPPED' });
+    const key = `resin-production:${id}:${action}`;
+    const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object' ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+    const fingerprint = createHash('sha256').update(JSON.stringify(canonical(request ?? null))).digest('hex');
+    if (this.inFlight.has(key)) {
+      if (this.productionRequests.get(key) !== fingerprint) throw Object.assign(new Error('Another production operation with different details is already in progress.'), { status: 409, code: 'LAYR_PRODUCTION_CONFLICT' });
+      return this.inFlight.get(key);
+    }
+    const operation = resinProduction[action](this, id, request);
+    this.inFlight.set(key, operation);
+    this.productionRequests.set(key, fingerprint);
+    try { return await operation; } finally { this.inFlight.delete(key); this.productionRequests.delete(key); }
+  }
+  reviewResinProduction(id, request) { return this._resinProductionAction('reviewProduction', id, request); }
+  approveResinProduction(id, request) { return this._resinProductionAction('approvePreparation', id, request); }
+  dispatchResinProduction(id, request) { return this._resinProductionAction('dispatchProduction', id, request); }
+  reconcileResinProduction(id, request) { return this._resinProductionAction('reconcileProduction', id, request); }
+  syncResinProductionEvidence(id) { return this._resinProductionAction('syncRunEvidence', id); }
 
   async pollNow(id) {
     if (this.stopping || !this.started) throw Object.assign(new Error('Input connectors are stopped.'), { status: 409 });

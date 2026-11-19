@@ -52,6 +52,10 @@ Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 
 Captured resin slices stay unqualified and cannot enter generic printer dispatch.
+The separate qualified resin flow requires current studio/device/profile
+authorization, local dispatch opt-in (off by default), and a new readiness
+confirmation for each one-unit run. Identified terminal telemetry and operator
+printed counts update the portal's remaining quantity without granting QC credit.
 The actual Saturn 4 Ultra 16K SDCP adapter was verified for read-only status and
 attributes; uploads, starts and physical output remain unqualified. Production
 still requires the portal update/token, resolved sizing/support instructions,
@@ -60,6 +64,7 @@ are in [private draft PR #15](https://github.com/3dprintingworldinc-lang/printby
 and have not been deployed.
 
 See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
+[qualified production steps](docs/RESIN-PRODUCTION.md),
 [headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
 [SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and
 [SDCP integration](docs/SDCP-INTEGRATION.md).

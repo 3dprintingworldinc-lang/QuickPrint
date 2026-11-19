@@ -9,7 +9,7 @@ const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-
 const HASH = /^[a-f0-9]{64}$/;
 const ACTIONS = new Set(['record_preprocessing', 'record_slice', 'approve_preparation', 'start_print', 'finish_print', 'fail_print']);
 const STATES = new Set(['pending', 'paused', 'auth_required', 'conflict', 'rejected', 'confirmed', 'dismissed']);
-const EXPECTED = { record_preprocessing: 'preparing', record_slice: 'preparing', approve_preparation: 'queued', start_print: 'printing', finish_print: 'post_processing', fail_print: 'preparing' };
+const EXPECTED = { record_preprocessing: ['preparing'], record_slice: ['preparing'], approve_preparation: ['queued'], start_print: ['printing'], finish_print: ['queued', 'preparing', 'post_processing'], fail_print: ['preparing'] };
 const MAX_STATE_BYTES = 32 * 1024 * 1024;
 const object = value => value && typeof value === 'object' && !Array.isArray(value);
 const digest = value => createHash('sha256').update(value).digest('hex');
@@ -33,18 +33,18 @@ function origin(value) {
   if (!text(value, 2000) || url.protocol !== 'https:' || url.pathname !== '/' || url.username || url.password || url.search || url.hash) fail('The outbox requires the original HTTPS portal origin.');
   return url.origin;
 }
-function validateCommand(command) {
+function validateCommand(command, { legacy = false } = {}) {
   keys(command, ['action', 'id', 'version', 'operationId', 'data']);
   if (!ACTIONS.has(command.action) || !UUID.test(command.id || '') || !UUID.test(command.operationId || '') || !Number.isSafeInteger(command.version) || command.version < 1 || !object(command.data)) fail('A saved production action requires valid job, operation and version identities.');
   const data = command.data;
   if (!HASH.test(data.ticketFingerprint || '')) fail('Production evidence requires the approved ticket fingerprint.');
   const fields = {
     record_preprocessing: ['ticketFingerprint', 'sourceSha256', 'tool', 'outputs', 'operations'],
-    record_slice: ['ticketFingerprint', 'sourceSha256', 'tool', 'profileSha256', 'printerId', 'printerModel', 'material', 'artifact'],
+    record_slice: ['ticketFingerprint', 'sourceSha256', 'tool', 'profileSha256', 'printerId', 'printerModel', 'material', 'artifact', 'partsPerRun', 'deviceFingerprint'],
     approve_preparation: ['ticketFingerprint', 'receiptId'],
-    start_print: ['ticketFingerprint', 'receiptId', 'runId', 'artifactSha256', 'printerId', 'remoteId', 'observedAt'],
-    finish_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt'],
-    fail_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt'],
+    start_print: ['ticketFingerprint', 'receiptId', 'runId', 'artifactSha256', 'printerId', 'remoteId', 'observedAt', 'plannedParts', 'deviceFingerprint'],
+    finish_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts'],
+    fail_print: ['ticketFingerprint', 'runId', 'remoteId', 'observedAt', 'printedParts'],
   };
   keys(data, fields[command.action]);
   if (['record_preprocessing', 'record_slice'].includes(command.action)) {
@@ -69,11 +69,16 @@ function validateCommand(command) {
     keys(data.artifact, ['sha256', 'sizeBytes', 'format']);
     if (!HASH.test(data.profileSha256 || '') || !text(data.printerId) || !text(data.printerModel) || !text(data.material) || !HASH.test(data.artifact.sha256 || '') ||
         !Number.isSafeInteger(data.artifact.sizeBytes) || data.artifact.sizeBytes < 1 || data.artifact.sizeBytes > 512 * 1024 * 1024 || !text(data.artifact.format, 40)) fail('Slice evidence requires the bound profile, printer, material and artifact hashes.');
+    if (data.partsPerRun !== undefined && (!Number.isSafeInteger(data.partsPerRun) || data.partsPerRun < 1 || data.partsPerRun > 500)) fail('The slice unit count must be a whole number from 1 to 500.');
+    if (data.deviceFingerprint != null && !HASH.test(data.deviceFingerprint)) fail('The physical printer signature must be a SHA-256 digest.');
   } else if (command.action === 'approve_preparation') {
     if (!UUID.test(data.receiptId || '')) fail('Preparation approval requires a receipt identity.');
   } else {
     if (!UUID.test(data.runId || '') || !text(data.remoteId) || !text(data.observedAt, 40) || !Number.isFinite(Date.parse(data.observedAt))) fail('Printer evidence requires an explicit identified run and observation.');
     if (command.action === 'start_print' && (!UUID.test(data.receiptId || '') || !HASH.test(data.artifactSha256 || '') || !text(data.printerId))) fail('Printer start evidence must identify its approved receipt, printer and artifact.');
+    if (!legacy && command.action === 'start_print' && (!HASH.test(data.deviceFingerprint || '') || !Number.isSafeInteger(data.plannedParts) || data.plannedParts < 1 || data.plannedParts > 500)) fail('Printer start evidence requires its qualified device signature and planned unit count.');
+    if (!legacy && command.action === 'finish_print' && (!Number.isSafeInteger(data.printedParts) || data.printedParts < 1 || data.printedParts > 500)) fail('Print completion evidence requires an explicit printed unit count.');
+    if (command.action === 'fail_print' && data.printedParts !== undefined && data.printedParts !== 0) fail('Failed print evidence cannot credit printed units.');
   }
   if (Buffer.byteLength(JSON.stringify(command)) > 32768) fail('Production evidence exceeds 32 KiB.', 413);
 }
@@ -91,16 +96,36 @@ function publicEntry(entry) {
     ...(entry.resolution ? { resolution: entry.resolution } : {}),
   });
 }
+function validProgress(progress) {
+  return object(progress) && Object.keys(progress).every(key => ['requestedParts', 'printedParts', 'remainingParts', 'completedRuns', 'failedRuns'].includes(key)) &&
+    ['requestedParts', 'printedParts', 'remainingParts', 'completedRuns', 'failedRuns'].every(key => Number.isSafeInteger(progress[key]) && progress[key] >= 0) &&
+    progress.requestedParts >= 1 && progress.requestedParts <= 500 && progress.printedParts <= progress.requestedParts && progress.remainingParts === progress.requestedParts - progress.printedParts;
+}
 function confirmation(result, entry, now) {
   const ticket = result?.ticket;
   const command = JSON.parse(entry.bodyJson);
-  if (!object(ticket) || ticket.id !== entry.id || ticket.version !== entry.version + 1 || ticket.status !== EXPECTED[entry.action] || ticket.ticketFingerprint !== command.data.ticketFingerprint) fail('The portal response did not confirm the saved production operation.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+  if (!object(ticket) || ticket.id !== entry.id || ticket.version !== entry.version + 1 || !EXPECTED[entry.action].includes(ticket.status) || ticket.ticketFingerprint !== command.data.ticketFingerprint) fail('The portal response did not confirm the saved production operation.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
   const summary = { version: ticket.version, status: ticket.status, confirmedAt: new Date(now).toISOString() };
   if (['record_preprocessing', 'record_slice'].includes(entry.action)) {
     const receipt = result.receipt;
     if (!object(receipt) || receipt.id !== entry.operationId || receipt.jobId !== entry.id || receipt.ticketFingerprint !== command.data.ticketFingerprint ||
         receipt.sourceSha256 !== command.data.sourceSha256 || typeof receipt.qualified !== 'boolean' || receipt.printReady !== false) fail('The portal response did not confirm the saved preparation receipt.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
     summary.receiptId = receipt.id; summary.qualified = receipt.qualified;
+  }
+  if (['start_print', 'finish_print', 'fail_print'].includes(entry.action) && (command.data.plannedParts !== undefined || command.data.printedParts !== undefined)) {
+    const run = ticket.production?.run, progress = ticket.production?.progress, data = command.data;
+    if (!validProgress(progress) || progress.requestedParts !== ticket.ticket?.specifications?.project?.quantity || !object(run) || run.runId !== data.runId || run.remoteId !== data.remoteId ||
+        !Number.isSafeInteger(run.plannedParts) || run.plannedParts < 1 || run.plannedParts > progress.requestedParts) fail('The portal did not confirm this identified run and its production quantities.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    if (entry.action === 'start_print' && (run.status !== 'printing' || run.receiptId !== data.receiptId || run.artifactSha256 !== data.artifactSha256 || run.printerId !== data.printerId ||
+        run.deviceFingerprint !== data.deviceFingerprint || run.plannedParts !== data.plannedParts || Date.parse(run.startedAt) !== Date.parse(data.observedAt))) fail('The portal did not confirm the saved physical start evidence.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    if (entry.action !== 'start_print') {
+      const completed = entry.action === 'finish_print';
+      const expectedStatus = completed ? progress.remainingParts === 0 ? 'post_processing' : progress.remainingParts >= run.plannedParts ? 'queued' : 'preparing' : 'preparing';
+      if (run.status !== (completed ? 'completed' : 'failed') || run.printedParts !== data.printedParts || Date.parse(run.finishedAt) !== Date.parse(data.observedAt) ||
+          ticket.status !== expectedStatus || (completed && (run.printedParts < 1 || run.printedParts > run.plannedParts || progress.printedParts < run.printedParts || progress.completedRuns < 1)) ||
+          (!completed && (run.printedParts !== 0 || progress.failedRuns < 1))) fail('The portal did not confirm this run result and remaining production work.', 502, 'LAYR_OUTBOX_UNCONFIRMED');
+    }
+    summary.progress = structuredClone(progress);
   }
   return summary;
 }
@@ -128,13 +153,13 @@ class LayrOutbox {
           if (!object(entry) || !text(entry.connectorId, 200) || origin(entry.portalUrl) !== entry.portalUrl || !UUID.test(entry.operationId || '') ||
               !HASH.test(entry.dedupKeyHash || '') || !HASH.test(entry.contentFingerprint || '') || !STATES.has(entry.state) ||
               !Number.isSafeInteger(entry.attempts) || entry.attempts < 0 || typeof entry.bodyJson !== 'string' || ids.has(entry.operationId) || dedup.has(entry.dedupKeyHash)) throw new Error('Invalid outbox operation');
-          const body = JSON.parse(entry.bodyJson); validateCommand(body);
+          const body = JSON.parse(entry.bodyJson); validateCommand(body, { legacy: true });
           if (body.operationId !== entry.operationId || body.id !== entry.id || body.action !== entry.action || body.version !== entry.version ||
               fingerprint(commandContent(entry, body)) !== entry.contentFingerprint) throw new Error('Outbox identity mismatch');
           ids.add(entry.operationId); dedup.add(entry.dedupKeyHash);
           // Persisted public confirmation must also be a narrow, safe summary.
-          if (entry.confirmation && (!object(entry.confirmation) || Object.keys(entry.confirmation).some(key => !['version', 'status', 'confirmedAt', 'receiptId', 'qualified'].includes(key)) ||
-              entry.confirmation.version !== entry.version + 1 || entry.confirmation.status !== EXPECTED[entry.action])) throw new Error('Invalid confirmation');
+          if (entry.confirmation && (!object(entry.confirmation) || Object.keys(entry.confirmation).some(key => !['version', 'status', 'confirmedAt', 'receiptId', 'qualified', 'progress'].includes(key)) ||
+              entry.confirmation.version !== entry.version + 1 || !EXPECTED[entry.action].includes(entry.confirmation.status) || (entry.confirmation.progress !== undefined && !validProgress(entry.confirmation.progress)))) throw new Error('Invalid confirmation');
           if ((entry.state === 'confirmed') !== Boolean(entry.confirmation)) throw new Error('Missing confirmation');
           if ((entry.state === 'dismissed') !== Boolean(entry.resolution) || (entry.resolution && (!object(entry.resolution) ||
               Object.keys(entry.resolution).sort().join(',') !== 'at,reason' || typeof entry.resolution.reason !== 'string' || !entry.resolution.reason.trim() || entry.resolution.reason.length > 500 ||
@@ -176,6 +201,11 @@ class LayrOutbox {
   }
   status() { return this.state.operations.map(publicEntry); }
   get(operationId) { const entry = this.state.operations.find(value => value.operationId === operationId); return entry ? publicEntry(entry) : null; }
+  command(operationId) {
+    if (!this.ready) fail('Initialize the production outbox before reading a saved operation.', 503, 'LAYR_OUTBOX_NOT_READY');
+    const entry = this.state.operations.find(value => value.operationId === operationId);
+    return entry ? JSON.parse(entry.bodyJson) : null;
+  }
   lookup(dedupKey) {
     if (!this.ready) fail('Initialize the production outbox before looking up saved evidence.', 503, 'LAYR_OUTBOX_NOT_READY');
     if (typeof dedupKey !== 'string' || dedupKey.length < 1 || dedupKey.length > 4000) fail('A stable evidence key is required.');
@@ -233,10 +263,10 @@ class LayrOutbox {
       return publicEntry(await this._update(operationId, { state: 'dismissed', nextAttemptAt: null, error: null, resolution: { reason, at: new Date(this._clock()).toISOString() } }));
     });
   }
-  async process(configs, { client = require('./layr-production-client'), signal, beforeSend, getConfigs } = {}) {
+  async process(configs, { client = require('./layr-production-client'), signal, beforeSend, getConfigs, sendRequest } = {}) {
     await this.init();
     const values = configs instanceof Map ? [...configs.values()] : configs;
-    if (!Array.isArray(values) || typeof client?.postEvidence !== 'function' || (beforeSend !== undefined && typeof beforeSend !== 'function') || (getConfigs !== undefined && typeof getConfigs !== 'function')) throw new TypeError('Provide connector configurations and a production evidence client.');
+    if (!Array.isArray(values) || typeof client?.postEvidence !== 'function' || (beforeSend !== undefined && typeof beforeSend !== 'function') || (getConfigs !== undefined && typeof getConfigs !== 'function') || (sendRequest !== undefined && typeof sendRequest !== 'function')) throw new TypeError('Provide connector configurations and a production evidence client.');
     return this._serialize(async () => {
       const blocked = new Set();
       for (const saved of [...this.state.operations]) {
@@ -301,9 +331,19 @@ class LayrOutbox {
         // leaves the original body and UUID available for exact replay.
         const attempting = await this._update(entry.operationId, { state: 'pending', attempts: entry.attempts + 1, lastAttemptAt: new Date(now).toISOString(),
           nextAttemptAt: new Date(now + 5000).toISOString(), error: null });
-        let result, caught;
-        try { result = await client.postEvidence(config, JSON.parse(attempting.bodyJson), { signal }); }
+        let result, caught, transmitted = false;
+        try {
+          const command = JSON.parse(attempting.bodyJson);
+          const send = () => { transmitted = true; return client.postEvidence(config, JSON.parse(attempting.bodyJson), { signal }); };
+          result = await (sendRequest ? sendRequest(publicEntry(attempting), command, send) : send());
+        }
         catch (error) { caught = error; }
+        if (caught?.definitelyUnsent === true && !transmitted && entry.attempts === 0) {
+          // A trusted local guard rejected before invoking the RPC closure.
+          // Preserve the body, but this operation still has no remote attempt.
+          await this._update(entry.operationId, { state: 'paused', attempts: 0, nextAttemptAt: null, error: 'Local preparation changed before transmission. Review this unsent operation before continuing.' });
+          continue;
+        }
         if (!caught) {
           try {
             const summary = confirmation(result, attempting, this._clock());

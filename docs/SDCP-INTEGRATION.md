@@ -48,6 +48,40 @@ Each packet contains at most 1 MiB of file data. Files must be nonempty and no l
 
 Packets are sent sequentially and require both `success: true` and `code: "000000"`. Redirects are refused. HTTP errors, malformed success envelopes, transfer-error notifications, socket loss, changed files and timeouts halt the transfer. There is no packet retry, offset guessing, automatic transfer termination, cleanup deletion or print start. A failed transfer can leave a partial remote file; inspect it before retrying. A final HTTP success is the documented packet acknowledgement with `Check: 1`; the specification does not define a separately correlated final checksum-completion event. QuickPrint does not claim a readback-verified remote checksum or hardware-qualified transfer from this acknowledgement.
 
+## Conditional qualified resin runs
+
+The adapter is connected to a separate qualified resin production path. Generic
+resin preparation/dispatch remains rejected. The qualified path requires a
+validated single-source-instance GOO, reviewed local profile bound to the local
+SDCP printer UUID, confirmed device-bound portal receipt, explicit whole-model
+one-order-unit declaration, approved portal plan and current studio binding.
+Local `resinEngine.dispatchEnabled` defaults to false, and every physical run
+requires a new readiness confirmation. See [production steps](RESIN-PRODUCTION.md).
+
+`sdcp-identity.js` fingerprints configured board/brand IDs with reported
+brand/machine, protocol, firmware, resolution and XYZ size. The studio binding
+also identifies the exact profile/engine, material, printer label/UUID and GOO
+format. Source, artifact, profile, configured-printer and device checks run before
+upload. Fresh portal authorization is read again after upload; revocation,
+changed files or a changed device can prevent start even when a file has already
+been uploaded. A short-lived internal one-use permit cannot be supplied by an
+HTTP client claiming `qualified: true`.
+
+Each run durably records a new run ID and unique remote filename. Its
+acknowledged start must identify that filename and a fresh SDCP task. Completion
+must match the owned task and file before the operator can record one printed
+unit. A zero-unit failed/stopped run provides no production credit. Printed unit
+progress is synchronized through exact saved portal operations; remaining units
+require separate starts and all requested printed units lead to post-processing,
+not quality acceptance.
+
+A lost/malformed printer start acknowledgement is held as an uncertain physical
+result without a start retry, including after restart. A lost portal response
+instead replays the same saved portal UUID/body/version without repeating the
+hardware action. These software gates have been tested using injected adapters
+and actual local portal handlers/SQLite. They do not change the pending hardware
+qualification stated above.
+
 ## Observed geometry discrepancy
 
 The observed firmware advertises `FILE_TRANSFER`, `PRINT_CONTROL` and `VIDEO_STREAM`, supports `CTB` and `GOO`, and reports `15120x6230` image resolution. Its `XYZsize` is `218.88x128.88x220` mm. The native/official target profile uses `211.68x118.37x220` mm. These values conflict and remain separate: the adapter returns the firmware value verbatim, while artifact qualification must use a reviewed target profile and a physical calibration result. Neither device capability advertisement nor a valid GOO container resolves this scale discrepancy. CTB advertisement also does not establish a CTB encoder or validated CTB artifact pipeline.
@@ -58,4 +92,4 @@ Private observed addresses, device IDs and raw reports, including the adapter re
 
 Run `node --test tests/adapters-sdcp.test.js`. All fixtures use synthetic identities and HTTP/WebSocket servers bound to `127.0.0.1`. Coverage includes request correlation, fresh reports, retained terminal states, new task identity, explicit rejection, malformed/lost acknowledgements, disconnect ambiguity, busy-device protection, capability/format checks, packet offsets/UUID/MD5/content, size and filename limits, partial transfer failure, redirects, transfer errors, timeouts and print-control command numbers. No test discovers or connects to a real printer.
 
-`node --test tests/sdcp-service.test.js` verifies durable SDCP run ownership and operator sign-off in the real `QuickPrintService` with an injected adapter and slicer. These service tests use the manual model-job path and fixture GOO metadata to exercise orchestration; they do not qualify the resin production path or bypass its dispatch block in the application.
+`node --test tests/sdcp-service.test.js` verifies durable SDCP run ownership and operator sign-off in `QuickPrintService` using the legacy manual model-job path with injected adapter/slicer and fixture GOO metadata. The conditional resin path has dedicated checks in `tests/resin-dispatch.test.js` and `tests/layr-production-flow.test.js`, covering current qualification, local opt-in, permits, repeated one-unit starts, matched terminal evidence, explicit counts and exact portal replay. Private-portal cases explicitly skip if that source is absent; always-running transport cases remain. None qualifies physical hardware.

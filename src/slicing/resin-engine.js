@@ -188,7 +188,9 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     const analysis = parseIssueReport(issueOutput);
     const finalHash = hash(await fs.readFile(gooPath));
     if (finalHash !== inspection.sha256) throw fail('The resin artifact changed during analysis.', 'RESIN_ARTIFACT_CHANGED', 409);
-    const attempt = { orientation, analysis, inspection, filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: finalHash, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256 };
+    // One submitted source instance; this does not count disconnected geometry,
+    // physical parts, or accepted production units. No duplication flags are used.
+    const attempt = { modelCopiesPerRun: 1, orientation, analysis, inspection, filePath: gooPath, fileName: 'prepared.goo', bytes: gooStat.size, sha256: finalHash, sl1Sha256: sl1.sha256, effectivePresetSha256: sl1.effectivePresetSha256 };
     attempts.push(attempt);
     await fs.writeFile(path.join(directory, 'evidence.json'), JSON.stringify({ ...attempt, tool, profileSha256, logs }, null, 2));
     if (analysis.passed) break;

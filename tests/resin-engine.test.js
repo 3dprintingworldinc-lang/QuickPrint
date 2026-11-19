@@ -195,6 +195,7 @@ test('orientation search stops at first issue-free artifact and preserves source
   const result = await prepareResin(f.options, mock);
   assert.equal(result.status, 'sliced_pending_qualification');
   assert.equal(result.printReady, false); assert.equal(result.printerCompatible, false);
+  assert.equal(result.modelCopiesPerRun, 1);
   assert.deepEqual(result.orientation, f.profile.orientationCandidates[1]);
   assert.equal(result.attempts.length, 2);
   assert.equal(mock.calls.filter(call => call.args.includes('--export-sla')).length, 2);
@@ -205,6 +206,10 @@ test('orientation search stops at first issue-free artifact and preserves source
   const evidence = JSON.parse(await fs.readFile(path.join(path.dirname(result.filePath), 'evidence.json'), 'utf8'));
   assert.equal(evidence.sha256, result.sha256);
   assert.equal(evidence.profileSha256, result.profileSha256);
+  assert.equal(evidence.modelCopiesPerRun, 1);
+  assert.ok(mock.calls.filter(call => call.args.includes('--export-sla')).every(call =>
+    !call.args.some(argument => /^--duplicate(?:-grid)?(?:=|$)/.test(argument))),
+  'single-instance evidence must never invoke Prusa duplication or grid duplication');
   const slice = mock.calls.find(call => call.args.includes('--export-sla'));
   assert.notEqual(slice.args.at(-1), f.options.inputPath);
   assert.deepEqual(await fs.readFile(slice.args.at(-1)), f.original);

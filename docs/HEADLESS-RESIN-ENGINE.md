@@ -5,6 +5,9 @@ preparation pipeline in `src/slicing/resin-engine.js`. It evaluates explicit
 orientation candidates, checks the resulting layers and target parameters, and
 retains the selected slice with inspectable evidence. It does not start a printer.
 Every result has `printReady: false` and `printerCompatible: false`.
+The separate [qualified production flow](RESIN-PRODUCTION.md) can authorize an
+individually confirmed run after current studio qualification and local opt-in;
+a preparation result alone never supplies that authority.
 
 This pipeline is separate from the installed SatelLite application. SatelLite's
 native export and internal automation boundaries are documented in
@@ -139,7 +142,7 @@ version 1 has these fields:
 | Field | Contract |
 | --- | --- |
 | `schemaVersion` | Numeric `1` |
-| `printerId` | Nonempty local target identity; not a printer start instruction |
+| `printerId` | Nonempty target identity for standalone preparation; production requires the selected local SDCP printer UUID |
 | `printerModel` | Nonempty target model label |
 | `material` | Nonempty reviewed resin/material label |
 | `presetPath` | Standalone INI path, absolute or relative to the JSON file |
@@ -240,6 +243,43 @@ target-dimension transformation. Candidate X/Y/Z angles are degrees in
 `[-360, 360]`. The supplied profile supports two candidates; up to four can be
 configured. Real provider evidence in this document used millimetre input.
 
+### Source copies and production quantity
+
+Each completed attempt and selected result records `modelCopiesPerRun: 1`;
+the verification CLI reports the same field. This means one submitted source
+instance. It does not count disconnected mesh components, physical parts,
+supports, or accepted production units. The engine passes no `--duplicate` or
+`--duplicate-grid` option and does not pack additional source instances.
+A single-unit repeat plan counts one order unit per file run only after an
+operator declares that the whole submitted model represents exactly one order
+unit. Repeated runs and physically accepted quantities still need separate
+production evidence; a slice never supplies QC counts.
+The actual provider rerun recorded this field in
+`artifacts/resin-single-instance-verification/verification-dd630f36-9c06-473c-a6aa-5afcd5281d16.json`:
+234 layers, zero reported issues, GOO SHA-256
+`c4e56cffb26b8f89d7cea14202fd053feb9e0769b6a73ba3b0fd2d65ed3df3d5`.
+
+Prusa 2.9.7 advertises duplication flags, but an actual overflow probe shows why
+they are not enabled here. The included 3 mm cube was sliced on the synthetic
+40 x 20 mm bed, with supports/pad disabled and 60 layers:
+
+| Requested `--duplicate` value | Reported material (mL) | Separate cube footprints in layer 30 |
+| --- | --- | --- |
+| 1 | 0.027 | 1 |
+| 2 | 0.054 | 2 |
+| 20 | 0.270 | 10 |
+
+All three invocations exited 0. The 20-copy request silently exported only ten
+cube equivalents. Tagged primary source shows
+[duplication before rotation/scale](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessTransform.cpp)
+and [arrangement followed by bed-0 selection before slicing](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessActions.cpp).
+The inspected SL1 `config.ini`/`config.json` contain no instance-count or
+placement-footprint contract. Raster component counting confirmed this simple
+cube probe, but cannot establish part counts for arbitrary geometry/supports.
+Local help, logs, SL1 files and raster-count evidence are retained under
+`scratch/resin-plate-plan/` and excluded from version control. Multiple-copy
+packing needs an independently checked placement/count contract before use.
+
 ## Desktop use and order requirements
 
 Configure local provider paths, reviewed profile settings and operation timeout
@@ -252,6 +292,7 @@ example, the `resinEngine` settings object can contain:
   "prusaExecutable": "C:\\Slicing\\PrusaSlicer\\prusa-slicer-console.exe",
   "uvtoolsExecutable": "C:\\Slicing\\UVtools\\UVtoolsCmd.exe",
   "timeoutMs": 900000,
+  "dispatchEnabled": false,
   "slots": [
     {
       "id": "standard-grey",
@@ -276,15 +317,16 @@ The UI can add, rename and remove slots; each selected slot references its own
 JSON/INI files. Save Settings before using that slot's **Customize profile**
 button. The editor exposes material name, layer height, normal/bottom exposure,
 layer counts, movement/wait values, PWM, support/pad toggles and one to four
-orientation candidates. It keeps printer identity, physical geometry and image
-mirrors fixed. Hollowing remains disabled.
+orientation candidates. **Bound local printer** binds `printerId` to an existing
+configured SDCP printer UUID. The model label, physical geometry and image
+mirrors remain in the reviewed profile. Hollowing remains disabled.
 
 The authenticated customization API is `GET /api/resin/profiles/:id` and
 `PUT /api/resin/profiles/:id`, where `id` is a saved named slot. The GET response
 contains `{slot, profile, profileSha256}`. PUT accepts the editable fields
-`material`, `layerHeightMm`, `uvtoolsProperties`, `supportsEnabled`, `padEnabled`,
-and `orientationCandidates`; omitted fields retain their current values. It also
-accepts the optional `expectedProfileSha256` control, which the UI always submits
+`printerId`, `material`, `layerHeightMm`, `uvtoolsProperties`, `supportsEnabled`,
+`padEnabled`, and `orientationCandidates`; omitted fields retain their current
+values. It also accepts the optional `expectedProfileSha256` control, which the UI always submits
 from its GET response. A mismatched or invalid digest rejects the save with HTTP
 409 before managed files are written, so a stale editor must reload first.
 The service synchronizes layer height and exposure changes into both JSON and
@@ -330,6 +372,11 @@ and leaves reported issues visible. Successful capture is
 `analysis_failed`. Neither becomes a generic dispatch-ready artifact.
 Authenticated GOO downloads recheck stored source/output hashes. Files with
 reported issues remain available for inspection.
+After a device-bound receipt is confirmed, use **Review production
+qualification** for the separate studio binding, whole-model one-unit declaration,
+portal approval and per-run authorization. **Enable qualified resin dispatch**
+defaults to false. The engine's unqualified result flags remain unchanged even
+when that separate run path is available; see the [production guide](RESIN-PRODUCTION.md).
 
 Native resin slicing and the SatelLite preprocessing probe share one service
 engine lock. Duplicate preparations for the same job are rejected. Active work

@@ -166,7 +166,7 @@ test('PrintByLayr browser sign-in imports a paid resin ticket with escaped requi
   await expect(dialog.getByText('Requested parts', { exact: true })).toBeVisible();
   await expect(dialog.getByText('7 parts requested · model units mm · presentation quality', { exact: true })).toBeVisible();
   await expect(dialog.getByText('grey resin · standard · supports: no-visible', { exact: true })).toBeVisible();
-  await expect(dialog.getByText('Awaiting resin qualification', { exact: true })).toBeVisible();
+  await expect(dialog.getByText(/^0 \/ 7 units printed/)).toBeVisible();
   await expect(dialog.locator('.file-name')).toHaveText(job.name);
   await expect(dialog.locator('.body-copy')).toContainText(NOTES);
   await expect(dialog.locator('[data-fixture-injection]')).toHaveCount(0);

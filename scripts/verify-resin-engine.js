@@ -51,6 +51,7 @@ async function main() {
     status: result.status, reportPath, artifactPath: result.filePath, sha256: result.sha256,
     sourceSha256: result.sourceSha256, profileSha256: result.profileSha256,
     tool: result.tool, attempts: result.attempts.length, orientation: result.orientation,
+    modelCopiesPerRun: result.modelCopiesPerRun,
     layerCount: result.inspection.layerCount, resolutionX: result.inspection.resolutionX, resolutionY: result.inspection.resolutionY,
     issueCount: result.analysis.count, printReady: result.printReady, printerCompatible: result.printerCompatible,
   }, null, 2) + '\n');

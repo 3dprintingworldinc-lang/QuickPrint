@@ -1,6 +1,6 @@
 'use strict';
 
-const { verifyQueuedEvidence } = require('./layr-evidence');
+const { verifyQueuedProductionEvidence, sendProductionRequest } = require('./layr-production');
 
 // Imports preparation tickets only. Portal workflow mutations are deliberately
 // separate from local model receipt and from physical manufacturing evidence.
@@ -20,7 +20,8 @@ async function pollLayr(manager, config, checkpoint) {
     const failures = [];
     const processEvidence = production ? () => manager.outbox.process(manager.service.getConnectors({ secrets: true }), {
       client, signal: controller.signal, getConfigs: () => manager.service.getConnectors({ secrets: true }),
-      beforeSend: (entry, command) => verifyQueuedEvidence(manager, entry, command),
+      beforeSend: (entry, command) => verifyQueuedProductionEvidence(manager, entry, command),
+      sendRequest: (entry, command, send) => sendProductionRequest(manager, entry, command, send),
     }) : null;
     // Pending writes may already have committed. Reconcile them independently
     // of listing/import failures so a large or broken model cannot starve them.
@@ -60,6 +61,12 @@ async function pollLayr(manager, config, checkpoint) {
           try { await manager.queueSliceEvidence(local.id, { connectorId: config.id }); }
           catch (error) { failures.push(error); }
         }
+      }
+      for (const local of manager.service.snapshot().jobs) {
+        if (manager.stopping) break;
+        if (local.technology !== 'resin' || local.order?.portalUrl !== config.portalUrl || !local.runs.some(run => run.startEvidence && run.receiptId)) continue;
+        try { await manager.syncResinProductionEvidence(local.id); }
+        catch (error) { failures.push(error); }
       }
       try { await processEvidence(); } catch (error) { failures.push(error); }
     }
