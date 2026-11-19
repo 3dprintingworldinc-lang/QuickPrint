@@ -59,6 +59,10 @@ Slicing now requires an independently audited closed, consistently wound source
 mesh before native processing. The optional [exact repair workflow](docs/RESIN-MESH-REPAIR.md)
 accounts for every source face, preserves the frozen original and binds the
 reviewed derivative through sizing, slicing and production evidence.
+The separate [hollow/drain request builder](docs/RESIN-HOLLOWING.md) binds explicit
+cylinders and native settings to the reviewed sized model and generates a
+deterministic headless 3MF request. Resulting cavity/wall verification remains
+pending, so production hollowing is still unavailable.
 
 Explicit multi-copy resin plates reserve the native single-copy support/pad
 footprint and replicate that reference's exact grayscale layer images on the

@@ -291,7 +291,9 @@ are converted once, without reapplying declared ticket units. The service binds
 the original CAD, converted mesh, reports and composite provider fingerprint.
 Models are treated as
 solid: `hollowing_enable=0` is mandatory because there is no qualified drain-hole
-plan or hollow-part inspection contract in this engine. This restriction does
+plan or hollow-part inspection contract in this engine. The separate
+[source-bound hollow/drain request builder](RESIN-HOLLOWING.md) generates
+unverified native requests and does not remove this production gate. This restriction does
 not detect a cavity already modeled into an uploaded mesh.
 
 Declared units convert deterministically: millimetres `1`, inches `25.4`, or

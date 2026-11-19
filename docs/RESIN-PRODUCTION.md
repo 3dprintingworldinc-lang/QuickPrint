@@ -326,9 +326,11 @@ No case uploads to or starts a real printer.
 ## Remaining production work
 
 Live portal migration/deployment/token setup and actual hardware qualification
-remain. The engine does not interpret free-text sizing, establish hollow/drain
-plans or certify self-intersection/cavity safety, or infer arbitrary
+remain. The engine does not interpret free-text sizing, qualify hollow/drain
+results or certify self-intersection/cavity safety, or infer arbitrary
 supports/finish requirements. Plate proof establishes explicit source-instance
 replication, not support strength, cure or physical acceptance. Post-processing,
 QC decisions, replacement allowance and delivery remain explicit studio/operator
 work; no automatic quality acceptance is inferred from printed-unit evidence.
+The separate [headless hollow/drain request builder](RESIN-HOLLOWING.md) prepares
+source-bound native requests; it does not qualify an order or grant a permit.
