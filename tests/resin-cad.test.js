@@ -29,7 +29,13 @@ test('real Node boundary verifies closed per-solid evidence and translated combi
   assert.deepEqual(verified.bytes, bytes); assert.equal(bytes.length, result.bytes); assert.equal(hash(bytes), result.sha256); assert.equal(bytes.readUInt32LE(80), 24);
   assert.ok(result.tool.binaryManifest.some(item => item.name === 'quickprint/cad-worker')); assert.ok(result.tool.binaryManifest.some(item => item.name === 'freecad/lib/Part.pyd'));
   assert.match(result.tool.executableSha256, /^[a-f0-9]{64}$/);
-  assert.equal(f.calls.length, 2); assert.ok(f.calls.every(call => call.executable === f.modulePaths.pythonExecutable && call.args[0] === '-I' && call.options.timeoutMs === 10000));
+  assert.equal(f.calls.length, 2);
+  for (const call of f.calls) {
+    // Windows temp paths may use an 8.3 spelling while realpath returns the
+    // long spelling. The process must still use the exact expected file.
+    assert.equal(await fs.realpath(call.executable), f.modulePaths.pythonExecutable);
+    assert.equal(call.args[0], '-I'); assert.equal(call.options.timeoutMs, 10000);
+  }
   assert.equal(scriptName(f.calls[0]), 'resin-cad-transfer-audit.py');
   const worker = f.calls[1]; assert.equal(scriptName(worker), 'resin-cad-worker.py');
   assert.equal(worker.args[worker.args.indexOf('--input') + 1], result.sourceCopy); assert.notEqual(result.sourceCopy, f.options.inputPath);
