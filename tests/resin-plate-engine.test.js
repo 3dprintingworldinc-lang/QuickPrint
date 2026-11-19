@@ -12,6 +12,7 @@ const { createPlateSliceFixture, gooForInstances } = require('./helpers/resin-pl
 const { prepareResin, loadProfile, parseIni } = require('../src/slicing/resin-engine');
 const { prepareResinGeometry, forEachResinTriangle } = require('../src/slicing/resin-geometry');
 const { prepareResinPlateSource } = require('../src/slicing/resin-plate');
+const { verifyGooPlate } = require('../src/slicing/goo-plate');
 const { normalizeResinPlateOptions, createResinPlate3mf, resinPlateHeightPolicy, prepareResinPlatePreset, assertPackedEffectiveSettings, verifyResinPlatePreparation } = require('../src/slicing/resin-plate-engine');
 
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
@@ -84,7 +85,8 @@ test('packed preset normalization appends only a missing faded-layer override an
 test('packed captures independently verified counts, one-instance reference and source-bound canonical layout', async t => {
   const f = await fixture(t), result = await f.prepareResin(f.input), proof = await f.verify(result);
   assert.equal(result.modelCopiesPerRun, 3); assert.equal(proof.modelCopiesPerRun, 3); assert.equal(proof.layout.copiesPlaced, 3); assert.equal(proof.rasterProof.copiesPerRun, 3);
-  assert.equal(f.renderCalls.length, 2); assert.equal(f.renderCalls[0].placements.length, 1); assert.equal(f.renderCalls[1].placements.length, 3);
+  assert.equal(result.platePreparation.method,'reference-raster-replication-v1'); assert.equal(proof.method,'reference-raster-replication-v1');
+  assert.equal(f.renderCalls.length, 1); assert.equal(f.renderCalls[0].placements.length, 1); assert.equal(f.analyzeCalls.length,1); assert.equal(f.analyzeCalls[0].expectedSha256,result.sha256);
   assert.equal(proof.rasterProof.totalForegroundPixels, proof.rasterProof.referenceForegroundPixels * 3); assert.equal(proof.rasterProof.imageEquivalent, true);
   assert.ok(Object.isFrozen(proof.layout.placements)); assert.deepEqual(await fs.readFile(f.input.inputPath), MODEL);
   assert.equal(result.printReady, false); assert.equal(result.platePreparation.sourceSha256, result.inputGeometry.sha256);
@@ -119,13 +121,14 @@ test('an upper bound exceeding bed capacity records the smaller proved count and
 
 test('actual missing instances are rejected by full raster proof even when native structure and declared file count are valid', async t => {
   const f = await fixture(t); f.faults.omitLastCopy = true;
-  await assert.rejects(f.prepareResin(f.input), { code: 'GOO_PLATE_IMAGE_MISMATCH' });
+  await assert.rejects(f.prepareResin(f.input), { code: 'RESIN_ARTIFACT_CHANGED' });
 });
 
 test('all six issue checks remain part of a truthful captured plate that needs review', async t => {
-  const f = await fixture(t); f.faults.issues = 2;
+  const f = await fixture(t); f.faults.issues = 2; f.faults.referenceIssues = 1;
   const result = await f.prepareResin(f.input);
   assert.equal(result.analysis.passed, false); assert.equal(result.analysis.count, 2); assert.equal(result.analysis.checks.length, 6); assert.equal(result.modelCopiesPerRun, 3);
+  assert.equal(f.renderCalls.length,1); assert.equal(f.analyzeCalls.length,1);
   assert.equal((await f.verify(result)).modelCopiesPerRun, 3);
 });
 
@@ -151,7 +154,21 @@ test('a valid but incomplete GOO cannot be substituted even after rehashing the 
   const f = await fixture(t), result = await f.prepareResin(f.input), record = structuredClone(result.platePreparation), loaded = await loadProfile(f.input.profilePath);
   const incomplete = gooForInstances({ placements: record.layout.placements.map(item => item.offsetMm).slice(0,-1), dimensions: record.layout.instanceDimensionsMm, profile: loaded.profile, ini: loaded.ini });
   record.artifactSha256 = hash(incomplete); reseal(record);
-  await assert.rejects(f.verify(result, record, incomplete), { code: 'GOO_PLATE_IMAGE_MISMATCH' });
+  await assert.rejects(f.verify(result, record, incomplete), { code: 'RESIN_PLATE_CHANGED' });
+});
+
+test('whole-file rederivation rejects thumbnail tampering even with a valid refreshed raster proof and artifact hash', async t => {
+  const f=await fixture(t),result=await f.prepareResin(f.input),record=structuredClone(result.platePreparation),artifact=await fs.readFile(result.filePath);
+  artifact[194]^=1; record.artifactSha256=hash(artifact);
+  const reference=await fs.readFile(record.reference.filePath),options={translationsPx:record.rasterProof.placements.map(({x,y})=>({x,y})),marginPx:record.rasterProof.marginPx,minGapPx:record.rasterProof.minGapPx};
+  record.rasterProof=verifyGooPlate(reference,artifact,options); record.replication.artifactSha256=hash(artifact); reseal(record);
+  assert.equal(record.rasterProof.imageEquivalent,true);
+  await assert.rejects(f.verify(result,record,artifact),{code:'RESIN_PLATE_CHANGED'});
+});
+
+test('packed records require the current derivation method instead of silently accepting native-plate receipts', async t => {
+  const f=await fixture(t),result=await f.prepareResin(f.input);
+  for(const method of [undefined,'native-instances','arbitrary-v1']) {const record=structuredClone(result.platePreparation);if(method===undefined)delete record.method;else record.method=method;reseal(record);await assert.rejects(f.verify(result,record),{code:'RESIN_PLATE_METHOD_UNSUPPORTED'});}
 });
 
 test('evidence paths outside the job and links inside it are rejected even for identical bytes', async t => {
@@ -184,7 +201,7 @@ test('packed mode pins the native placement version while default legacy mode ke
   assert.equal(calls.length, 1);
 });
 
-test('a mismatching later orientation is rejected while a prior proved but issue-bearing plate remains held for review', async t => {
+test('a clipped reference may skip an orientation while image-integrity failures stop preparation immediately', async t => {
   const f = await fixture(t), profile = JSON.parse(await fs.readFile(f.input.profilePath));
   profile.orientationCandidates.push({ x: 30, y: 15, z: 0 }); await fs.writeFile(f.input.profilePath, JSON.stringify(profile));
   for (const filename of [f.input.prusaExecutable,f.input.uvtoolsExecutable,path.join(f.root,'PrusaSlicer.dll'),path.join(f.root,'UVtoolsCmd.dll'),path.join(f.root,'UVtools.Core.dll')]) await fs.writeFile(filename, 'Owned native-boundary fixture');
@@ -192,12 +209,15 @@ test('a mismatching later orientation is rejected while a prior proved but issue
   const run = async (exe,args) => { if (args[0] === '--help') return 'PrusaSlicer-2.9.7\n --export-sla'; if (args[0] === '--core-version') return '7.1.2'; throw new Error('Injected native calls must stay at the trusted packed boundary.'); };
   const preparePackedAttempt = async options => {
     attempts++;
-    if (options.orientation.x !== 0) throw Object.assign(new Error('A real raster mismatch rejects this candidate.'), { code: 'GOO_PLATE_IMAGE_MISMATCH' });
+    if (options.orientation.x !== 0) throw Object.assign(new Error('The native reference exceeds its clear margin.'), { code: 'GOO_REPLICATION_CLIPPED' });
     return f.prepareResin({ ...f.input, outputDir: options.directory });
   };
   const result = await prepareResin(f.input, { run, preparePackedAttempt });
   assert.equal(attempts, 2); assert.equal(result.modelCopiesPerRun, 3); assert.equal(result.analysis.passed, false); assert.equal(result.status, 'analysis_failed'); assert.equal(result.printReady, false);
-  assert.deepEqual(result.orientation, { x: 0, y: 0, z: 0 }); assert.equal(result.rejectedOrientations[0].reason, 'GOO_PLATE_IMAGE_MISMATCH');
+  assert.deepEqual(result.orientation, { x: 0, y: 0, z: 0 }); assert.equal(result.rejectedOrientations[0].reason, 'GOO_REPLICATION_CLIPPED');
   assert.equal((await f.verify(result)).modelCopiesPerRun, 3);
-  await assert.rejects(prepareResin(f.input, { run, preparePackedAttempt: async () => { throw Object.assign(new Error('Mismatching pixels.'), { code: 'GOO_PLATE_IMAGE_MISMATCH' }); } }), { code: 'RESIN_PLATE_NO_VERIFIED_CANDIDATE' });
+  let mismatched=0;
+  await assert.rejects(prepareResin(f.input, { run, preparePackedAttempt: async () => { mismatched++; throw Object.assign(new Error('Mismatching pixels.'), { code: 'GOO_PLATE_IMAGE_MISMATCH' }); } }), { code: 'GOO_PLATE_IMAGE_MISMATCH' });
+  assert.equal(mismatched,1,'an integrity failure must not search another orientation');
+  await assert.rejects(prepareResin(f.input, { run, preparePackedAttempt: async () => { throw Object.assign(new Error('All native references are clipped.'), { code: 'GOO_REPLICATION_CLIPPED' }); } }), { code: 'RESIN_MODEL_OUT_OF_BOUNDS' });
 });

@@ -79,8 +79,12 @@ margin. Copies must be 1 through 500 and cannot exceed this target's remaining
 units; gaps are nonnegative and margins at least 1 mm. Native support/pad
 footprints, pixel alignment and resource bounds can reduce the actual fit.
 Review the displayed **verified source instances per plate** before approval.
-The engine proves the explicit placements against every final GOO layer; a
-request for 20 is never evidence that 20 were captured.
+The engine builds the plate from one native reference's exact pixel-translated
+layer images, independently reconstructs the complete GOO byte for byte and
+runs all six issue checks on that final file. The layout 3MF remains provenance,
+not a second native packed export. A request for 20 is never evidence that 20
+were captured. Earlier packed records require preparation with the current
+`reference-raster-replication-v1` method before reuse.
 
 Without a plate request the file contains one submitted source instance.
 Disconnected geometry and support components do not determine how many order

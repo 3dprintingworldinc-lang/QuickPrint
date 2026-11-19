@@ -108,19 +108,28 @@ preserved. See [CAD preparation](RESIN-CAD.md) and
 Without a plate request, the engine retains its single-source-instance path.
 With a plate request, `modelCopiesPerRun` is the actual verified fit, never the
 requested upper bound or a disconnected-component count. The operator declares
-that each whole source instance represents one order unit. Native reference
-slicing measures the full support/pad footprint; deterministic explicit 3MF
-instances use integer-pixel translations. Independent verification requires an
-exact grayscale union on every final GOO layer, matching layer schedules and
-physical settings, clear margins and separate footprints. It does not use
-Prusa's unsafe `--duplicate` overflow behavior.
+that each whole source instance represents one order unit. A single native
+indexed-3MF reference measures the full support/pad footprint; deterministic
+placements use integer-pixel translations. The plate GOO is built directly from
+exact reference grayscale images, with matching layer schedules and physical
+settings. The layout 3MF is retained as provenance, without a second native
+slicing pass. Independent verification reconstructs the whole final file byte
+for byte, checks its exact all-layer grayscale union, margins and separate
+footprints, then runs all six issue checks on that actual file. No grayscale
+tolerance or Prusa `--duplicate` overflow behavior supplies the count. Earlier
+packed receipts lacking the current method require preparation again.
 
 Real PrusaSlicer 2.9.7/UVtools 7.1.2 preparation produced 20 of 20 requested
 synthetic cubes, 60 layers and zero reports from all six issue checks with
-supports/pad explicitly disabled in a copied profile. The supported flat
-three-copy request fit two copies, passed their copy proof and stayed held on
-two islands. A tilted candidate failed exact raster equivalence and was rejected.
-Original files were preserved; all captures remain unqualified. See
+supports/pad explicitly disabled in a copied profile. The unchanged supported
+profile produced three of three copies at `(30,15,0)`, 234 layers and zero
+reports. The owned STEP cylinder passed the actual CAD-to-slice service flow
+with 20 copies, 60 layers and zero reports; core download verification passed
+before and after service reload. The source STEP stayed unchanged, embedded
+units converted once, dispatch remained disabled and no physical runs existed.
+These current-method results replace the earlier native packed-export probes
+that were held for non-equivalent rasters. Original files were preserved; all
+captures remain unqualified. See
 [plate proof and native evidence](RESIN-PLATES.md).
 
 Each approved plate needs a new readiness confirmation. An identified completed
@@ -171,7 +180,7 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
 | Units and sizing | mm/in/m conversion; measured source axes; explicit uniform factor or one-axis target; normalized input hash/bounds | Resolve free text and unsupported nonuniform/complex CAD changes |
 | Mesh/solid policy | STL/triangulated OBJ measurement; source-bound STEP audit/tessellation; closed-mesh and analytic solid checks; preserved originals; SatelLite probe | General healing, non-solid/void-shell CAD, self-intersection and cavity/drain-hole/wall certification |
-| Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; native-footprint multi-copy layout with exact all-layer raster proof | Customer support/finish requirements, physical support strength and qualification; candidates without equivalent copy rasters are rejected |
+| Orientation/supports | One to four explicit rotations; configurable supports/pad; exact native-reference raster replication, complete-byte rebuild and all six checks on the derived plate | Customer support/finish requirements, physical support strength and qualification; integrity mismatches stop preparation |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
 | Profile customization | Up to 32 named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |
 | Evidence synchronization | Durable slice/approval/start/result operations; exact UUID/body/version replay; optional automatic slice receipts | Deploy portal migration/API, provision scoped token and qualified bindings, verify live reconciliation |

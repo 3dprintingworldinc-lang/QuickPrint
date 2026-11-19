@@ -21,6 +21,7 @@ each provider's adjacent libraries and resources intact. The engine fingerprints
 the Prusa console/core DLL and UVtools console/command/core DLLs. Its QuickPrint
 manifest covers `resin-engine.js`, `goo.js`, `resin-profiles.js`,
 `resin-geometry.js`, `resin-plate.js`, `resin-plate-engine.js`, `goo-plate.js`,
+`goo-replication.js`,
 the process runner in `slicing/index.js`, and
 `psam/zip-inspection.js`. These selected hashes
 are not a complete manifest of every runtime dependency in the provider
@@ -97,6 +98,14 @@ fixture.
 The full-resolution local receipt is
 `artifacts/resin-16k-verification/verification-695ab5a3-2135-4c8d-afc5-e83d91273b04.json`.
 
+The current packed method also replicated a native 15120 x 6230 thin reference
+into 20 copies across all eight layers, with zero reports from all six checks.
+Independent streaming comparison of native-exported PNGs found zero differing
+rows on every layer, and both plate previews preserved the physical display
+aspect ratio. The [plate evidence](RESIN-PLATES.md#native-file-evidence-and-reproduction)
+records the artifact hash and report. This remains file-only verification;
+the known firmware/profile geometry conflict and physical qualification remain.
+
 ## Pipeline and selection behavior
 
 1. Read and hash the original STL/OBJ, JSON profile and standalone INI. Copy the
@@ -110,10 +119,15 @@ The full-resolution local receipt is
    normalized STL, `--scale 1`, rotations, `--export-sla`, and managed
    `prepared.sl1` output. Configuration compatibility substitutions are disabled.
    With an explicit `plate` request, instead preapply that rotation, create a
-   canonical shared mesh and native single-copy reference, reserve its measured
-   full support/pad footprint, then export explicit pixel-aligned 3MF instances
-   with automatic arrangement disabled. The final GOO must pass the independent
+   canonical indexed shared mesh and native single-copy reference with automatic
+   arrangement disabled. Reserve its measured full support/pad footprint and
+   plan explicit pixel-aligned copies. Build the final GOO by exact translation
+   of that reference's grayscale images, preserving physical schedules; retain
+   the layout 3MF as provenance. There is no second native packed slicing pass.
+   The final file must pass independent complete-byte reconstruction and the
    [all-layer copy proof](RESIN-PLATES.md) before it is a completed attempt.
+   In packed mode, steps 3-5 below apply to the native reference; its derived
+   final plate then receives its own inspection and issue analysis.
 3. Inspect the SL1 archive. Require bounded `prusaslicer.ini` and `config.ini`,
    contiguous `prepared00000.png` layer names, consistent layer counts, expected
    PNG header dimensions, and matching effective geometry, mirrors, orientation,
@@ -141,9 +155,9 @@ The full-resolution local receipt is
    candidates. If every candidate reports issues, retain the candidate with the
    fewest reports and return `analysis_failed`. Ties retain the earlier candidate.
    A process, integrity or profile failure stops the operation. In packed mode,
-   no-capacity, clipped-reference and non-equivalent raster candidates are
-   explicitly rejected and recorded; a different configured orientation may
-   still pass. If no copy-equivalent candidate survives, preparation fails.
+   no-capacity or clipped-reference candidates can be rejected and recorded;
+   another configured orientation may still fit. An exact-raster mismatch is a
+   derivation/integrity failure and stops preparation; no tolerance is applied.
 
 If every source orientation is out of bounds, fail with
 `RESIN_MODEL_OUT_OF_BOUNDS` before native slicing. These fit checks exclude
@@ -287,15 +301,23 @@ units. One whole source instance counts as one order unit only after explicit
 operator declaration. Every run still needs separate readiness and production
 evidence; a slice never supplies QC counts.
 
-The engine uses a single shared canonical mesh with explicit 3MF instances,
-native reference support/pad measurement and integer-pixel translations.
-Independent validation requires exact grayscale replication on every GOO layer,
-the same exposure/motion schedule and physical settings, clear margins and no
-overlap. It passes no `--duplicate` or `--duplicate-grid` option. Source,
+The engine uses an indexed shared canonical mesh for a single native 3MF
+reference, measures its support/pad footprint and derives integer-pixel copy
+placements. It generates the complete plate GOO from exact reference raster
+translations; the explicit layout 3MF remains provenance. Independent validation
+rebuilds the entire output byte for byte and requires exact grayscale replication
+on every layer, the same exposure/motion schedule and physical settings, clear
+margins and no overlap. All six issue checks run on the derived final file.
+It passes no `--duplicate` or `--duplicate-grid` option. Source,
 oriented mesh, reference/final GOO, original/effective presets, layout and 3MF
 identities are retained and rechecked at capture, download and qualified dispatch.
 See [multi-copy plate preparation](RESIN-PLATES.md) for the complete proof,
 actual native results, supported policy and a reproducible 20-copy example.
+Packed receipts require
+`platePreparation.method: "reference-raster-replication-v1"` and its complete
+derivation evidence. Earlier packed receipts must be prepared again; the legacy
+single-instance path without a plate request is unchanged. No grayscale
+tolerance or partially matching native raster is accepted.
 
 The earlier single-source-instance provider rerun recorded this field in
 `artifacts/resin-single-instance-verification/verification-dd630f36-9c06-473c-a6aa-5afcd5281d16.json`:

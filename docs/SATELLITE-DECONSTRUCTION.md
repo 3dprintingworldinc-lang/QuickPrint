@@ -325,10 +325,14 @@ and [slicing source](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/s
 show duplication, arrangement and selection of bed 0. The actual SL1 metadata
 provided no instance-count/footprint contract. Ignored evidence is in
 `scratch/resin-plate-plan/`. QuickPrint therefore sends no duplication flags.
-Its separate [verified plate path](RESIN-PLATES.md) uses explicit shared-mesh
-3MF placements, a native support/pad reference and exact all-layer GOO copy
-proof. A 20-copy synthetic export passed that proof and all six issue checks;
-supported candidates with islands or raster mismatches remain held or rejected.
+Its separate [verified plate path](RESIN-PLATES.md) retains indexed reference
+and layout 3MF provenance, then replicates one native support/pad reference's
+exact grayscale layers. Complete file reconstruction, independent all-layer
+copy proof and native analysis bind the actual derived GOO. Curved CAD and
+full-resolution 16K tests passed with 20 copies and all six issue checks enabled.
+Issue-bearing references or derived plates remain held; image tolerances are
+never accepted. These results establish software/file behavior, not physical
+qualification.
 
 ## Remaining qualification work
 

@@ -52,6 +52,9 @@ choose a download URL, package or installation directory.
    target dimension. Free-text requests still require operator interpretation.
 4. Slice with the selected reviewed resin/profile slot, then follow the usual
    [receipt and qualified production steps](RESIN-PRODUCTION.md).
+   Optional [plate copies](RESIN-PLATES.md) replicate the validated native
+   reference's exact layers while retaining the same CAD conversion and sizing
+   evidence; they do not scale the embedded CAD units again.
 
 Conversion and slicing share the resin engine lock. Duplicate requests, active
 print runs and pending/approved preparation holds prevent replacement work.

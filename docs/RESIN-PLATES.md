@@ -2,8 +2,10 @@
 
 QuickPrint can prepare explicit copies of a reviewed source model on one resin
 plate, then bind the verified count to PrintByLayr preparation and production
-evidence. It uses **PrusaSlicer 2.9.7 -> SL1 -> UVtools GOO**, with a native
-single-copy reference and independent comparison of every final layer.
+evidence. It uses **PrusaSlicer 2.9.7 -> SL1 -> UVtools GOO** for one native
+reference, then builds the plate by exact integer-pixel translation of that
+reference's grayscale layer images. Independent verification reconstructs the
+whole artifact byte for byte and separately compares every final layer.
 Preparation never starts a printer. Every result retains `printReady: false`
 and `printerCompatible: false`; the separate
 [qualified production flow](RESIN-PRODUCTION.md) requires current studio
@@ -58,7 +60,9 @@ its components; it does not pack their components separately.
    millimetre STL and sizing plan. Apply the candidate rotation in **Z -> X -> Y**
    order to actual vertices and normalize the rotated model with one common
    translation. Float32 conversion must preserve nondegenerate triangles and
-   winding. The same canonical mesh supplies the reference and every instance.
+   winding. Exactly identical coordinates share vertex indices in an indexed
+   3MF mesh, retaining triangle adjacency without moving or tolerantly merging
+   vertices. This canonical mesh supplies the reference and layout provenance.
 2. Export a native single-copy reference at a known pixel-aligned placement
    using the reviewed support/pad settings. Read the union of exposed pixels
    across **all** reference GOO layers, including generated supports and pad.
@@ -72,14 +76,19 @@ its components; it does not pack their components separately.
    reservation conservatively. Height policy includes support elevation, pad,
    layer rounding and supported tower-hop settings; the final GOO height is
    checked independently.
-4. Write one shared-mesh **3MF** with explicit build instances and transforms.
-   Exactly identical source coordinates share vertex indices, retaining triangle
-   adjacency, order and winding without moving or tolerantly merging vertices.
-   Preapply orientation and disable native automatic arrangement. Do not use
-   Prusa's `--duplicate` or `--duplicate-grid` switches. A real `--duplicate 20`
-   probe had exited successfully while exporting only ten cubes after bed
-   filtering; native exit status and material estimates cannot prove copies.
-5. Independently validate the reference and final GOO structure and compare
+4. Retain a shared-mesh **3MF** with the explicit layout instances/transforms as
+   provenance. Native slicing runs only for the single-copy reference, with
+   orientation preapplied and automatic arrangement disabled. A bounded writer
+   translates its exposed grayscale runs into the complete plate GOO. It
+   preserves all physical settings and the 66-byte definition of every layer,
+   rebuilding encoded image lengths, checksums and delimiters. There is no
+   second native packed export that could alter supports or antialiasing.
+   Prusa's `--duplicate`/`--duplicate-grid` options are unused; an actual
+   `--duplicate 20` probe had exited successfully while exporting only ten
+   cubes after bed filtering.
+5. Independently rebuild the complete derived GOO from the saved reference and
+   placements and require **byte-for-byte equality**. Also validate the
+   reference and final GOO structure with a separate reader and compare
    every layer. The final nonzero grayscale pixels must be exactly the declared
    translated union of the reference pixels, with no missing/extra pixels,
    overlap, clipping or gap/margin violation. Machine geometry, image/AA
@@ -87,18 +96,37 @@ its components; it does not pack their components separately.
    schedule must match. Pixel totals and grayscale-intensity totals must equal
    the reference multiplied by the actual instance count. This does not infer
    counts by counting raster connected components.
-6. Run the unchanged UVtools checks for islands, resin traps, suction cups,
-   touching bounds, print height and empty layers. A copy proof can pass while
-   print-issue analysis fails. Such a candidate stays visible as
+6. Run the unchanged native UVtools checks for islands, resin traps, suction
+   cups, touching bounds, print height and empty layers on the **actual derived
+   plate GOO**. No property script or native re-encoding runs after derivation;
+   a hash guard requires analysis to leave its bytes unchanged. A copy proof can
+   pass while print-issue analysis fails. Such a candidate stays visible as
    `analysis_failed` and cannot be promoted through the qualified flow.
 
 The engine records source/oriented-mesh hashes, original/effective preset
-descriptors, reference input/GOO, canonical layout, final 3MF/GOO and raster proof
-under `platePreparation`, bound by `preparationSha256`. The service independently
+descriptors, reference input/GOO, canonical layout/3MF, final GOO and raster proof
+under `platePreparation`, bound by `preparationSha256`. The required method is
+`reference-raster-replication-v1`; `replication` also binds the writer version,
+layer-definition/image hashes, estimates and previews. The service independently
 rebuilds and verifies this evidence at capture, download and qualified dispatch.
 Evidence must remain inside the managed job directory with matching real files,
 sizes and hashes; changing the saved descriptor alone cannot establish a count.
 Source and CAD conversion/sizing evidence remain bound alongside it.
+
+The writer rebuilds both 116-square and 290-square RGB565 big-endian previews
+from the final exposed-layer union, preserving aspect ratio. Material volume,
+weight and cost estimates scale by the actual copy count. The reference time
+estimate stays unchanged because its physical layer schedule is unchanged;
+this is not a measured duration guarantee. Preview orientation preserves the
+file's mirror policy and does not establish physical handedness.
+
+Earlier packed records without this method are rejected with
+`RESIN_PLATE_METHOD_UNSUPPORTED`, even if their old image proof passed. Prepare
+them again with the current engine, then obtain fresh receipt/approval as
+needed. Resolve any pending/approved preparation hold through the production
+workflow first; existing run evidence can still be reconciled and is not reset
+automatically. The legacy single-instance path without a plate request is
+unchanged. User original files, profile slots and presets remain preserved.
 
 Packed preparation currently requires the verified PrusaSlicer 2.9.7 interface,
 standard elevated-pad policy, unit geometry-correction factors, disabled
@@ -120,15 +148,18 @@ The grid is deterministic, not an arbitrary nesting/optimal-packing solver.
 
 ## Orientation failures and quality holds
 
-Native slicing of translated instances is not always translation-equivalent,
-even when input transforms are exact. Some tilted orientations change native
-support or raster output between reference and packed export. A mismatch is
-rejected as `GOO_PLATE_IMAGE_MISMATCH`; it never receives the requested count.
-The engine can try another configured orientation and records rejected ones.
-If no equivalent candidate survives, it fails with
-`RESIN_PLATE_NO_VERIFIED_CANDIDATE`. An earlier valid candidate with reported
-issues can remain the selected held artifact when a later candidate is rejected.
-Integrity, profile and provider failures still stop preparation.
+The earlier experimental method sliced a native reference and native multi-copy
+layout separately. Tilted and curved examples changed raster/support output
+between those exports and were rejected. The current method makes exact copies
+of the one native reference instead. It never accepts grayscale tolerance,
+approximate image similarity or a partially matching native plate.
+
+Out-of-bounds, no-capacity or clipped-reference candidates can be rejected and
+recorded while the engine tries the next configured orientation. Any final
+copy-proof mismatch such as `GOO_PLATE_IMAGE_MISMATCH` is a deterministic
+derivation/integrity failure and stops preparation. It cannot receive the
+requested count or be hidden by trying another orientation. Profile and
+provider failures also stop preparation.
 
 The first copy-equivalent candidate with zero issue reports is selected. If
 every retained candidate has issues, the one with the fewest reports is retained
@@ -174,25 +205,56 @@ automatically. See [production steps and recovery](RESIN-PRODUCTION.md).
 
 ## Native file evidence and reproduction
 
-Real local PrusaSlicer 2.9.7 and UVtools 7.1.2 produced these synthetic files:
+Real local PrusaSlicer 2.9.7 and UVtools 7.1.2 produced these files with the
+current `reference-raster-replication-v1` method:
 
 | Explicit fixture policy | Actual copies | Layers | Copy proof | Six-check analysis |
 | --- | --- | --- | --- | --- |
-| Original supports/pad enabled, flat `(0,0,0)` | 2 of 3 requested | 200 | Exact 2x grayscale union | Two islands; held |
+| Original supports/pad enabled, selected `(30,15,0)` | 3 of 3 | 234 | Exact 3x grayscale union and complete-byte rebuild | Zero reported issues |
 | Copied profile with supports/pad disabled, flat `(0,0,0)` | 20 of 20 | 60 | Exact 20x grayscale union | Zero reported issues |
-| Supported tilted `(30,15,0)` candidate | Rejected | — | Raster mismatch | Cannot qualify as this plate |
+| Owned STEP cylinder through actual CAD/service path, supports/pad disabled | 20 of 20 | 60 | Exact 20x grayscale union; verified before/after reload | Zero reported issues |
+| Native 15120 x 6230 thin reference, 211.68 x 118.37 mm display | 20 of 20 | 8 | Exact 20x grayscale union; independent PNG comparison of all layers | Zero reported issues |
 
-The 20-copy GOO SHA-256 was
-`4247d6776bfb41b6258f20a994d667fa49ff45aa7fb610ede6555025f494b86a`.
+Observed final GOO SHA-256 values:
+
+- Supported three-copy cube: `a091ab5e2e2ab4e98179d2c08b24ed47e8190a0bf21ca2cf1bcd464b13da4a39`.
+- Supports/pad-off 20-copy cube: `2e5dba75f9371db1346cb637a1249bf40067c09e6889124373466eb7de8ec8d7`.
+- CAD/service 20-copy cylinder: `ab8ed3a0ab08fba5517e388fa77905ba288838d75f9b83d2736a54d2af4b18c0`.
+- 16K thin 20-copy plate: `b20f77940e451abb013a42f189eaecefccc8576825af918a0ac899e1e02f2f22`.
+
 Local reports are `artifacts/resin-packed-engine-verification/native-summary.json`
-and `supports-off-20-result.json` in that directory. These ignored workspace
+plus `supports-on-3-result.json`, `supports-off-20-result.json` and
+`cad-packed/verification.json` in that directory. These ignored workspace
 artifacts are observations, not deterministic-build promises. The original
 source and public fixture profile/preset were unchanged. No printer upload,
 start or physical qualification was performed. Disabling support/pad here is
 an explicit synthetic-test policy, not a production repair recommendation.
-An additional curved CAD reference passed all six checks, but its native
-20-instance export failed exact raster equivalence and was held. This path
-does not promise that every valid reference can be packed by the native provider.
+
+The STEP case used the owned
+[`verification-cylinder.step`](../tests/fixtures/resin/verification-cylinder.step).
+It passed actual CAD transfer auditing, tessellation, source-bound sizing and
+20-copy capture, then core `getResinSliceDownload` verification before and after
+closing/reloading the service. The original STEP bytes remained unchanged;
+ticket units were `in` while converted geometry stayed `mm` with unit scale 1.
+Dispatch remained disabled, run history empty and `printReady` false. This
+tested the core download method, not a separate HTTP download transaction.
+
+The 16K case preserved X/Y mirrors `false,true`. Native UVtools PNG exports
+were independently streamed and compared across all eight 94-million-pixel
+layers: zero differing rows, with foreground pixel and grayscale-intensity
+totals exactly 20 times the reference. Both native-exported previews showed
+20 components and preserved the physical display aspect ratio of about 1.7883,
+rather than the raw pixel ratio of about 2.4270. Its report is
+`artifacts/resin-16k-raster-verification/summary.json`. This verifies file
+geometry and image replication, not physical handedness or resolution of the
+printer's firmware/profile dimension conflict.
+
+Earlier experiments sliced the entire native 3MF layout a second time. One
+supported three-copy request fit only two copies and stayed held on islands;
+tilted/curved native packed exports also failed exact raster equivalence. Those
+are historical results of the replaced method, not a limit imposed on current
+reference-image replication. Their packed receipts cannot be reused by the
+current verifier.
 
 To reproduce the 20-copy file from a checkout, keep complete local provider
 installations and run this PowerShell example from the repository root. Replace
@@ -231,7 +293,8 @@ const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
   const reportPath = path.join(copied, 'result.json');
   await fs.writeFile(reportPath, JSON.stringify(result, null, 2), { flag: 'wx' });
   if (sha(await fs.readFile(inputPath)) !== originalHash) throw new Error('Source changed');
-  console.log(JSON.stringify({ reportPath, copies: result.modelCopiesPerRun,
+  console.log(JSON.stringify({ reportPath, method: result.platePreparation.method,
+    copies: result.modelCopiesPerRun,
     layers: result.inspection.layerCount, issues: result.analysis.count,
     imageEquivalent: result.platePreparation.rasterProof.imageEquivalent,
     sha256: result.sha256, printReady: result.printReady }, null, 2));
@@ -244,7 +307,7 @@ Native-free regressions use real layout/3MF/GOO verification with injected
 renderers and printer fixtures:
 
 ```sh
-node --test tests/resin-plate.test.js tests/goo-plate.test.js tests/resin-plate-engine.test.js tests/resin-plate-service.test.js tests/layr-plate-production-flow.test.js
+node --test tests/resin-plate.test.js tests/goo-plate.test.js tests/goo-replication.test.js tests/resin-plate-engine.test.js tests/resin-plate-service.test.js tests/layr-plate-production-flow.test.js
 ```
 
 Exact copy proof and zero automated issue reports do not establish resin cure,

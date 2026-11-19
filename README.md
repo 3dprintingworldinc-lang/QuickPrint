@@ -57,13 +57,17 @@ Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 
 Explicit multi-copy resin plates reserve the native single-copy support/pad
-footprint, place copies on the printer pixel grid, and require every final GOO
-layer to equal the declared translated grayscale copies with matching physical
-parameters. The requested copy count is an upper bound; the captured result
-reports the number that actually fits. A real synthetic 20-copy file passed
-this proof and all six issue checks with supports/pad explicitly disabled.
-The supported three-copy request fit two copies, passed their copy proof and
-remained held on two islands. These file checks do not qualify physical output.
+footprint and replicate that reference's exact grayscale layer images on the
+printer pixel grid. Independent verification rebuilds the complete final GOO
+byte for byte, preserves its physical layer schedule and checks all six print
+issues on that actual derived file. The requested count is an upper bound;
+the captured result reports the number that actually fits. Old packed receipts
+must be prepared again with the current method. These file checks do not
+qualify physical output.
+Real local checks produced a supported three-copy plate and a 20-copy
+synthetic plate with supports/pad explicitly disabled, both with zero reported
+issues. The owned STEP cylinder also passed the CAD-to-20-copy service flow and
+proof revalidation after reload. No physical print was performed in those checks.
 
 Captured resin slices stay unqualified and cannot enter generic printer dispatch.
 The separate qualified resin flow requires current studio/device/profile

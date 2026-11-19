@@ -200,6 +200,7 @@ function inspectPlateGoo(bytes, profile, ini) {
 
 async function verifyResinPlatePreparation(sourceNormalizedSTL, record, { profile, ini, preset, artifactBytes, directory } = {}) {
   if (!Buffer.isBuffer(sourceNormalizedSTL) || !plain(record) || record.schemaVersion !== 1 || typeof directory !== 'string' || !path.isAbsolute(directory) || !Buffer.isBuffer(artifactBytes) || !HASH.test(record.preparationSha256 || '')) throw fail('A packed plate needs complete source, file and raster evidence.', 'RESIN_PLATE_CHANGED');
+  if (record.method !== 'reference-raster-replication-v1') throw fail('This packed receipt needs preparation with the current verified raster-replication method.', 'RESIN_PLATE_METHOD_UNSUPPORTED');
   const { preparationSha256, ...body } = record;
   if (canonicalHash(body) !== preparationSha256) throw fail('The packed plate receipt changed.', 'RESIN_PLATE_CHANGED');
   const requested = normalizeResinPlateOptions(record.requested), source = prepareResinPlateSource(sourceNormalizedSTL, { orientation: record.orientation }), geometry = profileGeometry(profile, ini);
@@ -219,15 +220,18 @@ async function verifyResinPlatePreparation(sourceNormalizedSTL, record, { profil
   if (!(await readManaged(directory, record.plateInput, MAX_MODEL)).equals(plateInput)) throw fail('Packed instances differ from the canonical placement input.', 'RESIN_PLATE_CHANGED');
   const inspection = inspectPlateGoo(artifactBytes, profile, ini);
   if (record.artifactSha256 !== inspection.sha256) throw fail('The packed output changed.', 'RESIN_PLATE_CHANGED');
-  let rasterProof;
   const proofOptions = { translationsPx: derived.translationsPx, marginPx: derived.reservation.marginPx, minGapPx: derived.reservation.minGapPx };
-  try { rasterProof = verifyGooPlate(referenceBytes, artifactBytes, proofOptions); }
-  catch (failure) { failure.plateProofOptions = proofOptions; throw failure; }
-  if (!isDeepStrictEqual(record.rasterProof, rasterProof) || rasterProof.copiesPerRun !== derived.layout.copiesPlaced) throw fail('The packed output does not match its saved raster proof.', 'RESIN_PLATE_CHANGED');
-  return freeze({ schemaVersion: 1, modelCopiesPerRun: derived.layout.copiesPlaced, requested, orientation: record.orientation, sourceSha256: record.sourceSha256, artifactSha256: inspection.sha256, layout: derived.layout, rasterProof, preparationSha256 });
+  const rebuilt = require('./goo-replication').replicateGooPlate(referenceBytes, proofOptions);
+  if (!artifactBytes.equals(rebuilt.buffer) || !isDeepStrictEqual(record.replication, rebuilt.derivation) || !isDeepStrictEqual(record.rasterProof, rebuilt.proof) || rebuilt.proof.copiesPerRun !== derived.layout.copiesPlaced) throw fail('The packed output differs from its complete deterministic reference derivation.', 'RESIN_PLATE_CHANGED');
+  // A separate reader verifies actual output pixels and the unchanged complete
+  // physical schedule, in addition to the writer's whole-file reconstruction.
+  const rasterProof = verifyGooPlate(referenceBytes, artifactBytes, proofOptions);
+  if (!isDeepStrictEqual(rebuilt.proof, rasterProof)) throw fail('Independent packed raster proof disagrees with the rebuilt artifact.', 'RESIN_PLATE_CHANGED');
+  return freeze({ schemaVersion: 1, method: record.method, modelCopiesPerRun: derived.layout.copiesPlaced, requested, orientation: record.orientation, sourceSha256: record.sourceSha256, artifactSha256: inspection.sha256, layout: derived.layout, rasterProof, replication: rebuilt.derivation, preparationSha256 });
 }
 
-async function preparePackedResinAttempt({ sourceNormalizedSTL, orientation, requested: options, profile, ini, preset, directory, render, signal }) {
+async function preparePackedResinAttempt({ sourceNormalizedSTL, orientation, requested: options, profile, ini, preset, directory, render, inspectAnalyze, signal }) {
+  if (typeof render !== 'function' || typeof inspectAnalyze !== 'function') throw fail('Packed preparation requires a native reference capture and final-artifact inspection/analysis boundary.', 'RESIN_PLATE_CONFIGURATION', 500);
   const requested = normalizeResinPlateOptions(options), source = prepareResinPlateSource(sourceNormalizedSTL, { orientation }), geometry = profileGeometry(profile, ini), heightPolicy = resinPlateHeightPolicy(source, profile, ini), placement = referencePlacement(source, geometry).placement;
   const write = async (filename, bytes) => { const filePath = path.join(directory, filename); await fs.writeFile(filePath, bytes, { flag: 'wx' }); return { filePath, sha256: hash(bytes), bytes: bytes.length }; };
   const preparedPreset = prepareResinPlatePreset(preset, ini);
@@ -237,19 +241,25 @@ async function preparePackedResinAttempt({ sourceNormalizedSTL, orientation, req
   signal?.throwIfAborted();
   const referenceDirectory = path.join(directory, 'reference'); await fs.mkdir(referenceDirectory);
   const referenceResult = await render(referenceInput.filePath, referenceDirectory, true, { presetPath: presetPreparation.effective.filePath });
-  const reference = { placement, input3mf: referenceInput, filePath: referenceResult.filePath, sha256: referenceResult.sha256, bytes: referenceResult.bytes, layerCount: referenceResult.inspection.layerCount, totalHeightMm: referenceResult.inspection.totalHeightMm };
+  const reference = { placement, input3mf: referenceInput, filePath: referenceResult.filePath, sha256: referenceResult.sha256, bytes: referenceResult.bytes, layerCount: referenceResult.inspection.layerCount, totalHeightMm: referenceResult.inspection.totalHeightMm, sl1Sha256: referenceResult.sl1Sha256, effectivePresetSha256: referenceResult.effectivePresetSha256 };
   if (Math.abs(reference.totalHeightMm - heightPolicy.expectedModelTopMm) > Math.max(heightPolicy.roundingReserveMm, float32Tolerance(heightPolicy.expectedModelTopMm)) || reference.totalHeightMm >= geometry.machineZMm - heightPolicy.roundingReserveMm) throw fail('The packed reference may be vertically clipped.', 'RESIN_PLATE_HEIGHT_POLICY');
   const referenceBytes = await readManaged(directory, reference, MAX_GOO), raster = inspectGooRaster(referenceBytes), derived = layoutFor(sourceNormalizedSTL, orientation, requested, reference, raster, profile, ini);
   const plateInput = await write('plate.3mf', createResinPlate3mf(source.stl, derived.layout.placements.map(item => item.offsetMm)));
   signal?.throwIfAborted();
   const plateDirectory = path.join(directory, 'plate'); await fs.mkdir(plateDirectory);
-  const result = await render(plateInput.filePath, plateDirectory, true, { presetPath: presetPreparation.effective.filePath }), artifactBytes = await readManaged(directory, result, MAX_GOO);
+  const replicated = require('./goo-replication').replicateGooPlate(referenceBytes, { translationsPx: derived.translationsPx, marginPx: derived.reservation.marginPx, minGapPx: derived.reservation.minGapPx });
+  const filePath = path.join(plateDirectory, 'prepared.goo'); await fs.writeFile(filePath, replicated.buffer, { flag: 'wx' });
+  const expectedSha256 = hash(replicated.buffer);
+  const result = await inspectAnalyze(filePath, plateDirectory, { expectedSha256, expectedLayerCount: reference.layerCount });
+  const artifactBytes = await readManaged(directory, { filePath, sha256: expectedSha256, bytes: replicated.buffer.length }, MAX_GOO);
+  if (result.filePath !== filePath || result.sha256 !== expectedSha256 || result.bytes !== replicated.buffer.length) throw fail('Final inspection changed the derived packed artifact.', 'RESIN_ARTIFACT_CHANGED');
   const rasterProof = verifyGooPlate(referenceBytes, artifactBytes, { translationsPx: derived.translationsPx, marginPx: derived.reservation.marginPx, minGapPx: derived.reservation.minGapPx });
-  const body = { schemaVersion: 1, requested, orientation: structuredClone(orientation), sourceSha256: hash(sourceNormalizedSTL), presetPreparation, orientedSource, reference, heightPolicy, supportEnvelopeMm: derived.reservation.supportEnvelopeMm, supportHeightMm: derived.reservation.supportHeightMm, layout: derived.layout, plateInput, rasterProof, artifactSha256: result.sha256 };
+  if (!isDeepStrictEqual(rasterProof, replicated.proof)) throw fail('Independent packed raster proof disagrees with the generated artifact.', 'RESIN_PLATE_CHANGED');
+  const body = { schemaVersion: 1, method: 'reference-raster-replication-v1', requested, orientation: structuredClone(orientation), sourceSha256: hash(sourceNormalizedSTL), presetPreparation, orientedSource, reference, heightPolicy, supportEnvelopeMm: derived.reservation.supportEnvelopeMm, supportHeightMm: derived.reservation.supportHeightMm, layout: derived.layout, plateInput, replication: replicated.derivation, rasterProof, artifactSha256: result.sha256 };
   const platePreparation = { ...body, preparationSha256: canonicalHash(body) };
   signal?.throwIfAborted();
   await verifyResinPlatePreparation(sourceNormalizedSTL, platePreparation, { profile, ini, preset, artifactBytes, directory });
-  return { ...result, modelCopiesPerRun: derived.layout.copiesPlaced, platePreparation };
+  return { ...result, referenceSl1Sha256: reference.sl1Sha256, effectivePresetSha256: reference.effectivePresetSha256, logs: { reference: referenceResult.logs, artifact: result.logs }, modelCopiesPerRun: derived.layout.copiesPlaced, platePreparation };
 }
 
 module.exports = { normalizeResinPlateOptions, createResinPlate3mf, resinPlateHeightPolicy, prepareResinPlatePreset, assertPackedEffectiveSettings, preparePackedResinAttempt, verifyResinPlatePreparation };

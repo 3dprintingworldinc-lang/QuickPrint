@@ -74,7 +74,7 @@ async function createPlateSliceFixture(root) {
   await fs.writeFile(settings.profilePath, JSON.stringify(profile));
   let preset = await fs.readFile(profile.presetPath, 'utf8'); preset = preset.replace('display_pixels_x=4\n', 'display_pixels_x=64\n').replace('display_pixels_y=2\n', 'display_pixels_y=32\n');
   await fs.writeFile(profile.presetPath, preset);
-  const calls = [], renderCalls = [], faults = { omitLastCopy: false, removeProof: false, claimedCopies: null, issues: 0 };
+  const calls = [], renderCalls = [], analyzeCalls = [], faults = { omitLastCopy: false, removeProof: false, claimedCopies: null, issues: 0, referenceIssues: null };
   const prepareResin = async input => {
     calls.push(input); input.signal?.throwIfAborted();
     if (!input.plate) throw new Error('The packed fixture requires an explicit reviewed plate request.');
@@ -88,14 +88,30 @@ async function createPlateSliceFixture(root) {
       const points = [...xml.matchAll(/<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"\/>/g)].map(match => match.slice(1).map(Number));
       const dimensions = Object.fromEntries(['x','y','z'].map((axis, index) => [axis, Math.max(...points.map(point => point[index])) - Math.min(...points.map(point => point[index]))]));
       const placements = [...xml.matchAll(/<item objectid="1" transform="([^"]+)"\/>/g)].map(match => { const values = match[1].split(' ').map(Number); return { x: values[9], y: values[10], z: values[11] }; });
-      const bytes = gooForInstances({ placements, dimensions, profile: loaded.profile, ini: loaded.ini, omitLast: faults.omitLastCopy && placements.length > 1 });
+      const bytes = gooForInstances({ placements, dimensions, profile: loaded.profile, ini: loaded.ini });
       const filePath = path.join(targetDirectory, 'prepared.goo'); await fs.writeFile(filePath, bytes, { flag: 'wx' });
       const effectivePreset = context.presetPath ? await fs.readFile(context.presetPath) : loaded.preset;
       renderCalls.push({ filename, targetDirectory, placements, dimensions, filePath, presetPath: context.presetPath });
       return { filePath, fileName: 'prepared.goo', bytes: bytes.length, sha256: hash(bytes), inspection: inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 } }),
-        analysis: { count: faults.issues, passed: faults.issues === 0, checks: [...CHECKS], issues: Array.from({ length: faults.issues }, () => 'Owned synthetic issue') }, sl1Sha256: hash(Buffer.from(xml)), effectivePresetSha256: hash(effectivePreset), attempts: [] };
+        analysis: { count: faults.referenceIssues ?? faults.issues, passed: (faults.referenceIssues ?? faults.issues) === 0, checks: [...CHECKS], issues: Array.from({ length: faults.referenceIssues ?? faults.issues }, () => 'Owned synthetic reference issue') }, sl1Sha256: hash(Buffer.from(xml)), effectivePresetSha256: hash(effectivePreset), attempts: [] };
     };
-    const result = await preparePackedResinAttempt({ sourceNormalizedSTL: normalized.stl, orientation: loaded.profile.orientationCandidates[0], requested: input.plate, profile: loaded.profile, ini: loaded.ini, preset: loaded.preset, directory, render, signal: input.signal });
+    const inspectAnalyze = async (filePath, targetDirectory, { expectedSha256, expectedLayerCount }) => {
+      input.signal?.throwIfAborted();
+      if (faults.omitLastCopy) {
+        const xml = new AdmZip(await fs.readFile(path.join(directory,'plate.3mf'))).readAsText('3D/3dmodel.model');
+        const points = [...xml.matchAll(/<vertex x="([^"]+)" y="([^"]+)" z="([^"]+)"\/>/g)].map(match=>match.slice(1).map(Number));
+        const dimensions = Object.fromEntries(['x','y','z'].map((axis,index)=>[axis,Math.max(...points.map(p=>p[index]))-Math.min(...points.map(p=>p[index]))]));
+        const placements = [...xml.matchAll(/<item objectid="1" transform="([^"]+)"\/>/g)].map(match=>{const v=match[1].split(' ').map(Number);return{x:v[9],y:v[10],z:v[11]};});
+        await fs.writeFile(filePath,gooForInstances({placements,dimensions,profile:loaded.profile,ini:loaded.ini,omitLast:true}));
+      }
+      const bytes=await fs.readFile(filePath);
+      if(hash(bytes)!==expectedSha256)throw Object.assign(new Error('Synthetic native analysis changed the derived artifact.'),{code:'RESIN_ARTIFACT_CHANGED'});
+      const inspection=inspectGoo(bytes);
+      if(inspection.layerCount!==expectedLayerCount)throw new Error('Synthetic analysis saw a changed layer count.');
+      analyzeCalls.push({filePath,targetDirectory,expectedSha256,layerCount:inspection.layerCount});
+      return{filePath,fileName:'prepared.goo',bytes:bytes.length,sha256:hash(bytes),inspection,analysis:{count:faults.issues,passed:faults.issues===0,checks:[...CHECKS],issues:Array.from({length:faults.issues},()=> 'Owned synthetic final-artifact issue')},logs:{analysis:`Issues: ${faults.issues}`}};
+    };
+    const result = await preparePackedResinAttempt({ sourceNormalizedSTL: normalized.stl, orientation: loaded.profile.orientationCandidates[0], requested: input.plate, profile: loaded.profile, ini: loaded.ini, preset: loaded.preset, directory, render, inspectAnalyze, signal: input.signal });
     const captured = { ...result, sizingPlan: normalized.plan, inputGeometry: { filePath: preparedInput, sha256: normalized.transformedSha256, bytes: normalized.stl.length, bounds: normalized.transformedBounds },
       format: 'goo', sourceSha256: hash(original), profileSha256: loaded.profileSha256, printerId: loaded.profile.printerId, printerModel: loaded.profile.printerModel, material: loaded.profile.material,
       tool: { name: 'Owned injected packed native boundary', version: 'fixture', executableSha256: hash(Buffer.from('Owned injected packed native boundary fixture v1')) }, printReady: false, printerCompatible: false, attempts: [] };
@@ -103,7 +119,7 @@ async function createPlateSliceFixture(root) {
     if (faults.claimedCopies !== null) captured.modelCopiesPerRun = faults.claimedCopies;
     return captured;
   };
-  return { settings, engine: { prepareResin }, prepareResin, calls, renderCalls, faults,
+  return { settings, engine: { prepareResin }, prepareResin, calls, renderCalls, analyzeCalls, faults,
     async bindPrinter(id) { const updated = JSON.parse(await fs.readFile(settings.profilePath, 'utf8')); updated.printerId = id; await fs.writeFile(settings.profilePath, JSON.stringify(updated)); } };
 }
 
