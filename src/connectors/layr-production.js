@@ -199,6 +199,8 @@ async function reviewTarget(manager, id) {
   const needsAdoption = target.id !== localTargetId(job);
   return { target, originalRequestedParts: job.order.requestedQuantity, portalStatus: ticket.status, portalVersion: ticket.version,
     progress: ticket.production?.progress, hasActiveRun, needsAdoption,
+    receiptId: ticket.production?.approvedReceiptId,
+    canWithdraw: !hasActiveRun && !needsAdoption && ticket.status === 'queued' && UUID.test(ticket.production?.approvedReceiptId || '') && ticket.production.approvedReceiptId === job.resinProduction?.plan?.receiptId && ticket.production?.run?.status !== 'printing',
     canAdopt: needsAdoption && !hasActiveRun && target.kind === 'replacement' && (target.requiredParts > 0 ? ticket.status === 'preparing' : ticket.status === 'post_processing') &&
       ticket.production?.approvedReceiptId == null && ticket.production?.approvedTargetId == null && ticket.production?.run?.status !== 'printing' };
 }

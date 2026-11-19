@@ -353,6 +353,25 @@ test('confirmed withdrawal reopens slicing and reapproval creates a new operatio
   expect(mutations(workspace.adapter)).toEqual([]); expect(errors).toEqual([]);
 });
 
+test('queued preparation remains withdrawable through target review after device qualification changes', async ({ page, workspace }) => {
+  await approve(page, workspace);
+  await page.getByRole('button', { name: 'Close', exact: true }).click();
+  await openJob(page, workspace);
+  workspace.adapter.attrs.FirmwareVersion = 'V1.5.7'; workspace.remote.qualified = false;
+  const reads = workspace.adapter.calls.length;
+  await page.getByRole('button', { name: 'Review current target', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Review current production target', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Reopen preparation', exact: true }).click();
+  await page.getByLabel('Reason for reopening preparation').fill('Firmware changed; review qualification before preparing again.');
+  await page.getByRole('button', { name: 'Withdraw preparation', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Slice resin model', exact: true })).toBeEnabled();
+  expect(workspace.service.getJob(workspace.job.id).resinProduction.plan.approvalState).toBe('withdrawn');
+  expect(workspace.remote.status).toBe('preparing'); expect(workspace.remote.qualified).toBe(false);
+  expect(workspace.adapter.calls.length).toBe(reads); expect(mutations(workspace.adapter)).toEqual([]);
+  expect(workspace.remote.writes.map(value => value.action)).toEqual(['record_slice', 'approve_preparation', 'withdraw_preparation']);
+});
+
 for (const mode of ['active', 'uncertain']) test(`${mode} physical resin run cannot expose preparation withdrawal`, async ({ page, workspace }) => {
   await approve(page, workspace); await enableDispatch(page); await openJob(page, workspace); await review(page);
   workspace.adapter.uncertainStart = mode === 'uncertain';

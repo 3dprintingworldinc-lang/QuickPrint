@@ -178,6 +178,11 @@ for the exact queued receipt/current version and returns the portal to
 `preparing`. It clears approval while preserving payment, the frozen ticket,
 current target, printed/remaining counts and immutable run history.
 
+If device qualification changed, use **Review current target -> Reopen
+preparation**. That review reads the queued target without requiring the old
+device signature to match, so a firmware change cannot trap an obsolete approval.
+Withdrawal still requires the exact queued receipt and no active or uncertain run.
+
 Wait for a confirmed operation and fresh same-target portal read before the local
 hold releases. A lost reply retains the hold and replays the same UUID/body after
 restart. Withdrawal can recover a preparation whose local source/profile/artifact
