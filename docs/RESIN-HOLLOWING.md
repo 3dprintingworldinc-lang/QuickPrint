@@ -145,6 +145,16 @@ Additional independent research established useful failure controls:
   the solid and a thin-wall edit. Conservative lower/upper occupancy keeps gray
   edge pixels ambiguous; coarse-grid conformance describes a declared voxel
   band, not exact geometric or physical wall certification.
+  At quality 0.5 the owned drained cube has 36 ambiguous gray samples in the
+  fine expected cavity. Actual quality 0.75 and 1 runs with supports and pad
+  disabled eliminate those samples at the **same** 512 x 512 x 200 grid and
+  0.149020 mm allowance: no missing cavity, outside additions, changed outer band
+  or thin-wall witnesses; both
+  individual black drain channels and global exterior reachability pass. Each
+  also passes all six native checks. All 200 SL1 PNG layers per quality match
+  independent GOO decoding (52,428,800 pixels each, zero differences). The wall
+  resolution interval remains about 1.951..2.249 mm, so these positive encoded
+  raster cases still do not certify a geometric or physical minimum of 2 mm.
 - Two OCCT versions agree on a valid inward-offset result that silently omits
   one lobe of a dumbbell cavity. Bounds, containment, shell validity and minimum
   clearance alone do not prove complete hollowing. Source-face history catches

@@ -93,6 +93,10 @@ test('stale derivative review and tampered repaired bytes fail visibly before th
   const f = await fixture(page);
   try {
     await f.show(); expect((await f.repair()).ok()).toBe(true); await page.getByRole('button', { name: 'Measure model', exact: true }).click();
+    // Measurement replaces the repaired-model form and clears its confirmations.
+    // Wait for that form before checking it or replacing its reviewed hash.
+    await expect(page.getByText('Measured source: 3 × 3 × 3 mm (X × Y × Z).', { exact: true })).toBeVisible();
+    await expect(page.locator('#resin-slice-form')).toHaveAttribute('data-geometry-sha', f.current().resinRepair.sha256);
     await page.locator('[name="confirmedRequirements"]').check(); await page.locator('[name="confirmedOriginalSize"]').check();
     await page.locator('#resin-slice-form').evaluate(form => { form.dataset.geometrySha = '0'.repeat(64); });
     const stale = page.waitForResponse(response => response.url().endsWith(f.base + '/resin/slice') && response.request().method() === 'POST');
