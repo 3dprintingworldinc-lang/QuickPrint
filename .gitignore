@@ -10,3 +10,4 @@ data/
 _reference/
 scratch/
 integrations/
+__pycache__/

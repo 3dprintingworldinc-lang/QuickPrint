@@ -4,6 +4,7 @@ const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell, session } = req
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const { createHash } = require('node:crypto');
 
 let mainWindow;
 let backend;
@@ -103,6 +104,35 @@ async function writeSmokeReport(report) {
   await fs.writeFile(destination, `${JSON.stringify(report, null, 2)}\n`);
 }
 
+async function smokeCadWorkers() {
+  const root = path.resolve(app.getPath('userData'));
+  const directory = await fs.mkdtemp(path.join(root, '.cad-workers-smoke-'));
+  try {
+    const { materializeCadWorkers } = require('../slicing/resin-cad');
+    const scripts = await materializeCadWorkers(directory);
+    if (!scripts || Object.keys(scripts).sort().join(',') !== 'auditor,worker') throw new Error('CAD worker extraction did not produce both resources.');
+    const files = [];
+    for (const [key, name] of [['worker', 'resin-cad-worker.py'], ['auditor', 'resin-cad-transfer-audit.py']]) {
+      const item = scripts[key], destination = path.join(directory, name);
+      if (!item || item.filePath !== destination) throw new Error('CAD worker extraction returned an unexpected path.');
+      const stat = await fs.lstat(destination);
+      if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('CAD worker extraction did not create an ordinary private file.');
+      const source = await fs.readFile(path.join(__dirname, '..', 'slicing', name));
+      const copied = await fs.readFile(destination);
+      const sha256 = createHash('sha256').update(copied).digest('hex');
+      if (!source.length || copied.length !== item.bytes || item.sha256 !== sha256 || !source.equals(copied)) throw new Error('Extracted CAD worker bytes do not match the packaged resource.');
+      files.push({ name, bytes: copied.length, sha256 });
+    }
+    return { extracted: true, count: files.length, files };
+  } finally {
+    // Remove only this fresh smoke directory, never a caller-supplied data
+    // directory. Confirm its resolved location before recursive cleanup.
+    const actual = await fs.realpath(directory), actualRoot = await fs.realpath(root);
+    if (path.dirname(actual) !== actualRoot || !path.basename(actual).startsWith('.cad-workers-smoke-')) throw new Error('CAD smoke cleanup path is outside its private directory.');
+    await fs.rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function smokeCheck(credentials) {
   const response = await fetch(new URL('/api/health', backend.url), { signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Health check failed: HTTP ${response.status}`);
@@ -129,13 +159,14 @@ async function smokeCheck(credentials) {
     return Array.isArray(state.jobs) && Array.isArray(state.printers);
   })()`);
   if (!apiReady) throw new Error('The desktop could not read its authenticated local API.');
+  const cadWorkers = await smokeCadWorkers();
   let credentialRoundTrip = 'unavailable-on-this-platform';
   if (process.platform === 'win32' || safeStorage.isEncryptionAvailable() && safeStorage.getSelectedStorageBackend?.() !== 'basic_text') {
     const probe = 'quickprint-smoke-test-not-a-secret';
     if (credentials.unseal(credentials.seal(probe)) !== probe) throw new Error('Credential storage validation failed.');
     credentialRoundTrip = 'passed';
   }
-  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, checkedAt: new Date().toISOString() });
+  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, checkedAt: new Date().toISOString() });
   stopping = true;
   await stopBackend();
   mainWindow.destroy();

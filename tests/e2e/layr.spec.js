@@ -98,7 +98,7 @@ const test = base.extend({
       const settings = await createProfile(directory);
       const slice = await makeSlice({ inputPath: current.inputPath, outputDir: path.join(instance.service.dataDir, 'jobs', id, 'resin-slicing'), ...settings });
       slice.tool.binaryManifest = [{ path: 'C:/private/test-binary.dll', sha256: 'a'.repeat(64) }];
-      await instance.service._mutate(() => { instance.service._job(id).resinSlice = { ...slice, printReady: false, printerCompatible: false, finishedAt: new Date().toISOString() }; });
+      await instance.service._mutate(() => { instance.service._job(id).resinSlice = { ...slice, printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: true, confirmedSizing: true, sizing: { mode: 'original' }, ticketFingerprint: current.order.ticketFingerprint, units: current.order.units, unitScale: 1 }, finishedAt: new Date().toISOString() }; });
     };
     try { await use({ ...instance, directory, calls, machine, capture }); }
     finally { machine.releases.forEach(resolve => resolve()); await instance.close(); await fs.rm(directory, { recursive: true, force: true }); }

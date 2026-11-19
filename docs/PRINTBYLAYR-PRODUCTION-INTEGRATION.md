@@ -41,8 +41,8 @@ kept separately. See [the production workflow](RESIN-PRODUCTION.md).
 
 Both portal clients preserve STL, OBJ, STEP and STP sources and their receipt
 hashes during import. Local measurement and slicing support STL and triangulated
-OBJ. STEP/STP tickets remain visible for review with conversion required; intake
-does not certify or tessellate their CAD geometry.
+OBJ; STEP/STP use the separately verified [CAD transfer and tessellation
+workflow](RESIN-CAD.md). Intake itself preserves the original geometry for review.
 
 Without a materialized private source, the production-client suite clearly
 skips its actual-server tests and continues running its standalone transport

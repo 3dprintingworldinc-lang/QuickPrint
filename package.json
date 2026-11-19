@@ -46,7 +46,8 @@
       "src/**/*",
       "assets/quickprint.png",
       "package.json",
-      "!**/*.test.js"
+      "!**/*.test.js",
+      "!**/__pycache__/**"
     ],
     "extraResources": [
       {

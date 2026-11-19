@@ -78,7 +78,7 @@ function localAddresses(port) {
 async function startServer(options = {}) {
   const dataDir = path.resolve(options.dataDir || process.env.QUICKPRINT_DATA_DIR || path.join(process.cwd(), 'data'));
   const token = options.token || crypto.randomBytes(32).toString('hex');
-  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, satellite: options.satellite, resinEngine: options.resinEngine, seal: options.seal, unseal: options.unseal });
+  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, satellite: options.satellite, resinEngine: options.resinEngine, resinCad: options.resinCad, cadRuntime: options.cadRuntime, seal: options.seal, unseal: options.unseal });
   await service.init();
   const layrOAuth = options.layrOAuth || new LayrOAuth();
   const connectors = new ConnectorManager({ service, layrOAuth, layrClient: options.layrClient, layrProductionClient: options.layrProductionClient, outbox: options.layrOutbox });
@@ -115,8 +115,11 @@ async function startServer(options = {}) {
     res.type('html').send('<!doctype html><html lang="en"><meta charset="utf-8"><title>PrintByLayr connected</title><h1>PrintByLayr connected</h1><p>Return to QuickPrint. Paid resin tickets will appear in review after the next check.</p><a href="/">Open QuickPrint</a></html>');
   });
   app.use('/api', authenticate(token));
-  const maintenanceGuard = (req, res, next) => maintenance && !['GET', 'HEAD'].includes(req.method)
-    ? res.status(503).json({ error: 'BACKUP_IN_PROGRESS', message: 'A workspace backup is in progress. Retry this request shortly.' }) : next();
+  const maintenanceGuard = (req, res, next) => {
+    if (closed) return res.status(503).json({ error: 'SHUTTING_DOWN', message: 'QuickPrint is closing.' });
+    if (maintenance && !['GET', 'HEAD'].includes(req.method)) return res.status(503).json({ error: 'BACKUP_IN_PROGRESS', message: 'A workspace backup is in progress. Retry this request shortly.' });
+    next();
+  };
   app.use('/api', maintenanceGuard);
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', maintenanceGuard);
@@ -126,6 +129,8 @@ async function startServer(options = {}) {
   app.get('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.reviewResinTarget(req.params.id)));
   app.post('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.prepareResinTarget(req.params.id, req.body)));
   app.get('/api/jobs/:id/resin/geometry', async (req, res) => res.json(await service.inspectResinGeometry(req.params.id)));
+  app.post('/api/jobs/:id/resin/cad', async (req, res) => res.json(await service.prepareResinCadJob(req.params.id, req.body)));
+  app.post('/api/resin/cad/runtime', async (req, res) => res.json(await service.setupResinCadRuntime(req.body)));
   app.post('/api/jobs/:id/resin/production/approve', async (req, res) => res.json(await connectors.approveResinProduction(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/production/dispatch', async (req, res) => res.json(await connectors.dispatchResinProduction(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/production/reconcile', async (req, res) => res.json(await connectors.reconcileResinProduction(req.params.id, req.body)));
@@ -305,6 +310,7 @@ async function startServer(options = {}) {
     async close() {
       if (closed) return; closed = true;
       clearInterval(pollTimer);
+      service.cancelPreparationsForShutdown();
       if (backupOperation) await backupOperation;
       await connectors.stop();
       await closeServer(intakeServer); await closeServer(server);

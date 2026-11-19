@@ -244,8 +244,12 @@ or secrets must be empty. Slicing does not need printer/account credentials.
 The wrapper does not accept an alternate command string from the preset or model.
 
 Inputs are nonempty `.stl` or triangulated `.obj` files up to 100 MiB. OBJ polygons
-and external/free-form geometry are rejected. STEP/STP intake remains for review;
-resin STEP tessellation is not implemented. Models are treated as
+and external/free-form geometry are rejected. STEP/STP can first pass the
+separate [CAD preparation](RESIN-CAD.md), which audits native transfer and
+tessellates every retained solid to a verified millimetre STL. Embedded CAD units
+are converted once, without reapplying declared ticket units. The service binds
+the original CAD, converted mesh, reports and composite provider fingerprint.
+Models are treated as
 solid: `hollowing_enable=0` is mandatory because there is no qualified drain-hole
 plan or hollow-part inspection contract in this engine. This restriction does
 not detect a cavity already modeled into an uploaded mesh.

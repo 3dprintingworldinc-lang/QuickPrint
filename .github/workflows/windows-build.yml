@@ -48,13 +48,13 @@ jobs:
           if ($process.ExitCode -ne 0 -or -not (Test-Path (Join-Path $install 'QuickPrint.exe'))) {
             throw 'QuickPrint installer did not produce a runnable application.'
           }
-      - name: Smoke test packaged application and Windows credential encryption
+      - name: Smoke test packaged application, credentials and CAD resources
         shell: pwsh
         run: |
           $report = Join-Path $env:RUNNER_TEMP 'quickprint-smoke.json'
           $data = Join-Path $env:RUNNER_TEMP 'quickprint-smoke-data'
           $exe = Join-Path $env:RUNNER_TEMP 'QuickPrint-installed/QuickPrint.exe'
-          $process = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', "--smoke-report=$report", "--data-dir=$data") -PassThru
+          $process = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', "--smoke-report=$report", "--data-dir=$data") -WindowStyle Hidden -PassThru
           if (-not $process.WaitForExit(60000)) {
             $process.Kill()
             throw 'Packaged QuickPrint did not complete its smoke test within 60 seconds.'
@@ -62,8 +62,8 @@ jobs:
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed') {
-            throw 'QuickPrint packaged startup or credential-encryption check failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2) {
+            throw 'QuickPrint packaged startup, credential encryption or CAD resource extraction failed.'
           }
           Copy-Item $report 'dist/windows-smoke-test.json'
       - name: Smoke test the portable executable
@@ -72,13 +72,13 @@ jobs:
           $exe = (Get-ChildItem 'dist/QuickPrint-Portable-*-x64.exe').FullName
           $report = Join-Path $env:RUNNER_TEMP 'quickprint-portable-smoke.json'
           $data = Join-Path $env:RUNNER_TEMP 'quickprint-portable-data'
-          $process = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', "--smoke-report=$report", "--data-dir=$data") -PassThru
+          $process = Start-Process -FilePath $exe -ArgumentList @('--smoke-test', "--smoke-report=$report", "--data-dir=$data") -WindowStyle Hidden -PassThru
           if (-not $process.WaitForExit(60000)) { $process.Kill(); throw 'QuickPrint portable startup timed out.' }
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "Portable QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed') {
-            throw 'QuickPrint portable startup or credential-encryption check failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2) {
+            throw 'QuickPrint portable startup, credential encryption or CAD resource extraction failed.'
           }
           Copy-Item $report 'dist/windows-portable-smoke-test.json'
       - name: Verify the installer can be uninstalled

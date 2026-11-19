@@ -50,7 +50,9 @@ six print-issue checks. Named profile slots support separate resin settings;
 customization saves validated profile/preset copies while preserving originals.
 STL/triangulated OBJ measurement supports explicit uniform factors or one
 source-axis target dimension, preserving original bytes and hashing the
-normalized input. Resin STEP/STP is retained for review; tessellation is not implemented.
+normalized input. STEP/STP can first pass independent native transfer auditing,
+per-solid FreeCAD tessellation and closed-mesh/CAD measurement checks. Embedded
+CAD units convert to millimetres once; originals and conversion evidence stay bound.
 Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 
@@ -73,6 +75,7 @@ See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
 [qualified production steps](docs/RESIN-PRODUCTION.md),
 [headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
 [model sizing](docs/RESIN-SIZING.md),
+[STEP geometry preparation](docs/RESIN-CAD.md),
 [SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and
 [SDCP integration](docs/SDCP-INTEGRATION.md).
 

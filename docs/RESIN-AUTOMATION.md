@@ -28,7 +28,9 @@ private-source test setup and deployment boundary.
    Imported models are limited to 100 MiB; signed download links are not retained.
 3. Configure PrusaSlicer and UVtools paths and reviewed named resin/profile slots
    in **Settings -> Resin model preparation**. Select a slot for each ticket and
-   resolve its requirements. Use **Measure model**, then keep its current size,
+   resolve its requirements. For STEP/STP, configure FreeCAD and **Set up CAD
+   transfer audit**, then confirm embedded units and **Prepare STEP geometry**.
+   Use **Measure model**, then keep its current size,
    choose a uniform numeric factor or set one source-axis dimension in mm.
    Declared mm/in/m units are converted explicitly. Confirm the chosen plan;
    customer free-text sizing is not interpreted automatically.
@@ -73,6 +75,13 @@ none was a qualified physical production print. Reproduction commands, profile
 schema, unit rules, resource bounds and observed hashes are in the
 [headless resin engine guide](HEADLESS-RESIN-ENGINE.md).
 
+The owned STEP cylinder also passed the two-reader CAD audit, preserved its
+large-offset assembly coordinates through one shared translation, and resized
+from 3 mm to a 6 mm source-Z target. The original verification orientations
+remained held on resin-trap reports. A copied profile changing only orientation
+to `(45,15,0)` produced 309 layers with zero reports across all six checks.
+That file remained unqualified; see the [CAD reproduction/evidence](RESIN-CAD.md#reproduce-a-file-only-verification).
+
 Named profile slots keep separate reviewed printer/resin settings while sharing
 provider executables and the timeout. Profile customization edits material,
 layer height, exposure/motion/PWM, support/pad policy and orientation candidates.
@@ -86,7 +95,10 @@ Source bytes remain unchanged while a separate normalized millimetre STL embodie
 the numeric sizing plan. The engine and service check its hash, bounds, triangle
 count and float32 representation independently. Exact Z -> X -> Y candidate
 extents must fit the strict zero-origin rectangular SLA bed and maximum height.
-STEP/STP intake stays in review; resin tessellation is not implemented. See
+STEP/STP uses a separate clean native transfer audit, per-solid FreeCAD
+tessellation and independent closed-mesh/CAD bounds/volume checks before sizing.
+Embedded CAD units convert to mm once; source bytes and assembly placements are
+preserved. See [CAD preparation](RESIN-CAD.md) and
 [model sizing](RESIN-SIZING.md) for the mesh subset, limits and 6 mm reproduction.
 
 The engine records `modelCopiesPerRun: 1`, meaning one submitted source instance,
@@ -138,7 +150,7 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 | --- | --- | --- |
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
 | Units and sizing | mm/in/m conversion; measured source axes; explicit uniform factor or one-axis target; normalized input hash/bounds | Resolve free text and unsupported nonuniform/complex CAD changes |
-| Mesh/solid policy | STL/triangulated OBJ measurement; preserved original; solid-only slicer policy; STEP/STP intake review; SatelLite probe | STEP tessellation, mesh repair qualification, existing cavities and drain-hole/wall validation |
+| Mesh/solid policy | STL/triangulated OBJ measurement; source-bound STEP audit/tessellation; closed-mesh and analytic solid checks; preserved originals; SatelLite probe | General healing, non-solid/void-shell CAD, self-intersection and cavity/drain-hole/wall certification |
 | Orientation/supports | One to four explicit rotations; configurable supports/pad; six issue checks; one source instance per file | Customer support/finish requirements, physical support strength, arbitrary orientation and validated plate packing |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
 | Profile customization | Named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |

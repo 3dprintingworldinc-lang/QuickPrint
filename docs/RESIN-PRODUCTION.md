@@ -44,18 +44,22 @@ profile is not a production calibration.
 
 Connect the scoped production machine API under **Inputs** and import a paid
 resin ticket awaiting preparation. Resolve scale, target dimensions, supports,
-finish and other free-text requirements before slicing. Use **Measure model**,
+finish and other free-text requirements before slicing. For STEP/STP, configure
+the [CAD providers](RESIN-CAD.md), confirm embedded CAD units and use **Prepare
+STEP geometry** first. Its verified mesh is already in millimetres; ticket units
+are retained without scaling CAD a second time. Use **Measure model**,
 then choose **Current model size**, **Uniform scale factor** or **Set one
 source-axis dimension**. The latter choices scale the whole model uniformly
-after its declared mm/in/m conversion. Review the millimetre preview and confirm
+after its unit conversion (embedded CAD units for STEP; declared mm/in/m for
+STL/OBJ). Review the millimetre preview and confirm
 the chosen plan. Text instructions are not interpreted automatically.
 
 Original bytes are preserved; a separate normalized and hashed millimetre STL
 embodies the numeric plan. Exact candidate-vertex extents after Z -> X -> Y
 rotation must fit the reviewed rectangular SLA bed and maximum height. See
 [model sizing](RESIN-SIZING.md) for source-axis meaning, parser/float32 bounds and
-reproduction. STEP/STP can arrive for review but needs reviewed tessellation
-before this STL/triangulated-OBJ resin path.
+reproduction. STEP conversion reports and per-solid meshes remain attached to
+the original ticket and are reverified before this resin slice can be qualified.
 
 Select the reviewed slot and choose **Slice resin model**. The engine evaluates
 the configured rotations, captures GOO, validates its layers and target values,
@@ -93,7 +97,7 @@ portal setting contains an array of those objects.
 
 The application does not perform calibration or establish resin cure,
 dimensional accuracy, image handedness, support strength or acceptable motion.
-Changing the engine/profile hash, material, printer binding or device/firmware
+Changing the engine/profile hash, CAD provider/tessellation tolerances, material, printer binding or device/firmware
 signature requires another qualification review. An immutable receipt's
 historical qualified flag cannot replace the portal's current binding check.
 
@@ -128,7 +132,7 @@ The service then:
 
 1. Reconciles saved portal evidence and reads fresh authorization for the exact
    queued ticket, receipt, device, current production target and remaining quantity.
-2. Rechecks original/normalized-input/GOO/profile hashes, sizing proof, local printer binding, device attributes,
+2. Rechecks original/CAD-conversion/normalized-input/GOO/profile hashes, sizing proof, local printer binding, device attributes,
    GOO capabilities and fresh idle status. It creates a short-lived, one-use
    internal permit; HTTP-supplied `qualified`/approval flags cannot create one.
 3. Durably records a new run ID and unique remote filename, then uploads that
@@ -277,8 +281,8 @@ No case uploads to or starts a real printer.
 ## Remaining production work
 
 Live portal migration/deployment/token setup and actual hardware qualification
-remain. The engine does not interpret free-text sizing, perform resin STEP
-tessellation, establish hollow/drain plans or cavity safety, infer arbitrary
+remain. The engine does not interpret free-text sizing, establish hollow/drain
+plans or certify self-intersection/cavity safety, infer arbitrary
 supports/finish requirements, or pack multiple source instances. Post-processing,
 QC decisions, replacement allowance and delivery remain explicit studio/operator
 work; no automatic quality acceptance is inferred from printed-unit evidence.

@@ -4,8 +4,10 @@ QuickPrint can measure and uniformly resize bounded STL and triangulated OBJ
 models before resin slicing. The uploaded source bytes remain unchanged. Free-text
 order dimensions, scale ratios, support requests and finish instructions remain
 operator-reviewed requirements; they are not parsed into transformations.
-STEP/STP can arrive for review, but resin STEP tessellation is not implemented.
-Supply a reviewed mesh before measurement or slicing.
+STEP/STP can first use the [verified CAD conversion](RESIN-CAD.md). Choose
+**Prepare STEP geometry** after reviewing embedded units, then measure and size
+the resulting millimetre mesh. The ticket's declared units are retained and are
+not applied a second time to CAD coordinates.
 
 ## Choose an explicit sizing method
 
@@ -16,6 +18,9 @@ In the resin job, select **Measure model**, then choose a **Sizing method**:
 | Current model size | Convert declared mm/in/m units to millimetres; keep source dimensions |
 | Uniform scale factor | Multiply all three converted dimensions by one numeric factor; `2` doubles size |
 | Set one source-axis dimension | Set source X, Y or Z to the entered millimetres and apply that same factor to every axis |
+
+For STEP, “current size” is the CAD kernel's intrinsic-unit conversion to mm;
+for STL/OBJ it is the declared mm/in/m conversion shown above.
 
 Axes and displayed dimensions refer to the source before print orientation,
 supports and pad. Proportions are preserved. Review the resulting X/Y/Z preview
@@ -61,7 +66,11 @@ the emitted file is reread to verify triangle count and bounds.
 `inputGeometry` records the normalized file's hash, byte count and bounds. The
 service independently derives the expected plan/file, checks the actual managed
 file without symbolic links, and rechecks geometry evidence before qualified
-production. Original bytes and ticket text are retained.
+production. Original bytes and ticket text are retained. For converted STEP,
+the sizing plan identifies the verified mesh hash; the slice receipt identifies
+the original CAD hash and separately retains the mesh/transfer reports and
+composite CAD-plus-slicer tool fingerprint. Source axes remain the imported CAD
+axes, before print orientation, supports and pad.
 
 ## Printer fit and provider input
 

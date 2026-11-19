@@ -148,6 +148,15 @@ function parse(buffer, config, visit) {
   return asciiStl(buffer, config.limits, visit);
 }
 
+function forEachResinTriangle(buffer, options, visit) {
+  if (typeof visit !== 'function') throw fail('A triangle visitor is required.');
+  const config = settings(options); let triangleCount = 0;
+  parse(buffer, config, vertices => {
+    visit(vertices.map(vertex => vertex.map(value => value * config.unitScale)), triangleCount++);
+  });
+  return freeze({ sourceSha256: hash(buffer), units: config.units, unitScale: config.unitScale, triangleCount, coordinateUnits: 'mm' });
+}
+
 function measureResinGeometry(buffer, options) {
   const config = settings(options), minimum = [Infinity, Infinity, Infinity], maximum = [-Infinity, -Infinity, -Infinity];
   let triangleCount = 0;
@@ -231,4 +240,4 @@ function prepareResinGeometry(buffer, options) {
   return Object.freeze({ plan, stl, transformedSha256: reread.sourceSha256, transformedBounds: reread.sourceBounds });
 }
 
-module.exports = { measureResinGeometry, planResinSizing, prepareResinGeometry, measureResinOrientation, float32Tolerance };
+module.exports = { measureResinGeometry, planResinSizing, prepareResinGeometry, measureResinOrientation, forEachResinTriangle, float32Tolerance };
