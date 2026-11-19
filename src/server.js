@@ -78,7 +78,7 @@ function localAddresses(port) {
 async function startServer(options = {}) {
   const dataDir = path.resolve(options.dataDir || process.env.QUICKPRINT_DATA_DIR || path.join(process.cwd(), 'data'));
   const token = options.token || crypto.randomBytes(32).toString('hex');
-  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, satellite: options.satellite, resinEngine: options.resinEngine, resinCad: options.resinCad, cadRuntime: options.cadRuntime, seal: options.seal, unseal: options.unseal });
+  const service = new QuickPrintService({ dataDir, adapters: options.adapters || adapterModule, slicer: options.slicer || slicerModule, satellite: options.satellite, resinEngine: options.resinEngine, resinCad: options.resinCad, resinRepair: options.resinRepair, cadRuntime: options.cadRuntime, seal: options.seal, unseal: options.unseal });
   await service.init();
   const layrOAuth = options.layrOAuth || new LayrOAuth();
   const connectors = new ConnectorManager({ service, layrOAuth, layrClient: options.layrClient, layrProductionClient: options.layrProductionClient, outbox: options.layrOutbox });
@@ -130,6 +130,13 @@ async function startServer(options = {}) {
   app.post('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.prepareResinTarget(req.params.id, req.body)));
   app.get('/api/jobs/:id/resin/geometry', async (req, res) => res.json(await service.inspectResinGeometry(req.params.id)));
   app.post('/api/jobs/:id/resin/cad', async (req, res) => res.json(await service.prepareResinCadJob(req.params.id, req.body)));
+  app.post('/api/jobs/:id/resin/repair', async (req, res) => res.json(await service.prepareResinRepairJob(req.params.id, req.body)));
+  app.get('/api/jobs/:id/resin/repair/download', async (req, res) => {
+    const artifact = await service.getResinRepairDownload(req.params.id);
+    const bytes = await fs.readFile(artifact.filePath);
+    if (bytes.length !== artifact.bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) throw fail('The repaired mesh changed before download.', 409, 'RESIN_REPAIR_CHANGED');
+    res.attachment(artifact.fileName).type('application/octet-stream').send(bytes);
+  });
   app.post('/api/resin/cad/runtime', async (req, res) => res.json(await service.setupResinCadRuntime(req.body)));
   app.post('/api/jobs/:id/resin/production/approve', async (req, res) => res.json(await connectors.approveResinProduction(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/production/dispatch', async (req, res) => res.json(await connectors.dispatchResinProduction(req.params.id, req.body)));

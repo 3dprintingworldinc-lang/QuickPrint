@@ -116,6 +116,12 @@ vertices, stricter than measurement's two-million-triangle bound. See
 [source preservation and exact repair](RESIN-MESH-REPAIR.md). This does not
 classify cavities or certify self-intersections.
 
+An imported STL/OBJ can first enter the explicit
+[exact repair workflow](RESIN-MESH-REPAIR.md). The engine then receives its
+verified repaired millimetre derivative at unit scale 1 and applies the later
+numeric sizing plan. The service binds both that derivative and the original
+portal source through capture and production evidence.
+
 1. Read and hash the original STL/OBJ, JSON profile and standalone INI. Copy the
    original and preset into a new work directory; never overwrite the original.
    Measure the source, apply its explicit unit conversion/uniform sizing and one

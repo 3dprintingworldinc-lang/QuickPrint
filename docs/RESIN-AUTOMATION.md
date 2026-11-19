@@ -176,15 +176,15 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 ## End-to-end process map
 
 See [exact mesh repair and source preservation](RESIN-MESH-REPAIR.md) for the
-mandatory pre-slice topology gate, its resource bounds and the separate
-face-accounted repair primitive. Native automatic repair cannot establish that
+mandatory pre-slice topology gate, its resource bounds and the explicit
+source-bound order repair workflow. Native automatic repair cannot establish that
 the submitted geometry survived unchanged.
 
 | Stage | Implemented and observed | Remaining work |
 | --- | --- | --- |
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |
 | Units and sizing | mm/in/m conversion; measured source axes; explicit uniform factor or one-axis target; normalized input hash/bounds | Resolve free text and unsupported nonuniform/complex CAD changes |
-| Mesh/solid policy | STL/triangulated OBJ measurement; source-bound STEP audit/tessellation; closed-mesh and analytic solid checks; preserved originals; SatelLite probe | General healing, non-solid/void-shell CAD, self-intersection and cavity/drain-hole/wall certification |
+| Mesh/solid policy | Mandatory closed-mesh audit; explicit exact duplicate/winding repair with source-face accounting and unit normalization; source-bound STEP audit/tessellation; preserved originals and derivative proof through production | General healing, non-solid/void-shell CAD, self-intersection and cavity/drain-hole/wall certification |
 | Orientation/supports | One to four explicit rotations; configurable supports/pad; exact native-reference raster replication, complete-byte rebuild and all six checks on the derived plate | Customer support/finish requirements, physical support strength and qualification; integrity mismatches stop preparation |
 | Slice/export | Callable Prusa SLA -> SL1 -> UVtools GOO; full bounded GOO-layer validation; target parameter checks | Printer/firmware/resin calibration, image handedness and dimensional acceptance |
 | Profile customization | Up to 32 named slots; managed copies; constrained material/exposure/motion/support/orientation editing | Qualification of each edited profile; no inference of safe resin values |

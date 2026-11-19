@@ -56,8 +56,9 @@ CAD units convert to millimetres once; originals and conversion evidence stay bo
 Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
 SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
 Slicing now requires an independently audited closed, consistently wound source
-mesh before native processing. The separate [exact repair primitive](docs/RESIN-MESH-REPAIR.md)
-accounts for every source face; its order-service adoption path is still pending.
+mesh before native processing. The optional [exact repair workflow](docs/RESIN-MESH-REPAIR.md)
+accounts for every source face, preserves the frozen original and binds the
+reviewed derivative through sizing, slicing and production evidence.
 
 Explicit multi-copy resin plates reserve the native single-copy support/pad
 footprint and replicate that reference's exact grayscale layer images on the

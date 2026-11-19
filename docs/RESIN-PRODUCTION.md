@@ -61,6 +61,12 @@ after its unit conversion (embedded CAD units for STEP; declared mm/in/m for
 STL/OBJ). Review the millimetre preview and confirm
 the chosen plan. Text instructions are not interpreted automatically.
 
+For STL or triangulated OBJ, optional **Review exact mesh repair** normalizes
+declared units once and captures exact duplicate/winding edits as a separate
+derivative. Review its counts and unqualified STL, then **Measure model** again
+before sizing. The original portal model stays unchanged and remains the
+receipt's source. See [the exact repair workflow](RESIN-MESH-REPAIR.md).
+
 Original bytes are preserved; a separate normalized and hashed millimetre STL
 embodies the numeric plan. Exact candidate-vertex extents after Z -> X -> Y
 rotation must fit the reviewed rectangular SLA bed and maximum height. See
@@ -118,7 +124,7 @@ portal setting contains an array of those objects.
 
 The application does not perform calibration or establish resin cure,
 dimensional accuracy, image handedness, support strength or acceptable motion.
-Changing the engine/profile hash, CAD provider/tessellation tolerances, material, printer binding or device/firmware
+Changing the engine/profile hash, exact repair implementation, CAD provider/tessellation tolerances, material, printer binding or device/firmware
 signature requires another qualification review. An immutable receipt's
 historical qualified flag cannot replace the portal's current binding check.
 

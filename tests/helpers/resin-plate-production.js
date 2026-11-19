@@ -21,22 +21,22 @@ const privateFiles = ['server/production.mjs', 'server/intake.mjs', 'server/work
 const available = privateFiles.every(file => existsSync(path.join(portalSource, file)));
 const missing = 'Private reviewed portal source is absent; set QUICKPRINT_PORTAL_SOURCE. See docs/PRINTBYLAYR-PRODUCTION-INTEGRATION.md.';
 
-function fakePortal(quantity) {
+function fakePortal(quantity, modelBuffer = MODEL) {
   const id = randomUUID(), createdAt = new Date().toISOString();
   const ticket = { id, reference: 'PBL-' + id, version: 5, status: 'preparing', createdAt, ticketFingerprint: 'a'.repeat(64),
-    ticket: { specifications: { project: { name: 'Packed production fixture', quantity }, production: { printType: 'resin', supports: 'allowed', colour: 'grey' }, file: { name: 'source.stl', format: 'stl', sizeBytes: MODEL.length, units: 'mm' } } },
+    ticket: { specifications: { project: { name: 'Packed production fixture', quantity }, production: { printType: 'resin', supports: 'allowed', colour: 'grey' }, file: { name: 'source.stl', format: 'stl', sizeBytes: modelBuffer.length, units: 'mm' } } },
     production: { target: { id, kind: 'order', cycle: 0, requiredParts: quantity, authorizedAt: createdAt, qcOperationId: null }, progress: { requestedParts: quantity, printedParts: 0, remainingParts: quantity, completedRuns: 0, failedRuns: 0 }, totals: { printedParts: 0, completedRuns: 0, failedRuns: 0 }, targetHistory: [] } };
   const receipts = new Map(), operations = new Map(), runIds = new Set(); let binding;
   const qualified = receipt => Boolean(binding && receipt && Object.entries(binding).every(([key, value]) => key === 'engineSha256' ? receipt.tool.executableSha256 === value : key === 'format' ? receipt.artifact.format === value : receipt[key] === value));
   const rejected = (code, status = 409) => Response.json({ code }, { status });
   return { id, async close() {}, qualify(value) { binding = clone(value); }, current: () => clone(ticket),
     async handle(url, options) {
-      if (url.pathname === '/api/intake') return new Response(MODEL);
+      if (url.pathname === '/api/intake') return new Response(modelBuffer);
       const action = url.searchParams.get('action');
       if (options.method !== 'POST') {
         if (action === 'tickets') return Response.json({ tickets: ticket.status === 'preparing' ? [clone(ticket)] : [], nextCursor: null });
         if (action === 'ticket') return Response.json({ ticket: clone(ticket) });
-        if (action === 'download') return Response.json({ name: 'source.stl', sizeBytes: MODEL.length, url: ORIGIN + '/api/intake?download=private.signature' });
+        if (action === 'download') return Response.json({ name: 'source.stl', sizeBytes: modelBuffer.length, url: ORIGIN + '/api/intake?download=private.signature' });
         const receipt = receipts.get(url.searchParams.get('receiptId')); if (!receipt) return rejected('receipt_not_found', 404);
         if (action === 'receipt') return Response.json({ receipt: clone(receipt), qualification: { qualified: qualified(receipt), checkedAt: new Date().toISOString(), qualificationFingerprint: qualified(receipt) ? hash(JSON.stringify(binding)) : null } });
         if (!qualified(receipt)) return rejected('preparation_unqualified');
@@ -78,15 +78,15 @@ function fakePortal(quantity) {
     } };
 }
 
-async function actualPortal(quantity) {
+async function actualPortal(quantity, modelBuffer = MODEL) {
   const [production, intake, workflow, { SqliteWorkflowD1 }, { FakeB2 }] = await Promise.all(privateFiles.slice(0, 5).map(file => import(pathToFileURL(path.join(portalSource, file)).href)));
   const database = new SqliteWorkflowD1(), bucket = new FakeB2(), id = randomUUID(), now = Date.now();
   for (const file of privateFiles.slice(5)) database.database.exec(readFileSync(path.join(portalSource, file), 'utf8'));
-  const model = { fileId: 'owned-model-' + id, size: MODEL.length, sha1: createHash('sha1').update(MODEL).digest('hex') };
+  const model = { fileId: 'owned-model-' + id, size: modelBuffer.length, sha1: createHash('sha1').update(modelBuffer).digest('hex') };
   const record = { id, requestId: 'PBL-' + id.toUpperCase(), origin: ORIGIN, createdAt: new Date(now).toISOString(), model, notification: { accepted: true },
-    payload: { client: { fullName: 'Owned fixture customer', email: 'fixture@example.test' }, project: { name: 'Packed production fixture', quantity }, production: { printType: 'resin', supports: 'allowed', colour: 'grey' }, file: { name: 'source.stl', format: 'stl', sizeBytes: MODEL.length, units: 'mm' } } };
+    payload: { client: { fullName: 'Owned fixture customer', email: 'fixture@example.test' }, project: { name: 'Packed production fixture', quantity }, production: { printType: 'resin', supports: 'allowed', colour: 'grey' }, file: { name: 'source.stl', format: 'stl', sizeBytes: modelBuffer.length, units: 'mm' } } };
   database.database.prepare('INSERT INTO intake_requests (id,record_json,model_json,notification_json,created_at) VALUES (?,?,?,?,?)').run(id, JSON.stringify(record), JSON.stringify(model), JSON.stringify(record.notification), record.createdAt);
-  bucket.objects.set(model.fileId, { fileId: model.fileId, key: 'requests/' + id + '/model.stl', bytes: MODEL, sha1: model.sha1 });
+  bucket.objects.set(model.fileId, { fileId: model.fileId, key: 'requests/' + id + '/model.stl', bytes: modelBuffer, sha1: model.sha1 });
   const env = { WORKFLOW_ENABLED: '1', INTAKE_DB: database, INTAKE_SIGNING_SECRET: 'packed-production-fixture-secret-at-least-32-characters', B2_APPLICATION_KEY_ID: 'test-key-id', B2_APPLICATION_KEY: 'test-key', B2_BUCKET_ID: bucket.bucketId,
     PRODUCTION_TOKEN_SHA256: hash(TOKEN), PRODUCTION_MACHINE_ID: 'packed-fixture-machine', PRODUCTION_QUALIFIED_BINDINGS: '[]' };
   let job = await workflow.ensureJob(env, record, { customerUrl: ORIGIN + '/job#fixture-customer', now });
@@ -97,8 +97,10 @@ async function actualPortal(quantity) {
     handle: (url, options) => url.pathname === '/api/production' ? production.handleProduction(new Request(url, options), env, { now: Date.now, log: () => {} }) : intake.handleIntake(new Request(url, options), env, { now: Date.now, storageFetch: bucket.fetch, log: () => {} }) };
 }
 
-async function fixture(t, { actual = false, quantity = 20 } = {}) {
-  const portal = actual ? await actualPortal(quantity) : fakePortal(quantity), directory = await fs.mkdtemp(path.join(os.tmpdir(), 'quickprint-packed-flow-'));
+async function fixture(t, { actual = false, quantity = 20, modelBuffer = MODEL } = {}) {
+  assert.ok(Buffer.isBuffer(modelBuffer) && modelBuffer.length, 'The owned source fixture must contain model bytes.');
+  const source = Buffer.from(modelBuffer);
+  const portal = actual ? await actualPortal(quantity, source) : fakePortal(quantity, source), directory = await fs.mkdtemp(path.join(os.tmpdir(), 'quickprint-packed-flow-'));
   const packed = await createPlateSliceFixture(path.join(directory, 'profile')), writes = [], faults = { loseReply: null, reject: null, freshTicket: null, beforeFreshTicket: null };
   let app, offset = 0;
   const fetchImpl = async (address, options = {}) => {

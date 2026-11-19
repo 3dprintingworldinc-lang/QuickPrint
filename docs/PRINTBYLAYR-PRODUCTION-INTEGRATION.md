@@ -22,7 +22,7 @@ git -C <private-checkout> fetch origin codex/quickprint-production-api
 git -C <private-checkout> switch --detach e5c06d4d43fe2fec394451b42c656acb9e0194dd
 git -C <private-checkout> diff --check
 $env:QUICKPRINT_PORTAL_SOURCE = '<absolute-private-checkout>'
-node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js tests/layr-cad-intake-flow.test.js tests/layr-plate-production-flow.test.js
+node --test tests/layr-production-client.test.js tests/layr-production-flow.test.js tests/layr-cad-intake-flow.test.js tests/layr-plate-production-flow.test.js tests/layr-repair-production-flow.test.js
 ```
 
 Verify the checked-out SHA with `git -C <private-checkout> rev-parse HEAD` and
@@ -58,6 +58,10 @@ unchanged retry bodies, lost-response ambiguity and receipt reconciliation.
 The plate flow also exercises 20 units as 6 + 6 + 6 + 2 against these actual
 handlers. A confirmed smaller remainder reopens preparation for a new plate and
 receipt; it cannot reuse the larger artifact or grant QC acceptance.
+The repair flow preserves the original damaged model through exact repair,
+uniform sizing and a verified two-copy plate. It exercises original-source
+receipt binding, qualification and identified simulated completion against the
+actual handlers; the portal records printed units while local QC stays zero.
 
 The private portal branch's `docs/PRODUCTION-API.md` contains the complete request
 and response contract, migration, dedicated token setup, qualification bindings and

@@ -135,7 +135,7 @@ function resinEngineConfiguration(config, previous = {}) {
 }
 
 class QuickPrintService extends EventEmitter {
-  constructor({ dataDir, adapters, slicer, satellite, resinEngine, resinCad, cadRuntime, seal, unseal } = {}) {
+  constructor({ dataDir, adapters, slicer, satellite, resinEngine, resinCad, resinRepair, cadRuntime, seal, unseal } = {}) {
     super();
     if (!dataDir) throw error(500, 'A QuickPrint data directory is required.');
     this.dataDir = path.resolve(dataDir);
@@ -144,6 +144,7 @@ class QuickPrintService extends EventEmitter {
     this.satellite = satellite;
     this.resinEngine = resinEngine;
     this.resinCad = resinCad;
+    this.resinRepair = resinRepair;
     this.cadRuntime = cadRuntime;
     this.store = new StateStore({ dataDir: this.dataDir, seal, unseal });
     this._transaction = Promise.resolve();
@@ -698,6 +699,66 @@ class QuickPrintService extends EventEmitter {
     return directory;
   }
 
+  async prepareResinRepairJob(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => key !== 'confirmedExactRepair') || request.confirmedExactRepair !== true) throw error(400, 'Confirm exact duplicate removal and winding repair after normalization to millimetres; this operation cannot fill holes or weld nearby coordinates.', 'RESIN_REPAIR_REVIEW_REQUIRED');
+    return this._queueResinPreparation(id, [`job:${id}`, 'resin:engine'], async controller => {
+      const job = this._job(id), format = path.extname(job.fileName).slice(1).toLowerCase();
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint || !['stl', 'obj'].includes(format)) throw error(409, 'Select an imported resin STL or triangulated OBJ ticket for exact repair.', 'RESIN_REPAIR_SOURCE_REQUIRED');
+      if (['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState)) throw error(409, 'Resolve the pending or committed preparation approval before repairing its source.', 'RESIN_APPROVAL_LOCKED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before exact repair.', 'JOB_BUSY');
+      if (job.resinCad) throw error(409, 'Mesh repair cannot adopt unrelated CAD conversion evidence.', 'RESIN_REPAIR_CHANGED');
+      try {
+        const source = await this._readResinGeometrySource(job);
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id); delete current.resinRepair; delete current.resinSlice; delete current.error;
+          this._invalidateResinPermits(id);
+          this._transition(current, 'preparing', 'Normalizing declared units and repairing exact mesh duplicates and winding; the original model is preserved.');
+        });
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-repair');
+        await fs.mkdir(outputDir, { recursive: true }); await this._resinRepairDirectory(job);
+        const implementation = this.resinRepair || require('../slicing/resin-repair');
+        controller.signal.throwIfAborted();
+        const record = await implementation.prepareResinRepair({ source: Buffer.from(source), format, units: job.order.units, outputDir, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (digest(source) !== job.sha256 || record?.sourceSha256 !== job.sha256) throw error(409, 'The repair did not preserve the frozen original source identity.', 'ORIGINAL_CHANGED');
+        await this._resinRepairDirectory(job);
+        await require('../slicing/resin-repair').verifyResinRepairGeometry(record, { source, format, units: job.order.units, directory: outputDir, signal: controller.signal });
+        await this._readResinGeometrySource(job);
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinRepair = { ...record, operatorReview: { exactRepair: true, ticketUnits: current.order.units, coordinateUnits: 'mm', reviewedAt: this._now() } };
+          delete current.error;
+          this._transition(current, 'review', 'Exact mesh repair validated. Review the repaired millimetre geometry before sizing and slicing.');
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id); delete current.resinRepair; delete current.resinSlice;
+          current.error = this._safeMessage(cause?.message || 'Exact mesh repair failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async _resinRepairDirectory(job) {
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-repair');
+    let current = this.dataDir;
+    const rootInfo = await fs.lstat(current);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw error(409, 'Repair evidence root cannot use symbolic links.', 'RESIN_REPAIR_CHANGED');
+    for (const segment of path.relative(this.dataDir, directory).split(path.sep)) {
+      current = path.join(current, segment);
+      const info = await fs.lstat(current);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw error(409, 'Repair evidence directories cannot use symbolic links.', 'RESIN_REPAIR_CHANGED');
+    }
+    if (path.relative(await fs.realpath(this.dataDir), await fs.realpath(directory)) !== path.relative(this.dataDir, directory)) throw error(409, 'Repair evidence resolves outside its managed job directory.', 'RESIN_REPAIR_CHANGED');
+    return directory;
+  }
+
   async _resinSliceFile(job, result = job.resinSlice) {
     if (!result || result.format !== 'goo' || typeof result.filePath !== 'string' || !path.isAbsolute(result.filePath) || !/^[a-f0-9]{64}$/.test(result.sha256 || '')) throw error(409, 'No captured resin slice is available.', 'RESIN_SLICE_UNAVAILABLE');
     const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
@@ -713,8 +774,8 @@ class QuickPrintService extends EventEmitter {
   }
 
   async sliceResinJob(id, request = {}) {
-    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate'].includes(key))) throw error(400, 'Resin slicing accepts reviewed sizing, plate policy, confirmations, a reviewed CAD geometry hash and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
-    if (request.expectedGeometrySha256 !== undefined && (typeof request.expectedGeometrySha256 !== 'string' || !SHA256.test(request.expectedGeometrySha256))) throw error(400, 'The reviewed CAD geometry hash must be a SHA-256 value.', 'INVALID_RESIN_SLICE_REQUEST');
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate'].includes(key))) throw error(400, 'Resin slicing accepts reviewed sizing, plate policy, confirmations, a reviewed derivative geometry hash and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    if (request.expectedGeometrySha256 !== undefined && (typeof request.expectedGeometrySha256 !== 'string' || !SHA256.test(request.expectedGeometrySha256))) throw error(400, 'The reviewed geometry hash must be a SHA-256 value.', 'INVALID_RESIN_SLICE_REQUEST');
     const plate = request.plate === undefined ? undefined : resinPlateRequest(request.plate);
     let sizing;
     try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
@@ -743,6 +804,7 @@ class QuickPrintService extends EventEmitter {
         });
         const expectedGeometry = await this._expectedResinGeometry(job, sizing);
         if (/\.(step|stp)$/i.test(job.fileName) && request.expectedGeometrySha256 !== job.resinCad?.sha256) throw error(409, 'The CAD geometry changed or has not been reviewed. Refresh its measurements and confirm sizing again.', 'RESIN_CAD_REVIEW_STALE');
+        if (expectedGeometry.repairPreparation && request.expectedGeometrySha256 !== expectedGeometry.engineSourceSha256) throw error(409, 'The repaired geometry changed or has not been reviewed. Refresh its measurements and confirm sizing again.', 'RESIN_REPAIR_REVIEW_STALE');
         const module = require('../slicing/resin-engine');
         const loaded = await module.loadProfile(settings.profilePath);
         const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-slicing');
@@ -750,6 +812,7 @@ class QuickPrintService extends EventEmitter {
         controller.signal.throwIfAborted();
         const result = await implementation.prepareResin({ ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), signal: controller.signal });
         controller.signal.throwIfAborted();
+        if (result && ['cadPreparation', 'meshSourceSha256', 'rawSliceTool', 'repairPreparation', 'repairedSourceSha256', 'repairSliceTool'].some(key => result[key] !== undefined)) throw error(502, 'The slicing engine cannot supply unrelated source preparation evidence.', 'INVALID_RESIN_OUTPUT');
         if (!result || !result.analysis || !Number.isSafeInteger(result.analysis.count) || result.analysis.count < 0 || result.analysis.passed !== (result.analysis.count === 0) || !Array.isArray(result.analysis.issues) || result.analysis.issues.length !== result.analysis.count || result.analysis.issues.some(issue => typeof issue !== 'string') || !Array.isArray(result.analysis.checks) || result.analysis.checks.length !== RESIN_ANALYSIS_CHECKS.length || RESIN_ANALYSIS_CHECKS.some(check => !result.analysis.checks.includes(check)) || result.sourceSha256 !== expectedGeometry.engineSourceSha256 || result.profileSha256 !== loaded.profileSha256 || result.printerId !== loaded.profile.printerId || result.printerModel !== loaded.profile.printerModel || result.material !== loaded.profile.material || !result.tool || !/^[a-f0-9]{64}$/.test(result.tool.executableSha256 || '')) throw error(502, 'Resin slicing returned incomplete or mismatched evidence.', 'INVALID_RESIN_OUTPUT');
         const inputGeometry = await this._verifyResinInputGeometry(job, result, expectedGeometry);
         const bytes = await this._resinSliceFile(job, result);
@@ -762,12 +825,17 @@ class QuickPrintService extends EventEmitter {
           const checked = await this._expectedResinGeometry(job, sizing);
           if (!require('node:util').isDeepStrictEqual(checked.cadPreparation, expectedGeometry.cadPreparation)) throw error(409, 'CAD preparation changed during resin slicing.', 'RESIN_CAD_CHANGED');
         }
+        if (expectedGeometry.repairPreparation) {
+          const checked = await this._expectedResinGeometry(job, sizing);
+          if (!require('node:util').isDeepStrictEqual(checked.repairPreparation, expectedGeometry.repairPreparation)) throw error(409, 'Exact repair preparation changed during resin slicing.', 'RESIN_REPAIR_CHANGED');
+        }
         controller.signal.throwIfAborted();
         return await this._mutate(() => {
           controller.signal.throwIfAborted();
           const current = this._job(id);
           const cad = expectedGeometry.cadPreparation;
-          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true, ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
+          const repair = expectedGeometry.repairPreparation;
+          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), ...(repair ? { repairedSourceSha256: expectedGeometry.engineSourceSha256, repairPreparation: repair, repairSliceTool: result.tool, tool: this._resinRepairSliceTool(result.tool, repair) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad || repair ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true } : {}), ...(repair ? { exactRepair: true } : {}), ...(cad || repair ? { ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
           if (result.analysis.passed) delete current.error;
           else current.error = `${result.analysis.count} resin print issue(s) require review. Inspect the captured file and change the model or profile before retrying.`;
           this._transition(current, 'review', result.analysis.passed ? 'Resin slice captured. Printer/material qualification is still required.' : current.error);
@@ -805,7 +873,7 @@ class QuickPrintService extends EventEmitter {
     const prepared = require('../slicing/resin-geometry').prepareResinGeometry(input.source, { format: input.format, units: input.units, sizing });
     const meshAudit = this._auditResinSlicingSource(prepared.stl);
     // Do not retain the potentially 100 MiB normalized Buffer during providers.
-    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit } };
+    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), ...(input.repairPreparation ? { repairPreparation: input.repairPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit } };
   }
 
   _auditResinSlicingSource(bytes) {
@@ -817,10 +885,20 @@ class QuickPrintService extends EventEmitter {
   async _resinGeometryInput(job) {
     const source = await this._readResinGeometrySource(job), format = path.extname(job.fileName).slice(1).toLowerCase();
     if (!['step', 'stp'].includes(format)) {
+      if (job.resinCad) throw error(409, 'Mesh-only sources cannot carry unrelated CAD preparation.', 'RESIN_CAD_CHANGED');
       const unitScale = { mm: 1, in: 25.4, m: 1000 }[job.order.units];
       if (!unitScale) throw error(400, 'Resolve the model units before slicing.', 'RESIN_MODEL_UNITS');
+      if (job.resinRepair) {
+        const { operatorReview, ...record } = job.resinRepair;
+        if (!['stl', 'obj'].includes(format) || operatorReview?.exactRepair !== true || operatorReview.ticketUnits !== job.order.units || operatorReview.coordinateUnits !== 'mm') throw error(409, 'Exact mesh repair requires its declared-unit operator review.', 'RESIN_REPAIR_CHANGED');
+        const directory = await this._resinRepairDirectory(job);
+        const checked = await require('../slicing/resin-repair').verifyResinRepairGeometry(record, { source, format, units: job.order.units, directory });
+        return { source: checked.bytes, format: 'stl', inputPath: record.filePath, units: 'mm', unitScale: 1, engineSourceSha256: record.sha256,
+          repairPreparation: { schemaVersion: 1, method: record.method, sourceSha256: job.sha256, meshSha256: record.sha256, normalizedSourceSha256: record.normalizedSource.sha256, normalizationSha256: record.normalizationPlan.sizingSha256, proofSha256: record.proofSha256, reportSha256: record.reportSha256, repairToolSha256: record.tool.executableSha256 } };
+      }
       return { source, format, inputPath: job.inputPath, units: job.order.units, unitScale, engineSourceSha256: job.sha256 };
     }
+    if (job.resinRepair) throw error(409, 'STEP sources cannot carry unrelated mesh repair preparation.', 'RESIN_REPAIR_CHANGED');
     if (!job.resinCad || job.resinCad.operatorReview?.embeddedUnits !== true) throw error(409, 'Audit and convert this STEP model before measuring or slicing its geometry.', 'RESIN_CAD_REQUIRED');
     const directory = await this._resinCadDirectory(job);
     await require('../slicing/resin-cad').verifyResinCadGeometry(job.resinCad, { source, directory });
@@ -835,10 +913,16 @@ class QuickPrintService extends EventEmitter {
     return { ...rawTool, executableSha256: digest(JSON.stringify({ engineSha256: rawTool.executableSha256, cadToolSha256: cad.cadToolSha256, tolerance: cad.tolerance })) };
   }
 
+  _resinRepairSliceTool(rawTool, repair) {
+    if (!SHA256.test(rawTool?.executableSha256 || '') || !SHA256.test(repair?.repairToolSha256 || '') || repair.method !== 'normalized-exact-mesh-repair-v1') throw error(409, 'Exact repair and slicing provider fingerprints are required.', 'RESIN_REPAIR_CHANGED');
+    return { ...rawTool, executableSha256: digest(JSON.stringify({ engineSha256: rawTool.executableSha256, repairToolSha256: repair.repairToolSha256, method: repair.method })) };
+  }
+
   async inspectResinGeometry(id) {
     return this._withLocks([`job:${id}`], async () => {
       const job = this._job(id), input = await this._resinGeometryInput(job);
       const measured = require('../slicing/resin-geometry').measureResinGeometry(input.source, { format: input.format, units: input.units });
+      if (input.repairPreparation) return Object.freeze({ ...measured, sourceSha256: job.sha256, geometrySha256: input.engineSourceSha256, repaired: true, ticketUnits: job.order.units, repairPreparation: input.repairPreparation, repairSummary: clone(job.resinRepair.summary) });
       return input.cadPreparation ? Object.freeze({ ...measured, sourceSha256: job.sha256, geometrySha256: input.engineSourceSha256, embeddedUnits: true, ticketUnits: job.order.units, cadPreparation: input.cadPreparation }) : measured;
     });
   }
@@ -901,8 +985,12 @@ class QuickPrintService extends EventEmitter {
 
   async _verifyResinSizingEvidence(job, slice, options = {}) {
     const isCad = /\.(step|stp)$/i.test(job.fileName);
+    const isRepair = !isCad && Boolean(job.resinRepair);
+    if (!isCad && (slice.cadPreparation || slice.meshSourceSha256 || slice.rawSliceTool)) throw error(409, 'Mesh-only slices cannot carry unrelated CAD evidence.', 'RESIN_CAD_CHANGED');
+    if (!isRepair && (slice.repairPreparation || slice.repairedSourceSha256 || slice.repairSliceTool || slice.operatorReview?.exactRepair)) throw error(409, 'This source cannot carry unrelated exact mesh repair evidence.', 'RESIN_REPAIR_CHANGED');
     if (!slice.sizingPlan) {
       if (isCad) throw error(409, 'STEP resin slices require source-bound CAD and sizing evidence.', 'RESIN_CAD_REQUIRED');
+      if (isRepair) throw error(409, 'Repaired resin slices require source-bound exact repair and sizing evidence.', 'RESIN_REPAIR_REQUIRED');
       if (slice.platePreparation || slice.operatorReview?.plate || slice.modelCopiesPerRun > 1) throw error(409, 'Packed slices require normalized source sizing evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
       if (slice.operatorReview?.confirmedOriginalSize !== true || (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original')) throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
       await this._expectedResinGeometry(job, { mode: 'original' });
@@ -911,7 +999,7 @@ class QuickPrintService extends EventEmitter {
     if (slice.operatorReview?.confirmedSizing !== true) throw error(409, 'Confirm the exact geometry sizing plan before production.', 'RESIN_SIZING_UNQUALIFIED');
     const expected = await this._expectedResinGeometry(job, slice.operatorReview.sizing);
     if (isCad && (slice.sourceSha256 !== job.sha256 || slice.meshSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.embeddedUnits !== true || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.cadPreparation, expected.cadPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinCadSliceTool(slice.rawSliceTool, expected.cadPreparation)))) throw error(409, 'CAD source, conversion, slicing provider or reviewed units changed.', 'RESIN_CAD_CHANGED');
-    if (!isCad && (slice.cadPreparation || slice.meshSourceSha256 || slice.rawSliceTool)) throw error(409, 'Mesh-only slices cannot carry unrelated CAD evidence.', 'RESIN_CAD_CHANGED');
+    if (isRepair && (slice.sourceSha256 !== job.sha256 || slice.repairedSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.exactRepair !== true || slice.operatorReview.ticketUnits !== job.order.units || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.repairPreparation, expected.repairPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinRepairSliceTool(slice.repairSliceTool, expected.repairPreparation)))) throw error(409, 'Original source, exact repair, slicing provider or reviewed units changed.', 'RESIN_REPAIR_CHANGED');
     await this._verifyResinInputGeometry(job, slice, expected);
     await this._verifyResinPlateEvidence(job,slice,options);
   }
@@ -924,6 +1012,16 @@ class QuickPrintService extends EventEmitter {
       await this._verifyResinSizingEvidence(job, job.resinSlice,{ artifactBytes: bytes });
       if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Slice this ticket again.', 'ORIGINAL_CHANGED');
       return { filePath: job.resinSlice.filePath, fileName: 'prepared-unqualified.goo', sha256: job.resinSlice.sha256, bytes: job.resinSlice.bytes };
+    });
+  }
+
+  async getResinRepairDownload(id) {
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (!job.resinRepair) throw error(409, 'No explicitly repaired mesh is available.', 'RESIN_REPAIR_REQUIRED');
+      const input = await this._resinGeometryInput(job);
+      if (!input.repairPreparation) throw error(409, 'This source has no verified exact mesh repair.', 'RESIN_REPAIR_REQUIRED');
+      return { filePath: input.inputPath, fileName: 'repaired-unqualified.stl', sha256: input.engineSourceSha256, bytes: input.source.length };
     });
   }
 
