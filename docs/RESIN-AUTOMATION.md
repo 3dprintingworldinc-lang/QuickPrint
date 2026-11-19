@@ -175,6 +175,11 @@ See [SatelLite deconstruction](SATELLITE-DECONSTRUCTION.md).
 
 ## End-to-end process map
 
+See [exact mesh repair and source preservation](RESIN-MESH-REPAIR.md) for the
+mandatory pre-slice topology gate, its resource bounds and the separate
+face-accounted repair primitive. Native automatic repair cannot establish that
+the submitted geometry survived unchanged.
+
 | Stage | Implemented and observed | Remaining work |
 | --- | --- | --- |
 | Paid intake | Scoped paginated production client; frozen ticket/version identity; private-model hash; deduplication | Live portal deployment/token and actual paid-order verification; larger-model policy |

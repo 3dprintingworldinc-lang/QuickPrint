@@ -803,8 +803,15 @@ class QuickPrintService extends EventEmitter {
   async _expectedResinGeometry(job, sizing) {
     const input = await this._resinGeometryInput(job);
     const prepared = require('../slicing/resin-geometry').prepareResinGeometry(input.source, { format: input.format, units: input.units, sizing });
+    const meshAudit = this._auditResinSlicingSource(prepared.stl);
     // Do not retain the potentially 100 MiB normalized Buffer during providers.
-    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds } };
+    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit } };
+  }
+
+  _auditResinSlicingSource(bytes) {
+    const audit = require('../slicing/resin-mesh').auditResinMesh(bytes, { format: 'stl', units: 'mm' });
+    if (audit.components.some(component => component.winding !== 'positive')) throw error(422, 'Source shells need explicit winding or cavity repair before slicing; native automatic repair cannot establish source preservation.', 'RESIN_MESH_NEGATIVE_COMPONENT');
+    return audit;
   }
 
   async _resinGeometryInput(job) {
@@ -863,7 +870,9 @@ class QuickPrintService extends EventEmitter {
     } finally { await file.close(); }
     const measured = require('../slicing/resin-geometry').measureResinGeometry(bytes, { format: 'stl', units: 'mm' });
     if (measured.triangleCount !== expected.sizingPlan.triangleCount || !same(measured.sourceBounds, anticipated.bounds)) throw error(409, 'The normalized resin input does not match the reviewed bounds.', 'RESIN_INPUT_GEOMETRY_CHANGED');
-    return { filePath: descriptor.filePath, sha256: anticipated.sha256, bytes: anticipated.bytes, bounds: measured.sourceBounds };
+    const meshAudit = this._auditResinSlicingSource(bytes);
+    if (!same(meshAudit, anticipated.meshAudit) || (descriptor.meshAudit !== undefined && !same(descriptor.meshAudit, meshAudit))) throw error(409, 'The normalized source topology no longer matches its independently audited mesh.', 'RESIN_INPUT_GEOMETRY_CHANGED');
+    return { filePath: descriptor.filePath, sha256: anticipated.sha256, bytes: anticipated.bytes, bounds: measured.sourceBounds, meshAudit };
   }
 
   async _loadResinSliceProfile(slice) {
@@ -896,6 +905,7 @@ class QuickPrintService extends EventEmitter {
       if (isCad) throw error(409, 'STEP resin slices require source-bound CAD and sizing evidence.', 'RESIN_CAD_REQUIRED');
       if (slice.platePreparation || slice.operatorReview?.plate || slice.modelCopiesPerRun > 1) throw error(409, 'Packed slices require normalized source sizing evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
       if (slice.operatorReview?.confirmedOriginalSize !== true || (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original')) throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
+      await this._expectedResinGeometry(job, { mode: 'original' });
       return;
     }
     if (slice.operatorReview?.confirmedSizing !== true) throw error(409, 'Confirm the exact geometry sizing plan before production.', 'RESIN_SIZING_UNQUALIFIED');
@@ -911,7 +921,7 @@ class QuickPrintService extends EventEmitter {
       const job = this._job(id);
       if (job.technology !== 'resin') throw error(409, 'Select a resin ticket.', 'RESIN_TICKET_REQUIRED');
       const bytes = await this._resinSliceFile(job);
-      if (job.resinSlice.sizingPlan || /\.(step|stp)$/i.test(job.fileName) || job.resinSlice.platePreparation || job.resinSlice.modelCopiesPerRun > 1) await this._verifyResinSizingEvidence(job, job.resinSlice,{ artifactBytes: bytes });
+      await this._verifyResinSizingEvidence(job, job.resinSlice,{ artifactBytes: bytes });
       if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Slice this ticket again.', 'ORIGINAL_CHANGED');
       return { filePath: job.resinSlice.filePath, fileName: 'prepared-unqualified.goo', sha256: job.resinSlice.sha256, bytes: job.resinSlice.bytes };
     });
@@ -953,8 +963,7 @@ class QuickPrintService extends EventEmitter {
     if (!SHA256.test(deviceFingerprint || '') || !receipt || receipt.kind !== 'slice' || !UUID.test(receipt.id || '') || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint || receipt.sourceSha256 !== job.sha256 || receipt.profileSha256 !== slice.profileSha256 || receipt.tool?.executableSha256 !== slice.tool.executableSha256 || receipt.printerId !== slice.printerId || receipt.printerModel !== slice.printerModel || receipt.material !== slice.material || receipt.artifact?.sha256 !== slice.sha256 || receipt.artifact?.sizeBytes !== slice.bytes || receipt.artifact?.format !== 'goo' || receipt.partsPerRun !== copies || receipt.deviceFingerprint !== deviceFingerprint || receipt.printReady !== false) throw error(409, 'The portal receipt does not identify this exact slice, profile, plate count and printer.', 'RESIN_RECEIPT_MISMATCH');
     if (slice.sourceSha256 !== job.sha256 || job.order.modelSha256 !== job.sha256 || digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed after resin preparation.', 'ORIGINAL_CHANGED');
     const bytes = await this._resinSliceFile(job), loaded = await this._loadResinSliceProfile(slice);
-    if (slice.sizingPlan || /\.(step|stp)$/i.test(job.fileName) || slice.platePreparation || copies > 1) await this._verifyResinSizingEvidence(job, slice,{ loaded,artifactBytes: bytes });
-    else if (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original') throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
+    await this._verifyResinSizingEvidence(job, slice,{ loaded,artifactBytes: bytes });
     const module = require('../slicing/resin-engine');
     const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
     module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);

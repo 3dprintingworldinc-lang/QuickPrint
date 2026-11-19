@@ -56,11 +56,11 @@ async function makeSlice(input, { issues = 0 } = {}) {
   return { filePath, fileName: 'prepared.goo', bytes: bytes.length, format: 'goo', modelCopiesPerRun: 1, sizingPlan: prepared.plan, inputGeometry: { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds }, sha256: hash(bytes), sourceSha256: prepared.plan.sourceSha256, profileSha256: loaded.profileSha256, printerId: loaded.profile.printerId, printerModel: loaded.profile.printerModel, material: loaded.profile.material, tool: { name: 'Fixture engine', version: 'test', executableSha256: 'e'.repeat(64) }, inspection: inspectGoo(bytes), analysis: { count: issues, passed: issues === 0, checks: ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'], issues: Array.from({ length: issues }, (_, index) => `Island ${index + 1}`) }, attempts: [], printReady: true, printerCompatible: true };
 }
 
-async function importTicket(service, { units = 'mm', project = {} } = {}) {
+async function importTicket(service, { units = 'mm', project = {}, data = MODEL, fileName = 'source.stl' } = {}) {
   const id = crypto.randomUUID(), portalUrl = 'https://printbylayr.example';
-  const portalJob = { id, reference: `PBL-${id.toUpperCase()}`, version: 5, status: 'preparing', payment: { amountCents: 2000, confirmedAt: '2026-11-19T15:00:00Z' }, ticket: { model: { size: MODEL.length, fileId: 'private-fixture' }, quote: { amountCents: 2000 }, specifications: { file: { name: 'source.stl', format: 'stl', sizeBytes: MODEL.length, units }, project: { name: 'Resin study', quantity: 4, notes: 'Review geometry.', ...project }, production: { printType: 'resin', supports: 'allowed', qualityTier: 'standard', properties: 'standard', colour: 'grey' } } } };
-  const order = buildOrderMetadata(portalJob, portalUrl, MODEL);
-  return (await service.submit({ source: `layr:${portalUrl}`, sourceId: `${id}:${order.ticketFingerprint}`, quantity: 1, order, files: [{ name: 'source.stl', data: MODEL }] })).jobs[0];
+  const portalJob = { id, reference: `PBL-${id.toUpperCase()}`, version: 5, status: 'preparing', payment: { amountCents: 2000, confirmedAt: '2026-11-19T15:00:00Z' }, ticket: { model: { size: data.length, fileId: 'private-fixture' }, quote: { amountCents: 2000 }, specifications: { file: { name: fileName, format: path.extname(fileName).slice(1).toLowerCase(), sizeBytes: data.length, units }, project: { name: 'Resin study', quantity: 4, notes: 'Review geometry.', ...project }, production: { printType: 'resin', supports: 'allowed', qualityTier: 'standard', properties: 'standard', colour: 'grey' } } } };
+  const order = buildOrderMetadata(portalJob, portalUrl, data);
+  return (await service.submit({ source: `layr:${portalUrl}`, sourceId: `${id}:${order.ticketFingerprint}`, quantity: 1, order, files: [{ name: fileName, data }] })).jobs[0];
 }
 
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }

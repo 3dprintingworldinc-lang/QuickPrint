@@ -217,9 +217,9 @@ current `reference-raster-replication-v1` method:
 
 Observed final GOO SHA-256 values:
 
-- Supported three-copy cube: `a091ab5e2e2ab4e98179d2c08b24ed47e8190a0bf21ca2cf1bcd464b13da4a39`.
-- Supports/pad-off 20-copy cube: `2e5dba75f9371db1346cb637a1249bf40067c09e6889124373466eb7de8ec8d7`.
-- CAD/service 20-copy cylinder: `ab8ed3a0ab08fba5517e388fa77905ba288838d75f9b83d2736a54d2af4b18c0`.
+- Supported three-copy cube: `f3a7bfdf5f8b313fc95354724e626153bee97e6a6aa5511ac3929aaf4b4f54aa`.
+- Supports/pad-off 20-copy cube: `1903d443a6d7045dc0bbbba2136d2c9a91ec4b81127e45524486d6c6706a8142`.
+- CAD/service 20-copy cylinder: `5c3c632c1fec1c3a132d2709d38b29c1f54e4ad5017d5b768a9dc2c7962bef39`.
 - 16K thin 20-copy plate: `b20f77940e451abb013a42f189eaecefccc8576825af918a0ac899e1e02f2f22`.
 
 Local reports are `artifacts/resin-packed-engine-verification/native-summary.json`

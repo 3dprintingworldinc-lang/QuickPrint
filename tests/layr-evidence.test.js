@@ -14,7 +14,7 @@ const { inspectGoo } = require('../src/slicing/goo');
 
 const PORTAL = 'https://printbylayr.example';
 const TOKEN = 'p'.repeat(43);
-const MODEL = Buffer.from('solid source\nendsolid source\n');
+const { MODEL } = require('./helpers/resin-slice');
 const hash = data => createHash('sha256').update(data).digest('hex');
 function gate() { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; }
 
@@ -80,6 +80,7 @@ async function fixture(t, { autoSync = false, config = {}, loseResponse = false 
     tool: { name: 'PrusaSlicer + UVtools', version: '2.9.7 + 4.4.3', executableSha256: 'd'.repeat(64),
       binaryManifest: [{ name: 'private-binary', path: 'C:/private/install/UVtools.Core.dll', sha256: 'e'.repeat(64) }], executablePath: 'C:/private/install/slicer.exe' },
     analysis: { count: 0, passed: true, issues: [] }, inspection: inspectGoo(bytes), status: 'sliced_pending_qualification', printReady: false, printerCompatible: false,
+    operatorReview: { confirmedRequirements: true, confirmedOriginalSize: true, ticketFingerprint: order.ticketFingerprint },
   };
   await service._mutate(() => { service._job(local.id).resinSlice = structuredClone(slice); });
   const portal = { version: frozen.version, status: 'preparing', operations: new Map(), calls: [], writes: [], downloads: 0, loseResponse,

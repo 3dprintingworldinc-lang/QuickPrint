@@ -8,6 +8,7 @@ const crypto = require('node:crypto');
 const { runProcess } = require('./index');
 const { inspectZip, readZipEntry } = require('./psam/zip-inspection');
 const { prepareResinGeometry, measureResinGeometry, measureResinOrientation, float32Tolerance } = require('./resin-geometry');
+const { auditResinMesh } = require('./resin-mesh');
 
 const MAX_BYTES = 512 * 1024 * 1024;
 const MAX_MODEL_BYTES = 100 * 1024 * 1024;
@@ -190,6 +191,10 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   const original = await fs.readFile(inputPath);
   if (!original.length || original.length > MAX_MODEL_BYTES) throw fail('Resin models must be nonempty and at most 100 MiB.', 'RESIN_MODEL_SIZE');
   const prepared = prepareResinGeometry(original, { format: path.extname(inputPath).slice(1).toLowerCase(), units: { 1: 'mm', 25.4: 'in', 1000: 'm' }[unitScale], sizing, limits: { maxBytes: MAX_MODEL_BYTES } });
+  // Reject geometry that a native importer could silently repair or discard.
+  // This bounded topology audit does not certify intersections or cavities.
+  const meshAudit = auditResinMesh(prepared.stl, { format: 'stl', units: 'mm' });
+  if (meshAudit.components.some(component => component.winding !== 'positive')) throw fail('Negative-winding mesh shells require an explicit reviewed repair before resin slicing.', 'RESIN_MESH_NEGATIVE_COMPONENT', 422);
   const loaded = await loadProfile(profilePath);
   const { profile, profileSha256 } = loaded;
   const targetGeometry = { ...profile.expected, machineZMm: Number(loaded.ini.max_print_height) };
@@ -208,6 +213,7 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
     ['quickprint-resin-engine', __filename], ['quickprint-goo-validator', path.join(__dirname, 'goo.js')],
     ['quickprint-resin-profiles', path.join(__dirname, 'resin-profiles.js')],
     ['quickprint-resin-geometry', path.join(__dirname, 'resin-geometry.js')],
+    ['quickprint-resin-mesh-audit', path.join(__dirname, 'resin-mesh.js')],
     ['quickprint-resin-plate-geometry', path.join(__dirname, 'resin-plate.js')],
     ['quickprint-resin-plate-engine', path.join(__dirname, 'resin-plate-engine.js')],
     ['quickprint-goo-plate-proof', path.join(__dirname, 'goo-plate.js')],
@@ -224,7 +230,7 @@ async function prepareResin({ inputPath, outputDir, profilePath, prusaExecutable
   await fs.writeFile(sourceCopy, original, { flag: 'wx' });
   await fs.writeFile(preparedInput, prepared.stl, { flag: 'wx' });
   await fs.writeFile(presetCopy, loaded.preset, { flag: 'wx' });
-  const inputGeometry = { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds };
+  const inputGeometry = { filePath: preparedInput, sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit };
   const inspectAnalyze = async (gooPath, directory, { expectedSha256, expectedLayerCount } = {}) => {
     signal?.throwIfAborted();
     const info = await fs.lstat(gooPath);

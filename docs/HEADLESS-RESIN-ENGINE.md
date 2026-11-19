@@ -108,6 +108,14 @@ the known firmware/profile geometry conflict and physical qualification remain.
 
 ## Pipeline and selection behavior
 
+Before invoking any native provider, the engine audits the normalized source's
+closed, consistently wound edge/vertex-manifold topology and requires positive
+components. The service independently repeats this gate and rechecks captured
+evidence at download and dispatch. The topology bound is 250,000 triangles and
+vertices, stricter than measurement's two-million-triangle bound. See
+[source preservation and exact repair](RESIN-MESH-REPAIR.md). This does not
+classify cavities or certify self-intersections.
+
 1. Read and hash the original STL/OBJ, JSON profile and standalone INI. Copy the
    original and preset into a new work directory; never overwrite the original.
    Measure the source, apply its explicit unit conversion/uniform sizing and one

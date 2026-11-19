@@ -164,3 +164,29 @@ test('geometry HTTP read requires authentication, returns measurements only and 
   assert.ok(!JSON.stringify(value).includes(f.dataDir)); assert.equal(f.calls.length, 0);
   await fs.appendFile(job.inputPath, 'changed'); const changed = await fetch(f.app.url + route, { headers }); assert.equal(changed.status, 409); assert.equal((await changed.json()).error, 'ORIGINAL_CHANGED');
 });
+
+test('an isolated source facet cannot be silently discarded by a native slicer before capture', async t => {
+  const f = await fixture(t);
+  const extra = 'facet normal 0 0 1\nouter loop\nvertex 10 10 10\nvertex 11 10 10\nvertex 10 11 10\nendloop\nendfacet\n';
+  const data = Buffer.from(MODEL.toString().replace(/endsolid/, extra + 'endsolid'));
+  const job = await f.imported({ data });
+  const measured = await f.service.inspectResinGeometry(job.id);
+  assert.equal(measured.triangleCount, 13, 'measurement preserves the complete submitted geometry');
+  await assert.rejects(f.service.sliceResinJob(job.id, CONFIRMED), { code: 'RESIN_MESH_OPEN' });
+  assert.equal(f.calls.length, 0, 'source audit must fail before a native or injected slicing provider runs');
+  assert.equal(f.service.getJob(job.id).resinSlice, undefined);
+  assert.deepEqual(await fs.readFile(job.inputPath), data);
+});
+
+test('source topology evidence is independently captured and rechecked on download and dispatch', async t => {
+  const f = await fixture(t), job = await f.imported();
+  await f.service.sliceResinJob(job.id, CONFIRMED);
+  let current = f.service.getJob(job.id);
+  assert.equal(current.resinSlice.inputGeometry.meshAudit.topology.closed, true);
+  assert.equal(current.resinSlice.inputGeometry.meshAudit.triangleCount, 12);
+  const captured = receipt(current);
+  await f.service._mutate(() => { const geometry = f.service._job(job.id).resinSlice.inputGeometry; geometry.meshAudit = structuredClone(geometry.meshAudit); geometry.meshAudit.triangleCount--; });
+  await assert.rejects(f.service.getResinSliceDownload(job.id), { code: 'RESIN_INPUT_GEOMETRY_CHANGED' });
+  current = f.service.getJob(job.id);
+  await assert.rejects(f.service._resinDispatchBindings(current, captured, captured.deviceFingerprint), { code: 'RESIN_INPUT_GEOMETRY_CHANGED' });
+});

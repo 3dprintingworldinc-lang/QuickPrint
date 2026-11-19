@@ -251,8 +251,63 @@ test('orientation search stops at first issue-free artifact and preserves source
   assert.equal(result.sizingPlan.sourceSha256, sha(f.original));
   assert.deepEqual(result.sizingPlan.dimensionsMm, { x: 3, y: 3, z: 3 });
   assert.deepEqual(evidence.inputGeometry, result.inputGeometry);
+  assert.equal(result.inputGeometry.meshAudit.sourceSha256, result.inputGeometry.sha256);
+  assert.deepEqual(result.inputGeometry.meshAudit.topology, { closed: true, edgeManifold: true, vertexManifold: true, consistentlyOriented: true });
+  assert.equal(result.inputGeometry.meshAudit.solidCertified, false);
+  assert.equal(result.inputGeometry.meshAudit.intersectionStatus, 'not_checked');
+  assert.equal(result.inputGeometry.meshAudit.cavityStatus, 'not_classified');
   assert.deepEqual(evidence.sizingPlan, result.sizingPlan);
   assert.ok(result.tool.binaryManifest.some(item => item.name === 'quickprint-resin-geometry'));
+  assert.ok(result.tool.binaryManifest.some(item => item.name === 'quickprint-resin-mesh-audit'));
+});
+
+test('input topology is audited before any native call and never silently repaired', async t => {
+  const f = await fixture(t);
+  const base = prepareResinGeometry(f.original, { format: 'stl', units: 'mm', sizing: { mode: 'original' } }).stl;
+  const withRecords = records => {
+    const header = Buffer.from(base.subarray(0, 84)); header.writeUInt32LE(records.length, 80);
+    return Buffer.concat([header, ...records]);
+  };
+  const records = Array.from({ length: 12 }, (_, index) => Buffer.from(base.subarray(84 + index * 50, 134 + index * 50)));
+  const reverse = record => {
+    const result = Buffer.from(record), first = Buffer.from(record.subarray(12, 24));
+    record.subarray(24, 36).copy(result, 12); first.copy(result, 24);
+    return result;
+  };
+  const isolated = Buffer.alloc(50);
+  [[6, 6, 6], [7, 6, 6], [6, 7, 6]].flat().forEach((value, index) => isolated.writeFloatLE(value, 12 + index * 4));
+  const oversized = Buffer.alloc(84 + 250001 * 50); base.copy(oversized, 0, 0, 84); oversized.writeUInt32LE(250001, 80);
+  for (let index = 0; index < 250001; index++) records[index % 12].copy(oversized, 84 + index * 50);
+  for (const [name, bytes, code] of [
+    ['isolated facet', withRecords([...records, isolated]), 'RESIN_MESH_OPEN'],
+    ['reversed face', withRecords(records.map((record, index) => index ? record : reverse(record))), 'RESIN_MESH_WINDING'],
+    ['duplicate face', withRecords([...records, records[0]]), 'RESIN_MESH_DUPLICATE_FACE'],
+    ['inward shell', withRecords(records.map(reverse)), 'RESIN_MESH_NEGATIVE_COMPONENT'],
+    ['audit bound', oversized, 'RESIN_MESH_LIMIT'],
+  ]) {
+    await fs.writeFile(f.options.inputPath, bytes);
+    const mock = provider();
+    await assert.rejects(prepareResin(f.options, mock), { code }, name);
+    assert.equal(mock.calls.length, 0, `${name} must be held before native version detection or slicing`);
+    assert.deepEqual(await fs.readFile(f.options.inputPath), bytes);
+  }
+});
+
+test('separate positive closed shells retain explicit uncertified cavity status', async t => {
+  const f = await fixture(t);
+  const base = prepareResinGeometry(f.original, { format: 'stl', units: 'mm', sizing: { mode: 'original' } }).stl;
+  const shifted = Buffer.from(base.subarray(84));
+  for (let triangle = 0; triangle < 12; triangle++) for (let point = 0; point < 3; point++) {
+    const offset = triangle * 50 + 12 + point * 12;
+    shifted.writeFloatLE(shifted.readFloatLE(offset) + 6, offset);
+  }
+  const combined = Buffer.concat([base, shifted]); combined.writeUInt32LE(24, 80);
+  await fs.writeFile(f.options.inputPath, combined);
+  const result = await prepareResin(f.options, provider());
+  assert.equal(result.inputGeometry.meshAudit.componentCount, 2);
+  assert.equal(result.inputGeometry.meshAudit.cavityReviewRequired, true);
+  assert.equal(result.inputGeometry.meshAudit.cavityStatus, 'not_classified');
+  assert.equal(result.inputGeometry.meshAudit.solidCertified, false);
 });
 
 test('all failing orientations remain analysis_failed and select the fewest reported issues', async t => {
