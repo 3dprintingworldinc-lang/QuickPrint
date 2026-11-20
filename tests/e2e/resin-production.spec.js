@@ -302,13 +302,65 @@ test('two resin units require separate physical confirmations and counted runs, 
   expect(await fs.readFile(workspace.service.getJob(workspace.job.id).inputPath)).toEqual(MODEL);
   expect(workspace.remote.totals.printedParts).toBe(2); expect(errors).toEqual([]);
   } catch (error) {
-    const current = workspace.service.getJob(workspace.job.id), run = current.runs.find(value => value.id === current.currentRunId) || current.runs.at(-1);
-    const diagnostic = { pageErrors: errors.slice(-4).map(message => message.slice(0, 512)), job: { status: current.status, currentRunId: current.currentRunId || null, acceptedQuantity: current.acceptedQuantity, printedParts: current.resinProduction?.printedParts, remainingParts: current.resinProduction?.remainingParts }, run: run ? { phase: run.phase, outcome: run.outcome, plannedParts: run.plannedParts, printedParts: run.printedParts, resolved: Boolean(run.resolvedAt), terminalOutcome: run.terminalEvidence?.outcome } : null };
-    const body = JSON.stringify(diagnostic, null, 2);
-    console.error('Bounded resin production failure state:', body);
-    await testInfo.attach('resin-production-failure-state', { body: Buffer.from(body), contentType: 'application/json' });
+    let body = JSON.stringify({ pageErrors: errors.slice(-4).map(message => message.slice(0, 512)), jobStateUnavailable: true });
+    try {
+      const current = workspace.service.getJob(workspace.job.id), run = current.runs.find(value => value.id === current.currentRunId) || current.runs.at(-1);
+      body = JSON.stringify({ pageErrors: errors.slice(-4).map(message => message.slice(0, 512)), job: { status: current.status, currentRunId: current.currentRunId || null, acceptedQuantity: current.acceptedQuantity, printedParts: current.resinProduction?.printedParts, remainingParts: current.resinProduction?.remainingParts }, run: run ? { phase: run.phase, outcome: run.outcome, plannedParts: run.plannedParts, printedParts: run.printedParts, resolved: Boolean(run.resolvedAt), terminalOutcome: run.terminalEvidence?.outcome } : null }, null, 2);
+    } catch { /* Timed-out fixture teardown must not replace the original failure. */ }
+    try { console.error('Bounded resin production failure state:', body); } catch { /* Diagnostics are best effort. */ }
+    try { await testInfo.attach('resin-production-failure-state', { body: Buffer.from(body), contentType: 'application/json' }); } catch { /* Preserve the original failure if attachment storage is unavailable. */ }
     throw error;
   }
+});
+
+test('deferred modal focus preserves edited resin counts and notes and ignores closed or replaced dialogs', async ({ page, workspace }) => {
+  await page.evaluate(() => {
+    const native = window.requestAnimationFrame.bind(window), queued = [];
+    // Hold only the renderer world's scheduling; Playwright's isolated world
+    // keeps its native animation frames for visibility and stability checks.
+    window.requestAnimationFrame = callback => { queued.push(callback); return queued.length; };
+    window.modalFocusFixture = { pending: () => queued.length, flushOne: () => queued.shift()?.(performance.now()), flush: () => { while (queued.length) queued.shift()(performance.now()); }, restore: () => { window.requestAnimationFrame = native; } };
+  });
+  try {
+    // A closed dialog's deferred work must not focus a subsequently opened one.
+    await review(page);
+    await expect.poll(() => page.evaluate(() => window.modalFocusFixture.pending())).toBe(1);
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await openJob(page, workspace);
+    expect(await page.evaluate(() => { const before = document.activeElement; window.modalFocusFixture.flushOne(); return document.activeElement === before && !document.querySelector('.modal').contains(document.activeElement); })).toBe(true);
+    await page.evaluate(() => window.modalFocusFixture.flush());
+    await expect(page.locator('[name="confirmedRequirements"]')).toBeFocused(); // Initial autofocus still works.
+
+    // Also replace a dialog directly, without closing it first.
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await openJob(page, workspace);
+    await review(page);
+    expect(await page.evaluate(() => { const before = document.activeElement; window.modalFocusFixture.flushOne(); return document.activeElement === before && !document.querySelector('.modal').contains(document.activeElement); })).toBe(true);
+    await page.evaluate(() => window.modalFocusFixture.flush());
+    await expect(page.locator('[name="confirmedWholeModel"]')).toBeFocused();
+
+    // Reach the real reconciliation form through the isolated owned adapter.
+    await workspace.api(`/api/jobs/${workspace.job.id}/resin/production/approve`, { confirmedWholeModel: true });
+    await workspace.api('/api/settings', { resinEngine: { dispatchEnabled: true } }, 'PUT');
+    await workspace.api(`/api/jobs/${workspace.job.id}/resin/production/dispatch`, { confirmedReady: true });
+    const run = workspace.service.getJob(workspace.job.id).runs.at(-1);
+    workspace.adapter.telemetry = { state: 'idle', outcome: 'completed', remoteId: run.remoteId, currentFile: run.remotePath, progress: 100 };
+    await workspace.api(`/api/printers/${run.printerId}/test`, {});
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    await openJob(page, workspace);
+    await page.getByRole('button', { name: 'Refresh status', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Record run outcome', exact: true })).toBeVisible();
+    await page.evaluate(() => window.modalFocusFixture.flush());
+    await page.getByRole('button', { name: 'Record run outcome', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Record this resin run', exact: true })).toBeVisible();
+    const count = page.getByLabel('Printed order units from this run (0 or 1)'), notes = page.getByLabel('Operator notes', { exact: true });
+    await count.fill('1'); await notes.fill('Owned count and notes must survive deferred autofocus.');
+    await expect(notes).toBeFocused();
+    await page.evaluate(() => window.modalFocusFixture.flush());
+    await expect(notes).toBeFocused(); await expect(count).toHaveValue('1'); await expect(notes).toHaveValue('Owned count and notes must survive deferred autofocus.');
+    await page.keyboard.insertText(' Keyboard entry remains in notes.');
+    await expect(count).toHaveValue('1'); await expect(notes).toHaveValue('Owned count and notes must survive deferred autofocus. Keyboard entry remains in notes.');
+  } finally { await page.evaluate(() => window.modalFocusFixture?.restore()).catch(() => {}); }
 });
 
 test('a current qualification revocation is visible and cannot approve or start a resin order', async ({ page, workspace }) => {

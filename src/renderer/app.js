@@ -304,7 +304,11 @@
     $('#modal-root').innerHTML = `<div class="modal-backdrop"><section class="modal ${large ? 'large' : ''}" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-subtitle"><header class="modal-header"><div><h2 id="modal-title">${title}</h2><p id="modal-subtitle">${subtitle}</p></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></header><div class="modal-body"><div id="modal-error" class="inline-notice error form-error" role="alert"></div>${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ''}</section></div>`;
     document.body.style.overflow = 'hidden';
     modalBusy = false;
-    requestAnimationFrame(() => ($('#modal-root input:not([type=hidden])') || $('#modal-root select') || $('#modal-root button'))?.focus());
+    const dialog = $('#modal-root .modal');
+    requestAnimationFrame(() => {
+      if (!dialog.isConnected || dialog.contains(document.activeElement)) return;
+      ($('input:not([type=hidden])', dialog) || $('select', dialog) || $('button', dialog))?.focus();
+    });
   }
 
   function closeModal() {
