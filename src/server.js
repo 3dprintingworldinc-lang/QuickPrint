@@ -129,6 +129,13 @@ async function startServer(options = {}) {
   app.get('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.reviewResinTarget(req.params.id)));
   app.post('/api/jobs/:id/resin/production/target', async (req, res) => res.json(await connectors.prepareResinTarget(req.params.id, req.body)));
   app.get('/api/jobs/:id/resin/geometry', async (req, res) => res.json(await service.inspectResinGeometry(req.params.id)));
+  app.post('/api/jobs/:id/resin/geometry/plan', async (req, res) => res.json(await service.planResinGeometry(req.params.id, req.body)));
+  app.post('/api/jobs/:id/resin/hollow/review', async (req, res) => res.json(await service.reviewResinHollowPreparation(req.params.id, req.body)));
+  app.post('/api/jobs/:id/resin/geometry/source', async (req, res) => {
+    const source = await service.getResinGeometrySource(req.params.id, req.body);
+    if (crypto.createHash('sha256').update(source.bytes).digest('hex') !== source.sha256) throw fail('The reviewed source changed before download.', 409, 'RESIN_INPUT_GEOMETRY_CHANGED');
+    res.set('X-QuickPrint-Geometry-Sha256', source.sha256).set('X-QuickPrint-Sizing-Sha256', source.sizingSha256).attachment(source.fileName).type('model/stl').send(source.bytes);
+  });
   app.post('/api/jobs/:id/resin/cad', async (req, res) => res.json(await service.prepareResinCadJob(req.params.id, req.body)));
   app.post('/api/jobs/:id/resin/repair', async (req, res) => res.json(await service.prepareResinRepairJob(req.params.id, req.body)));
   app.get('/api/jobs/:id/resin/repair/download', async (req, res) => {

@@ -117,7 +117,7 @@ async function implementation(options) {
     bodyReferenceAudit: { sha256: body.sha256, disposition: body.disposition, wallPolicyResolved: body.wallPolicyResolved, nativeInvocationAttested: false },
     tool, native: { provider, ...Object.fromEntries(Object.entries({ solid, hollow, final }).map(([name, item]) => [name, { sha256: item.sha256, input3mfSha256: hash(item.input3mf), effectivePresetSha256: hash(item.effectivePreset), definitionsSha256: scans[name].definitionsSha256 }])) },
     targetProperties, alignment: { placement, modelElevationMm: support.geometry.modelElevationMm, frame, crop, completeFinalMaterial: true, maskedFinalMaterial: false, nativeLayerCount: metadata.layerCount },
-    policy: body.policy, uncertainty: body.uncertainty, limits: { reference: referenceLimits, scan: { ...RESIN_HOLLOW_RASTER_LIMITS, ...scanLimits }, grid: { ...RESIN_HOLLOW_FINAL_GRID_LIMITS, ...gridLimits }, timeoutMs },
+    policy: body.policy, uncertainty: body.uncertainty, limits: { reference: referenceLimits, scan: { ...RESIN_HOLLOW_RASTER_LIMITS, ...scanLimits }, grid: { ...RESIN_HOLLOW_FINAL_GRID_LIMITS, maxTimeMs: 60000, ...gridLimits }, timeoutMs },
     disposition: gridAudit.disposition, gridAudit, nativeInvocationAttested: false, functionalVoidClearanceCertified: false, geometricWallCertification: false, physicalDrainageCertification: false, productionEligible: false,
     resources: { elapsedMs: Math.ceil(performance.now() - started), scans: Object.fromEntries(Object.entries(scans).map(([name, item]) => [name, item.stats])), grids: Object.fromEntries(Object.entries(grids).map(([name, item]) => [name, item.stats])) } };
   record.sha256 = digest(semantic(record)); check(); return freeze(record);

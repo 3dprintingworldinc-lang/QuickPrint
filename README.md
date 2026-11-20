@@ -103,6 +103,7 @@ See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
 [qualified production steps](docs/RESIN-PRODUCTION.md),
 [headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
 [verified multi-copy plates](docs/RESIN-PLATES.md),
+[controlled hollow preparation](docs/RESIN-HOLLOW-WORKFLOW.md),
 [model sizing](docs/RESIN-SIZING.md),
 [STEP geometry preparation](docs/RESIN-CAD.md),
 [SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and

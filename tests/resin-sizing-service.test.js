@@ -165,6 +165,25 @@ test('geometry HTTP read requires authentication, returns measurements only and 
   await fs.appendFile(job.inputPath, 'changed'); const changed = await fetch(f.app.url + route, { headers }); assert.equal(changed.status, 409); assert.equal((await changed.json()).error, 'ORIGINAL_CHANGED');
 });
 
+test('sized geometry review and exact source download bind the coordinates used by drain/contact automation without slicing', async t => {
+  const f = await fixture(t), job = await f.imported({ units: 'in' }), before = await fs.readFile(path.join(f.dataDir, 'state.json'));
+  const sizing = { mode: 'dimension', axis: 'z', millimeters: 10 }, plan = await f.service.planResinGeometry(job.id, { sizing }), artifact = await f.service.getResinGeometrySource(job.id, { sizing });
+  assert.equal(plan.sourceSha256, job.sha256); assert.equal(plan.engineSourceSha256, job.sha256); assert.equal(plan.coordinateUnits, 'mm'); assert.equal(plan.triangleCount, 12); assert.deepEqual(plan.dimensionsMm, { x: 10, y: 10, z: 10 });
+  assert.equal(hash(artifact.bytes), plan.geometrySha256); assert.equal(artifact.sha256, plan.geometrySha256); assert.equal(artifact.sizingSha256, plan.sizingSha256); assert.equal(plan.meshAudit.sourceSha256, artifact.sha256);
+  assert.deepEqual(measureResinGeometry(artifact.bytes, { format: 'stl', units: 'mm' }).sourceDimensionsMm, plan.dimensionsMm);
+  assert.deepEqual(await fs.readFile(path.join(f.dataDir, 'state.json')), before); assert.deepEqual(await fs.readFile(job.inputPath), MODEL); assert.equal(f.calls.length, 0); assert.ok(!JSON.stringify(plan).includes(f.dataDir));
+  const resized = await f.service.planResinGeometry(job.id, { sizing: { mode: 'dimension', axis: 'z', millimeters: 11 } }); assert.notEqual(resized.geometrySha256, plan.geometrySha256); assert.notEqual(resized.sizingSha256, plan.sizingSha256);
+  for (const request of [{ inputPath: job.inputPath }, { sizing: null }, { sizing: { mode: 'scale', factor: 0 } }]) { await assert.rejects(f.service.planResinGeometry(job.id, request), { code: 'RESIN_SIZING_INVALID' }); await assert.rejects(f.service.getResinGeometrySource(job.id, request), { code: 'RESIN_SIZING_INVALID' }); }
+});
+
+test('authenticated geometry planning endpoints deliver matching hashes and exact reviewed STL while rejecting stale originals', async t => {
+  const f = await fixture(t, makeSlice, { http: true }), job = await f.imported(), base = f.app.url + `/api/jobs/${job.id}/resin/geometry`, body = JSON.stringify({ sizing: { mode: 'scale', factor: 2 } });
+  assert.equal((await fetch(base + '/plan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })).status, 401);
+  const headers = { Authorization: `Bearer ${f.app.token}`, 'Content-Type': 'application/json' }, planned = await fetch(base + '/plan', { method: 'POST', headers, body }); assert.equal(planned.status, 200); const value = await planned.json();
+  const download = await fetch(base + '/source', { method: 'POST', headers, body }); assert.equal(download.status, 200); const bytes = Buffer.from(await download.arrayBuffer()); assert.equal(hash(bytes), value.geometrySha256); assert.equal(download.headers.get('X-QuickPrint-Geometry-Sha256'), value.geometrySha256); assert.equal(download.headers.get('X-QuickPrint-Sizing-Sha256'), value.sizingSha256); assert.match(download.headers.get('Content-Disposition'), /reviewed-sized-source\.stl/);
+  await fs.appendFile(job.inputPath, 'changed'); assert.equal((await fetch(base + '/plan', { method: 'POST', headers, body })).status, 409); assert.equal((await fetch(base + '/source', { method: 'POST', headers, body })).status, 409); assert.equal(f.calls.length, 0);
+});
+
 test('an isolated source facet cannot be silently discarded by a native slicer before capture', async t => {
   const f = await fixture(t);
   const extra = 'facet normal 0 0 1\nouter loop\nvertex 10 10 10\nvertex 11 10 10\nvertex 10 11 10\nendloop\nendfacet\n';

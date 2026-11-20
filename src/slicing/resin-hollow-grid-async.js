@@ -34,7 +34,7 @@ function transferInput(input){
   const signal=input.signal;
   if(signal!==undefined&&!(signal instanceof AbortSignal))throw fail('Use a native AbortSignal.');
   if(signal?.aborted)throw aborted();
-  let limits={...CAPS};
+  let limits={...CAPS,maxTimeMs:60000};
   if(input.limits!==undefined){if(!plain(input.limits)||Reflect.ownKeys(input.limits).some(key=>!Object.hasOwn(CAPS,key)))throw fail('Grid limits contain an unsupported key.','RESIN_HOLLOW_GRID_LIMITS');for(const[key,value]of Object.entries(input.limits))if(!Number.isSafeInteger(value)||value<1||value>CAPS[key])throw fail('Grid limits may only lower positive whole-number hard bounds.','RESIN_HOLLOW_GRID_LIMITS');limits={...limits,...input.limits};}
   exact(input.frame,['nx','ny','nz','pitchMm','originMm','direction'],'Grid frame');
   const frame={nx:input.frame.nx,ny:input.frame.ny,nz:input.frame.nz,pitchMm:vector(input.frame.pitchMm,1e-9,10000),originMm:vector(input.frame.originMm,-1000000,1000000),direction:vector(input.frame.direction,-1,1)};

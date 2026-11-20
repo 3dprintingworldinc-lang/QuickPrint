@@ -18,7 +18,7 @@ function validate(input) {
   if (!plain(input) || Reflect.ownKeys(input).some(key => !['solidBody', 'hollowBody', 'final', 'frame', 'wallThicknessMm', 'uncertaintyMm', 'drains', 'supportEnvelope', 'supportRegions', 'boundaryPolicy', 'limits', 'signal'].includes(key))) throw fail('Supply only the declared final-material audit fields.');
   const boundaryPolicy = input.boundaryPolicy === undefined ? 'exact-raster' : input.boundaryPolicy;
   if (!['exact-raster', 'voxel-enclosure'].includes(boundaryPolicy)) throw fail('Choose an explicit supported body boundary policy.');
-  const limits = { ...LIMITS };
+  const limits = { ...LIMITS, maxTimeMs: 60000 };
   if (input.limits !== undefined) {
     if (!plain(input.limits) || Reflect.ownKeys(input.limits).some(key => !Object.hasOwn(LIMITS, key))) throw fail('Unsupported final-material limits.', 'RESIN_HOLLOW_FINAL_LIMITS');
     for (const [key, value] of Object.entries(input.limits)) { if (!Number.isSafeInteger(value) || value < 1 || value > LIMITS[key]) throw fail('Limits may only lower positive whole-number hard bounds.', 'RESIN_HOLLOW_FINAL_LIMITS'); limits[key] = value; }

@@ -364,6 +364,10 @@ async function dispatchProduction(manager, id, request = {}) {
   const count = plateParts(slice);
   if ((count > 1 && (expectedReceiptId === undefined || plannedParts === undefined)) || (expectedReceiptId !== undefined && expectedReceiptId !== receiptId) || (plannedParts !== undefined && plannedParts !== count)) throw fail('The approved receipt or plate count changed after review. Refresh the production review before starting.', 'LAYR_PLATE_REVIEW_STALE');
   await processOutbox(manager); await syncRunEvidence(manager, id); await processOutbox(manager);
+  // Rebuild expensive source/hollow proofs before the 30-second portal grant.
+  // Later permit/start checks still rehash current bindings and invalidate any
+  // private verification cache when source, tool, profile or evidence changes.
+  await manager.service.getResinSliceDownload(id);
   const device = await manager.service.inspectResinPrinter(slice.printerId);
   const proof = await authority(manager, id, { receiptId, deviceFingerprint: device.deviceFingerprint });
   const permit = await manager.service.issueResinDispatchPermit(issuer(manager), id, { printerId: slice.printerId, ...proof, deviceFingerprint: device.deviceFingerprint, observedAt: new Date(manager.now()).toISOString(), confirmedWholeModel: true });

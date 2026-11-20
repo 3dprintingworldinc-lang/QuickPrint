@@ -18,6 +18,12 @@ function fixture({sealed=false,solidOnly=false,oneDrain=false,tinyDrain=false}={
 function copy(input){return{...input,frame:structuredClone(input.frame),solid:{lower:input.solid.lower.slice(),upper:input.solid.upper.slice()},hollow:{lower:input.hollow.lower.slice(),upper:input.hollow.upper.slice()},drains:structuredClone(input.drains)};}
 function setHollow(input,x,y,z,lo,hi=lo){const i=index(input.frame,x,y,z);input.hollow.lower[i]=lo;input.hollow.upper[i]=hi;}
 
+test('default deadline stays one minute while an explicit longer bounded budget changes no geometry predicate',()=>{
+  const input=fixture(),normal=auditResinHollowGrid(input),declared=auditResinHollowGrid({...input,limits:{maxTimeMs:180000}});
+  assert.equal(normal.limits.maxTimeMs,60000);assert.equal(declared.limits.maxTimeMs,180000);assert.equal(RESIN_HOLLOW_GRID_LIMITS.maxTimeMs,300000);
+  assert.equal(declared.disposition,normal.disposition);assert.deepEqual(declared.counts,normal.counts);assert.deepEqual(declared.drains,normal.drains);assert.equal(declared.limits.maxOperations,2000000000);assert.equal(declared.limits.maxWorkingBytes,768*1024*1024);
+});
+
 test('source-derived cavity, unchanged outer band and two independent black drain channels conform only to the declared raster band',()=>{
   const input=fixture(),before=copy(input),result=auditResinHollowGrid(input);
   assert.equal(result.disposition,'conforming');assert.deepEqual(result.reasons,[]);assert.ok(result.counts.expectedDeepCavity>0);
@@ -168,7 +174,7 @@ test('strict interval, typed-array, halo, coordinate and drain validation happen
   const base=fixture();for(const change of[i=>{i.solid.lower=new Uint8Array(1);},i=>{i.solid.lower=new Uint8ClampedArray(i.solid.lower.length);},i=>{i.solid.lower=new Uint8Array(new SharedArrayBuffer(i.solid.lower.length));}]){const input=copy(base);change(input);assert.throws(()=>auditResinHollowGrid(input),{code:'RESIN_HOLLOW_GRID_ARRAY'});}
   const bad=copy(base);bad.solid.lower[0]=255;assert.throws(()=>auditResinHollowGrid(bad),{code:'RESIN_HOLLOW_GRID_INTERVAL'});const halo=copy(base);halo.solid.upper[0]=1;assert.throws(()=>auditResinHollowGrid(halo),{code:'RESIN_HOLLOW_GRID_HALO'});
   for(const change of[i=>{i.frame.nx=3.5;},i=>{i.frame.pitchMm.x=NaN;},i=>{i.frame.direction.z=-1;},i=>{i.drains[0].direction.z=.9;},i=>{i.drains[1].id=i.drains[0].id;},i=>{i.extra=1;},i=>{i.drains=[];},i=>{i.boundaryPolicy='automatic';},i=>{i.boundaryPolicy=null;},i=>{i.exteriorSeedPolicy='final';},i=>{i.exteriorSeedPolicy=null;}]){const input=copy(base);change(input);assert.throws(()=>auditResinHollowGrid(input));}
-  for(const limits of[{constructor:1},{toString:1},{[Symbol('unexpected')]:1},{maxVoxels:20000001},{maxOperations:2000000001},{maxTimeMs:60001},{maxWorkingBytes:768*1024*1024+1}])assert.throws(()=>auditResinHollowGrid({...base,limits}),{code:'RESIN_HOLLOW_GRID_LIMITS'});
+  for(const limits of[{constructor:1},{toString:1},{[Symbol('unexpected')]:1},{maxVoxels:20000001},{maxOperations:2000000001},{maxTimeMs:300001},{maxWorkingBytes:768*1024*1024+1}])assert.throws(()=>auditResinHollowGrid({...base,limits}),{code:'RESIN_HOLLOW_GRID_LIMITS'});
 });
 
 test('voxel, dimension, drain, memory, operation, deadline and cancellation budgets fail closed',()=>{

@@ -55,6 +55,7 @@
   let settingsDirty = false;
   let lastPage = null;
   const resinGeometryCache = new Map();
+  const resinHollowReviews = new Map();
   const activeStates = new Set(['preparing', 'dispatching', 'printing', 'paused']);
   const attentionStates = new Set(['needs_attention', 'failed']);
   const statusNames = { review: 'Needs review', preparing: 'Preparing', ready: 'Ready to print', dispatching: 'Starting print', printing: 'Printing', paused: 'Paused', needs_attention: 'Needs attention', completed: 'Completed', cancelled: 'Cancelled', failed: 'Failed', idle: 'Available', offline: 'Offline', error: 'Connection issue', unknown: 'Not checked' };
@@ -421,6 +422,98 @@
     return job.resinSlice?.sizingPlan?.sourceSha256 === job.sha256 ? job.resinSlice.sizingPlan : null;
   }
   const dimensionText = dimensions => ['x', 'y', 'z'].map(axis => Number(dimensions[axis].toPrecision(6))).join(' × ');
+  function resinSizingRequest(form) {
+    const value = name => $('[name="' + name + '"]', form)?.value;
+    return value('resinSizingMode') === 'scale' ? { mode: 'scale', factor: Number(value('resinScaleFactor')) } : value('resinSizingMode') === 'dimension' ? { mode: 'dimension', axis: value('resinDimensionAxis'), millimeters: Number(value('resinDimensionMm')) } : { mode: 'original' };
+  }
+  function hollowReviewEntry(job) {
+    let entry = resinHollowReviews.get(job.id);
+    const source = [job.sha256, job.resinCad?.sha256 || '', job.resinRepair?.sha256 || ''].join(':');
+    if (!entry) {
+      entry = { review: job.resinSlice?.operatorReview?.hollow || null, enabled: false, revision: 0, validated: null, pending: false, error: '', source };
+      resinHollowReviews.set(job.id, entry);
+    } else if (entry.source !== source) {
+      entry.source = source; entry.revision++; entry.validated = null; entry.pending = false;
+    }
+    return entry;
+  }
+  function resinHollowKey(form) {
+    const job = jobById(form.dataset.id), engine = state.settings.resinEngine || {}, slotId = $('[name="profileSlotId"]', form)?.value || '';
+    return JSON.stringify([job.sha256, job.resinCad?.sha256 || '', job.resinRepair?.sha256 || '', form.dataset.geometrySha || '', resinSizingRequest(form), slotId, slotId ? engine.slots?.find(slot => slot.id === slotId)?.profilePath || '' : engine.profilePath || '']);
+  }
+  function parseHollowReview(value) {
+    const object = (item, required, optional = []) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || required.some(key => !Object.hasOwn(item, key)) || Object.keys(item).some(key => ![...required, ...optional].includes(key))) throw new Error('The recipe has missing or unsupported fields. Import a canonical hollow review JSON file.');
+    };
+    if (value && typeof value === 'object' && Object.keys(value).length === 1 && Object.hasOwn(value, 'hollow')) value = value.hollow;
+    object(value, ['geometrySha256', 'profileSha256', 'recipe', 'supportRequest', 'resolutionRequest', 'boundaryPolicy']);
+    if (![value.geometrySha256, value.profileSha256].every(hash => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash))) throw new Error('The recipe must contain its original geometry and profile SHA-256 hashes.');
+    object(value.recipe, ['orientation', 'wallThicknessMm', 'quality', 'closingDistanceMm', 'drains']);
+    const vector = item => object(item, ['x', 'y', 'z']);
+    vector(value.recipe.orientation);
+    if (!Array.isArray(value.recipe.drains) || value.recipe.drains.length > 64) throw new Error('The recipe must contain a bounded drain list.');
+    value.recipe.drains.forEach(drain => { object(drain, ['id', 'startMm', 'direction', 'radiusMm', 'lengthMm']); vector(drain.startMm); vector(drain.direction); });
+    object(value.supportRequest, ['mode', 'clearanceMm', 'points', 'regions']);
+    if (!Array.isArray(value.supportRequest.points) || !Array.isArray(value.supportRequest.regions) || value.supportRequest.points.length + value.supportRequest.regions.length > 512) throw new Error('The recipe must contain bounded support contact and region lists.');
+    value.supportRequest.points.forEach(point => { object(point, ['id', 'sourceFaceIndex', 'positionMm', 'headRadiusMm', 'allowedRadiusMm']); vector(point.positionMm); });
+    value.supportRequest.regions.forEach(region => { object(region, ['id', 'minMm', 'maxMm']); vector(region.minMm); vector(region.maxMm); });
+    object(value.resolutionRequest, ['maximumUncertaintyMm'], ['minimumPitchMm', 'reduction', 'maxCells', 'maxWorkingBytes']);
+    if (value.resolutionRequest.minimumPitchMm) vector(value.resolutionRequest.minimumPitchMm);
+    if (value.resolutionRequest.reduction) vector(value.resolutionRequest.reduction);
+    return value;
+  }
+  function resinHollowSummary(review) {
+    if (!review) return '<p class="field-hint">Import a reviewed recipe bound to this sized source and resin profile.</p>';
+    const vector = value => ['x', 'y', 'z'].map(axis => esc(value?.[axis])).join(', '), recipe = review.recipe, support = review.supportRequest, resolution = review.resolutionRequest;
+    return `<dl class="details-grid"><div><dt>Wall / quality / closing</dt><dd>${esc(recipe.wallThicknessMm)} mm / ${esc(recipe.quality)} / ${esc(recipe.closingDistanceMm)} mm</dd></div><div><dt>Orientation X, Y, Z</dt><dd>${vector(recipe.orientation)}°</dd></div><div><dt>Supports</dt><dd>${esc(support.mode)} · ${support.points.length} contact(s) · ${support.regions.length} prior region(s) · clearance ${esc(support.clearanceMm)} mm</dd></div><div><dt>Boundary policy</dt><dd>${esc(review.boundaryPolicy)}</dd></div><div><dt>Prior resolution policy</dt><dd>Maximum uncertainty ${esc(resolution.maximumUncertaintyMm)} mm${resolution.minimumPitchMm ? ` · minimum pitch ${vector(resolution.minimumPitchMm)} mm` : ''}${resolution.reduction ? ` · reduction ${vector(resolution.reduction)}` : ''}${resolution.maxCells !== undefined ? ` · ${esc(resolution.maxCells)} cells maximum` : ''}${resolution.maxWorkingBytes !== undefined ? ` · ${esc(resolution.maxWorkingBytes)} working bytes maximum` : ''}</dd></div><div><dt>Bound hashes</dt><dd>Geometry ${esc(review.geometrySha256.slice(0, 12))}… · profile ${esc(review.profileSha256.slice(0, 12))}…</dd></div></dl><p class="field-hint">Drain positions and directions are in the sized source’s millimetre coordinate frame.</p>${recipe.drains.map(drain => `<p class="field-hint text-break"><strong>${esc(drain.id)}</strong> · start (${vector(drain.startMm)}) mm · direction (${vector(drain.direction)}) · radius ${esc(drain.radiusMm)} mm · length ${esc(drain.lengthMm)} mm</p>`).join('')}`;
+  }
+  function resinHollowFields(job) {
+    const entry = hollowReviewEntry(job);
+    return `<details class="mt-16" id="resin-hollow-fields"><summary>Optional hollow preparation</summary><p class="field-hint">Digital hollow verification occurs during preparation. Printer, resin and physical qualification remain required.</p><label class="checkbox-field mt-16"><input type="checkbox" name="resinHollowEnabled" ${entry.enabled ? 'checked' : ''}><span>Use this reviewed hollow recipe for preparation</span></label><div class="field mt-16"><label for="resin-hollow-file">Reviewed hollow recipe JSON (maximum 256 KiB)</label><input type="file" id="resin-hollow-file" accept=".json,application/json" style="max-width:100%"><p class="field-hint">Import a canonical hollow review or a JSON object containing only its hollow field. Existing hashes are checked against the selected size and profile.</p></div><div id="resin-hollow-summary">${resinHollowSummary(entry.review)}</div><p id="resin-hollow-status" class="field-hint" role="status"></p><p id="resin-hollow-error" class="field-hint error" role="alert"></p><div class="button-row mt-16"><button type="button" class="button small" data-action="validate-resin-hollow" data-id="${attr(job.id)}">Validate recipe</button><button type="button" class="button small" data-action="download-resin-geometry-source" data-id="${attr(job.id)}">Download sized source STL</button></div><label class="checkbox-field mt-16"><input type="checkbox" name="confirmedHollowPreparation" disabled><span>I reviewed the validated hollow dimensions, drain directions, support policy and resolution limits for this exact size and resin profile.</span></label></details>`;
+  }
+  function updateResinHollowState(form, { invalidate = false } = {}) {
+    if (!form?.isConnected || !$('#resin-hollow-fields', form)) return;
+    const entry = hollowReviewEntry(jobById(form.dataset.id)), key = resinHollowKey(form), confirmation = $('[name="confirmedHollowPreparation"]', form);
+    if (invalidate || (entry.validated && entry.validated.key !== key)) {
+      entry.revision++; entry.validated = null; entry.pending = false; confirmation.checked = false;
+    }
+    const valid = entry.validated?.key === key;
+    if (!valid || !entry.enabled) confirmation.checked = false;
+    confirmation.disabled = !entry.enabled || !valid || modalBusy; confirmation.required = entry.enabled && valid;
+    $('#resin-hollow-status', form).textContent = entry.pending ? 'Checking the recipe against the current sized source and profile…' : valid ? 'Recipe validated for the current size and resin profile. Review and confirm before slicing.' : entry.review ? 'Recipe requires validation for the current size and resin profile.' : 'No hollow recipe imported.';
+    $('#resin-hollow-error', form).textContent = entry.error;
+    $('[data-action="validate-resin-hollow"]', form).disabled = modalBusy || entry.pending || !entry.enabled || !entry.review;
+    $('button[type="submit"]', form).disabled = modalBusy || form.dataset.resinConfigured !== 'true' || (entry.enabled && !valid);
+  }
+  async function importResinHollowFile(input) {
+    const form = input.closest('form'), entry = hollowReviewEntry(jobById(form.dataset.id)), revision = ++entry.revision, file = input.files?.[0];
+    entry.validated = null; entry.pending = false; entry.review = null; entry.error = ''; $('[name="confirmedHollowPreparation"]', form).checked = false;
+    updateResinHollowState(form);
+    try {
+      if (!file) return;
+      if (file.size > 256 * 1024) throw new Error('The hollow recipe exceeds the 256 KiB limit.');
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+      const review = parseHollowReview(JSON.parse(text));
+      if (entry.revision !== revision || !form.isConnected) return;
+      entry.review = review;
+    } catch (error) { if (entry.revision === revision) entry.error = error instanceof SyntaxError ? 'The hollow recipe is not valid JSON.' : error.message; }
+    finally { if (entry.revision === revision && form.isConnected) { $('#resin-hollow-summary', form).innerHTML = resinHollowSummary(entry.review); updateResinHollowState(form); } }
+  }
+  async function validateResinHollow(form) {
+    const entry = hollowReviewEntry(jobById(form.dataset.id));
+    if (modalBusy || !entry.enabled || !entry.review) return;
+    const key = resinHollowKey(form), revision = ++entry.revision, hollow = structuredClone(entry.review), slotId = $('[name="profileSlotId"]', form)?.value;
+    entry.validated = null; entry.pending = true; entry.error = ''; $('[name="confirmedHollowPreparation"]', form).checked = false; updateResinHollowState(form);
+    try {
+      const result = await api(`/api/jobs/${idPath(form.dataset.id)}/resin/hollow/review`, { method: 'POST', body: { hollow, sizing: resinSizingRequest(form), ...(slotId ? { profileSlotId: slotId } : {}) } });
+      if (!form.isConnected || revision !== entry.revision || key !== resinHollowKey(form)) return;
+      const canonical = parseHollowReview(result.hollow);
+      if (canonical.geometrySha256 !== hollow.geometrySha256 || canonical.profileSha256 !== hollow.profileSha256 || result.geometry?.geometrySha256 !== hollow.geometrySha256 || result.profileSha256 !== hollow.profileSha256) throw new Error('The recipe hashes changed. Import an updated reviewed recipe; this recipe was not rebound.');
+      entry.validated = { key, hollow: canonical }; entry.review = canonical;
+      $('#resin-hollow-summary', form).innerHTML = resinHollowSummary(canonical);
+    } catch (error) { if (revision === entry.revision) entry.error = error.message; }
+    finally { if (revision === entry.revision) { entry.pending = false; updateResinHollowState(form); } }
+  }
   function resinRepairPanel(job) {
     if (!/\.(stl|obj)$/i.test(job.fileName)) return '';
     const repair = job.resinRepair, summary = repair?.summary, operations = summary?.operations;
@@ -436,6 +529,7 @@
     return `<div id="resin-sizing-fields" class="mt-16"><h4>Model size</h4>${repairHint}${cad ? `<p class="field-hint">CAD units have been converted to millimetres. ${esc(job.resinCad?.cad?.solidCount || 0)} source solid(s) retained; ticket units ${esc(job.order.units)} are recorded separately.</p><button type="button" class="button small" data-action="prepare-resin-cad" data-id="${attr(job.id)}">Regenerate STEP geometry</button>` : ''}<p class="field-hint">${geometry ? `Measured source: ${esc(dimensionText(geometry.sourceDimensionsMm))} mm (X × Y × Z).` : 'Measure the model before choosing a numeric scale or target dimension.'}</p><button type="button" class="button small" data-action="measure-resin-geometry" data-id="${attr(job.id)}">Measure model</button><div class="field mt-16"><label for="resin-sizing-mode">Sizing method</label><select id="resin-sizing-mode" name="resinSizingMode"><option value="original" ${original ? 'selected' : ''}>Current model size</option><option value="scale" ${sizing.mode === 'scale' ? 'selected' : ''} ${geometry ? '' : 'disabled'}>Uniform scale factor</option><option value="dimension" ${sizing.mode === 'dimension' ? 'selected' : ''} ${geometry ? '' : 'disabled'}>Set one source-axis dimension</option></select></div><div id="resin-scale-fields" ${sizing.mode === 'scale' ? '' : 'hidden'}>${field('resinScaleFactor', 'Uniform scale factor', sizing.factor ?? 1, { type: 'number', extra: `min="0.0001" max="10000" step="any" ${sizing.mode === 'scale' ? 'required' : 'disabled'}` })}</div><div id="resin-dimension-fields" class="form-grid mt-16" ${sizing.mode === 'dimension' ? '' : 'hidden'}><div class="field"><label for="resin-dimension-axis">Source axis</label><select id="resin-dimension-axis" name="resinDimensionAxis" ${sizing.mode === 'dimension' ? '' : 'disabled'}>${['x', 'y', 'z'].map(axis => `<option value="${axis}" ${sizing.axis === axis ? 'selected' : ''}>${axis.toUpperCase()}</option>`).join('')}</select></div>${field('resinDimensionMm', 'Target source dimension (mm)', sizing.millimeters ?? geometry?.sourceDimensionsMm?.x ?? 1, { type: 'number', extra: `min="0.000001" max="10000" step="any" ${sizing.mode === 'dimension' ? 'required' : 'disabled'}` })}</div><p id="resin-sizing-preview" class="field-hint mt-16">${geometry ? `Expected model: ${esc(dimensionText(sizing.mode === 'original' ? geometry.sourceDimensionsMm : job.resinSlice?.sizingPlan?.dimensionsMm || geometry.sourceDimensionsMm))} mm before orientation and supports.` : 'Declared units will be converted to millimetres.'}</p><label id="resin-original-confirm" class="checkbox-field mt-16" ${original ? '' : 'hidden'}><input type="checkbox" name="confirmedOriginalSize" ${original ? 'required' : 'disabled'}><span>${cad ? 'I reviewed the CAD size in millimetres and its embedded units.' : repaired ? 'I reviewed the repaired model size in millimetres and its exact mesh edits.' : `I reviewed the declared ${esc(job.order.units)} units and current model size.`} Requested sizing is already embodied in this model.</span></label><label id="resin-sizing-confirm" class="checkbox-field mt-16" ${original ? 'hidden' : ''}><input type="checkbox" name="confirmedSizing" ${original ? 'disabled' : 'required'}><span>I reviewed the measured source size and chosen uniform transform against the order requirements. Source axes are measured before print orientation; proportions stay unchanged.</span></label></div>`;
   }
   function updateResinSizing(form, { modeChanged = false, clearConfirmation = false } = {}) {
+    if (modeChanged || clearConfirmation) updateResinHollowState(form, { invalidate: true });
     const mode = $('[name="resinSizingMode"]', form)?.value || 'original', job = jobById(form.dataset.id), geometry = geometryFor(job);
     for (const [id, enabled] of [['resin-scale-fields', mode === 'scale'], ['resin-dimension-fields', mode === 'dimension'], ['resin-original-confirm', mode === 'original'], ['resin-sizing-confirm', mode !== 'original']]) {
       const section = document.getElementById(id); section.hidden = !enabled;
@@ -466,7 +560,7 @@
     const approvalHold = ['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState);
     const configured = engine.prusaExecutable && engine.uvtoolsExecutable && (slots.length || engine.profilePath) && !approvalHold && (job.resinProduction?.remainingParts ?? job.order.requestedQuantity) > 0 && ((/\.(stl|obj)$/i.test(job.fileName) && (!job.resinRepair || geometryFor(job))) || (/\.(step|stp)$/i.test(job.fileName) && geometryFor(job)));
     const project = Object.entries(job.order?.project || {}).map(([key, value]) => `<div><dt>${esc(key.replace(/([a-z])([A-Z])/g, '$1 $2'))}</dt><dd style="white-space:pre-wrap">${esc(typeof value === 'object' ? JSON.stringify(value) : value)}</dd></div>`).join('');
-    const form = ['review', 'cancelled'].includes(job.status) ? `<form id="resin-slice-form" data-id="${attr(job.id)}" data-geometry-sha="${attr(geometryFor(job)?.geometrySha256 || '')}">${slotPicker}${approvalHold ? '<p class="field-hint mt-16">Preparation is approved or awaiting confirmation. Reopen it through the production review before replacing this slice.</p>' : ''}<label class="checkbox-field mt-16"><input type="checkbox" name="confirmedRequirements" required><span>I reviewed all ticket requirements and confirmed that the selected printer, resin, exposure, and support profile meet them. Unresolved requirements must be clarified before slicing.</span></label>${resinSizingFields(job)}${resinPlateFields(job)}<div class="button-row mt-16"><button type="submit" class="button primary" ${configured ? '' : 'disabled'}>${icon('cube')} Slice resin model</button></div></form>` : job.status === 'preparing' ? `<p>Resin preparation is running.</p><button class="button" data-action="cancel-local" data-id="${attr(job.id)}">Cancel resin preparation</button>` : '';
+    const form = ['review', 'cancelled'].includes(job.status) ? `<form id="resin-slice-form" data-id="${attr(job.id)}" data-geometry-sha="${attr(geometryFor(job)?.geometrySha256 || '')}" data-resin-configured="${configured ? 'true' : 'false'}">${slotPicker}${approvalHold ? '<p class="field-hint mt-16">Preparation is approved or awaiting confirmation. Reopen it through the production review before replacing this slice.</p>' : ''}<label class="checkbox-field mt-16"><input type="checkbox" name="confirmedRequirements" required><span>I reviewed all ticket requirements and confirmed that the selected printer, resin, exposure, and support profile meet them. Unresolved requirements must be clarified before slicing.</span></label>${resinSizingFields(job)}${resinPlateFields(job)}${resinHollowFields(job)}<div class="button-row mt-16" data-resin-submit-row><button type="submit" class="button primary" ${configured ? '' : 'disabled'}>${icon('cube')} Slice resin model</button></div></form>` : job.status === 'preparing' ? `<p>Resin preparation is running.</p><button class="button" data-action="cancel-local" data-id="${attr(job.id)}">Cancel resin preparation</button>` : '';
     return `<div class="job-action-panel"><h3>Resin production ticket ${esc(job.order?.reference)}</h3><p>${esc(job.order?.requestedQuantity)} parts requested · model units ${esc(job.order?.units)} · ${esc(job.order?.production?.qualityTier)} quality</p><p>${esc(job.order?.production?.colour)} resin · ${esc(job.order?.production?.properties)} · supports: ${esc(job.order?.production?.supports)}</p><dl class="details-grid">${project}</dl><p>QuickPrint checks configured orientation candidates and captures a GOO file for inspection. It does not interpret size or support instructions from free text. Captured slices require printer and material qualification before production.</p>${resinRepairPanel(job)}${form}${slice ? `<div class="divider mt-16"></div><p><strong>${slice.analysis?.passed ? 'Slice captured for qualification' : 'Print issues require review'}</strong> · ${esc(slice.inspection?.layerCount)} layers · ${esc(slice.analysis?.count)} reported issues · ${esc(slice.modelCopiesPerRun || 1)} verified source instance(s) per plate</p>${slice.platePreparation && slice.platePreparation.layout.copiesPlaced < slice.platePreparation.requested.copies ? `<p class="field-hint">${esc(slice.platePreparation.layout.copiesPlaced)} of up to ${esc(slice.platePreparation.requested.copies)} requested copies fit this plate. Remaining order units require another confirmed run.</p>` : ''}<p class="field-hint">${esc(slice.printerModel)} · ${esc(slice.material)} · finished ${esc(dateTime(slice.finishedAt))}</p>${slice.analysis?.issues?.length ? `<ul>${slice.analysis.issues.map(issue => `<li>${esc(issue)}</li>`).join('')}</ul>` : ''}<button class="button" data-action="download-resin-slice" data-id="${attr(job.id)}">${icon('download')} Download captured GOO</button>` : ''}<details class="mt-16"><summary>SatelLite preparation probe</summary><p>Repair and evaluation CLI output is still experimental.</p><button class="button" data-action="resin-preprocess" data-id="${attr(job.id)}" ${job.status === 'review' ? '' : 'disabled'}>Probe SatelLite evaluation</button>${job.resinPreparation ? `<p class="field-hint">Last preprocessing: ${esc(job.resinPreparation.status)}</p>` : ''}</details></div>`;
   }
 
@@ -516,6 +610,7 @@
       ${showResolve ? `<div class="job-action-panel"><h3>Verify this print run</h3><p>Check the physical printer and part before recording the outcome. If a start was interrupted or ambiguous, confirm whether the printer started. Never mark an active print as not started.</p><button class="button compact" data-action="reconcile" data-id="${attr(job.id)}">${icon('check')} Record run outcome</button></div>` : ''}
       ${job.status === 'completed' ? `<div class="inline-notice no-margin">${icon('check')}<span>All requested copies have been accepted. This job is complete.</span></div>` : ''}
       ${history.length ? `<div class="section-label">JOB HISTORY</div><div class="history">${history.map(item => `<div class="history-item"><p>${esc(item.message || item.note || item.event || statusNames[item.status] || item.status || item.type || 'Job updated')}</p><time>${esc(dateTime(item.at || item.createdAt || item.timestamp))}</time></div>`).join('')}</div>` : ''}`, ` ${['review', 'ready'].includes(job.status) ? `<button class="button" data-action="cancel-local" data-id="${attr(job.id)}">Cancel job</button>` : ''}<button class="button" data-action="refresh-job" data-id="${attr(job.id)}">${icon('refresh')} Refresh status</button><button class="button" data-action="download" data-id="${attr(job.id)}">${icon('download')} Original file</button><button class="button" data-action="close-modal">Close</button>`, true);
+    updateResinHollowState($('#resin-slice-form'));
   }
 
   function confirmModal(title, description, actionLabel, onConfirm, { danger = false, checkbox = '', onCancel = null } = {}) {
@@ -629,10 +724,12 @@
         await api('/api/settings', { method: 'PUT', body: { intake: { enabled: data.has('enabled'), port: number('port') } } });
         await refresh(); toast('Intake settings saved.'); await integrationModal();
       } else if (form.id === 'resin-slice-form') {
+        const hollowEntry = hollowReviewEntry(jobById(id)), hollowEnabled = data.has('resinHollowEnabled');
+        if (hollowEnabled && (!hollowEntry.enabled || hollowEntry.validated?.key !== resinHollowKey(form) || !data.has('confirmedHollowPreparation'))) throw new Error('Validate and explicitly confirm the hollow recipe for the current size and resin profile before slicing.');
         const button = $('button[type="submit"]', form);
         if (button) button.innerHTML = '<span class="spinner"></span> Slicing resin…';
-        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button'; cancel.dataset.action = 'cancel-local'; cancel.dataset.id = id; cancel.dataset.preparingCancel = 'true'; cancel.textContent = 'Cancel resin preparation'; $('.button-row', form).append(cancel);
-        const result = await api(`/api/jobs/${idPath(id)}/resin/slice`, { method: 'POST', body: { ...(number('resinPlateCopies') > 1 ? { plate: { copies: number('resinPlateCopies'), gapMm: number('resinPlateGapMm'), marginMm: number('resinPlateMarginMm') } } : {}), ...((jobById(id).resinRepair || /\.(step|stp)$/i.test(jobById(id).fileName)) ? { expectedGeometrySha256: form.dataset.geometrySha } : {}), confirmedRequirements: data.has('confirmedRequirements'), confirmedOriginalSize: data.has('confirmedOriginalSize'), confirmedSizing: data.has('confirmedSizing'), sizing: value('resinSizingMode') === 'scale' ? { mode: 'scale', factor: number('resinScaleFactor') } : value('resinSizingMode') === 'dimension' ? { mode: 'dimension', axis: value('resinDimensionAxis'), millimeters: number('resinDimensionMm') } : { mode: 'original' }, ...(value('profileSlotId') ? { profileSlotId: value('profileSlotId') } : {}) } });
+        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button'; cancel.dataset.action = 'cancel-local'; cancel.dataset.id = id; cancel.dataset.preparingCancel = 'true'; cancel.textContent = 'Cancel resin preparation'; $('[data-resin-submit-row]', form).append(cancel);
+        const result = await api(`/api/jobs/${idPath(id)}/resin/slice`, { method: 'POST', body: { ...(hollowEnabled ? { hollow: hollowEntry.validated.hollow, confirmedHollowPreparation: data.has('confirmedHollowPreparation') } : {}), ...(number('resinPlateCopies') > 1 ? { plate: { copies: number('resinPlateCopies'), gapMm: number('resinPlateGapMm'), marginMm: number('resinPlateMarginMm') } } : {}), ...((jobById(id).resinRepair || /\.(step|stp)$/i.test(jobById(id).fileName)) ? { expectedGeometrySha256: form.dataset.geometrySha } : {}), confirmedRequirements: data.has('confirmedRequirements'), confirmedOriginalSize: data.has('confirmedOriginalSize'), confirmedSizing: data.has('confirmedSizing'), sizing: resinSizingRequest(form), ...(value('profileSlotId') ? { profileSlotId: value('profileSlotId') } : {}) } });
         await refresh(); jobModal(id); toast(result.resinSlice?.analysis?.passed ? 'Resin slice captured for qualification.' : 'Resin slice has print issues that need review.', !result.resinSlice?.analysis?.passed);
       } else if (form.id === 'prepare-form') {
         const button = $('button[type="submit"]', form);
@@ -652,7 +749,7 @@
       else modalError(error);
       if (form.id === 'prepare-form') { const button = $('button[type="submit"]', form); if (button) button.innerHTML = `${icon('cube')} Prepare file`; await refresh({ silent: true }); }
       if (form.id === 'resin-slice-form') { const button = $('button[type="submit"]', form); if (button) button.innerHTML = `${icon('cube')} Slice resin model`; await refresh({ silent: true }); }
-    } finally { $('[data-preparing-cancel]', form)?.remove(); setBusy(false, form); }
+    } finally { $('[data-preparing-cancel]', form)?.remove(); setBusy(false, form); if (form.id === 'resin-slice-form') updateResinHollowState(form); }
   }
 
   async function browse(kind, targetId) {
@@ -697,6 +794,15 @@
       if (action === 'add-printer') return printerModal();
       if (action === 'edit-printer') return printerModal(id);
       if (action === 'job') return jobModal(id);
+      if (action === 'validate-resin-hollow') return await validateResinHollow(button.closest('form'));
+      if (action === 'download-resin-geometry-source') {
+        if (modalBusy) return;
+        button.disabled = true;
+        const response = await fetch(`/api/jobs/${idPath(id)}/resin/geometry/source`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ sizing: resinSizingRequest(button.closest('form')) }) });
+        if (!response.ok) { let message = 'The sized source could not be downloaded.'; try { const error = await response.json(); message = error.message || error.error || message; } catch {} throw new Error(message); }
+        const href = URL.createObjectURL(await response.blob()), link = document.createElement('a');
+        link.href = href; link.download = 'reviewed-sized-source.stl'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); return;
+      }
       if (action === 'refresh-job') { const job = jobById(id); button.disabled = true; if (job?.printerId) await api(`/api/printers/${idPath(job.printerId)}/test`, { method: 'POST' }); await refresh(); return jobModal(id); }
       if (action === 'go-inputs') { location.hash = '#inputs'; return; }
       if (action === 'filter') { jobFilter = button.dataset.filter; renderPage(); return; }
@@ -757,6 +863,7 @@
         $('#resin-sizing-fields').outerHTML = resinSizingFields(jobById(id));
         $('#resin-slice-form').dataset.geometrySha = geometry.geometrySha256 || '';
         updateResinSizing($('#resin-slice-form'));
+        updateResinHollowState($('#resin-slice-form'), { invalidate: true });
         return;
       }
       if (action === 'withdraw-resin-preparation') return openModal('Reopen resin preparation', 'Withdraw this queued preparation so the model or profile can be revised. Printed counts and run history are preserved.', `<form id="resin-withdraw-form" data-id="${attr(id)}" data-receipt-id="${attr(button.dataset.receiptId)}">${field('reason', 'Reason for reopening preparation', '', { textarea: true, required: true, full: true, extra: 'maxlength="2000"' })}<p class="field-hint">The portal must confirm withdrawal before this file can be replaced. This sends no printer command and does not cancel the paid order.</p></form>`, footerSubmit('resin-withdraw-form', 'Withdraw preparation'));
@@ -838,7 +945,7 @@
       }
       if (action === 'reconcile') return reconcileModal(id);
     } catch (error) { if ($('#modal-root').hasChildNodes()) modalError(error); else toast(error.message, true); }
-    finally { if (button.isConnected) button.disabled = false; }
+    finally { if (button.isConnected) button.disabled = false; if (['validate-resin-hollow', 'download-resin-geometry-source'].includes(action)) updateResinHollowState(button.closest('form')); }
   }
 
   function toast(message, error = false) {
@@ -862,6 +969,12 @@
     }
   });
   document.addEventListener('change', event => {
+    if (event.target.id === 'resin-hollow-file') { importResinHollowFile(event.target).catch(modalError); }
+    if (event.target.name === 'resinHollowEnabled') {
+      const form = event.target.closest('form'), entry = hollowReviewEntry(jobById(form.dataset.id));
+      entry.enabled = event.target.checked; entry.error = ''; updateResinHollowState(form, { invalidate: true });
+    }
+    if (event.target.name === 'profileSlotId') updateResinHollowState(event.target.closest('form'), { invalidate: true });
     if (['resinSizingMode', 'resinDimensionAxis'].includes(event.target.name)) updateResinSizing($('#resin-slice-form'), { modeChanged: event.target.name === 'resinSizingMode', clearConfirmation: true });
     if (event.target.id === 'upload-files') { uploadFiles = [...event.target.files]; renderSelectedFiles(); }
     if (event.target.id === 'printer-type') { $('#printer-auth').innerHTML = printerAuth(event.target.value, printerById($('#printer-form').dataset.id) || {}); $('#printer-hint').innerHTML = printerHint(event.target.value); $('#printer-model-field').innerHTML = printerModel(event.target.value, printerById($('#printer-form').dataset.id)?.model || ''); }

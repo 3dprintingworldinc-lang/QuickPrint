@@ -13,7 +13,8 @@
 const { performance } = require('node:perf_hooks');
 
 const LIMITS = Object.freeze({ maxVoxels: 20000000, maxAxisLength: 65536, maxDrains: 64,
-  maxWorkingBytes: 768 * 1024 * 1024, maxOperations: 2000000000, maxTimeMs: 60000, maxWitnesses: 8 });
+  maxWorkingBytes: 768 * 1024 * 1024, maxOperations: 2000000000, maxTimeMs: 300000, maxWitnesses: 8 });
+const DEFAULT_TIME_MS = 60000;
 const AXES = ['x','y','z'];
 const plain = value => value && typeof value === 'object' && !Array.isArray(value) && [Object.prototype,null].includes(Object.getPrototypeOf(value));
 const fail = (message,code = 'RESIN_HOLLOW_GRID_INPUT',status = 400) => Object.assign(new Error(message),{ code,status });
@@ -30,10 +31,10 @@ function vector(value,label,minimum,maximum) {
 }
 function freeze(value) { if (value && typeof value === 'object') { Object.values(value).forEach(freeze); Object.freeze(value); } return value; }
 function readLimits(value) {
-  if (value === undefined) return { ...LIMITS };
+  if (value === undefined) return { ...LIMITS, maxTimeMs: DEFAULT_TIME_MS };
   if (!plain(value) || Reflect.ownKeys(value).some(key => !Object.hasOwn(LIMITS,key))) throw fail('Grid limits contain an unsupported key.','RESIN_HOLLOW_GRID_LIMITS');
   for (const [key,item] of Object.entries(value)) if (!Number.isSafeInteger(item) || item < 1 || item > LIMITS[key]) throw fail('Grid limits may only lower positive whole-number hard bounds.','RESIN_HOLLOW_GRID_LIMITS');
-  return { ...LIMITS,...value };
+  return { ...LIMITS, maxTimeMs: DEFAULT_TIME_MS, ...value };
 }
 function workBudget(limits,signal) {
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw fail('Use a native AbortSignal.');

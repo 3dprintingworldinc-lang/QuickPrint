@@ -19,6 +19,11 @@ function fixture(){
 }
 function arrays(input){return[input.solid.lower,input.solid.upper,input.hollow.lower,input.hollow.upper];}
 
+test('the real body worker preserves default and explicitly declared longer deadlines without raising other limits',async()=>{
+  const normal=await auditResinHollowGridAsync(fixture()),input=fixture();input.limits={maxTimeMs:180000};const declared=await auditResinHollowGridAsync(input);
+  assert.equal(normal.limits.maxTimeMs,60000);assert.equal(declared.limits.maxTimeMs,180000);assert.deepEqual(declared.counts,normal.counts);assert.deepEqual(declared.drains,normal.drains);assert.equal(declared.limits.maxOperations,normal.limits.maxOperations);
+});
+
 test('the real worker returns the identical frozen pure audit and transfers each aliased buffer only once',async()=>{
   const input=fixture(),expected=auditResinHollowGrid(input),controller=new AbortController();input.signal=controller.signal;const backing=[...new Set(arrays(input).map(a=>a.buffer))];
   const pending=auditResinHollowGridAsync(input);for(const buffer of backing)assert.equal(buffer.byteLength,0,'valid input ownership must transfer without copying');

@@ -262,4 +262,4 @@ async function preparePackedResinAttempt({ sourceNormalizedSTL, orientation, req
   return { ...result, referenceSl1Sha256: reference.sl1Sha256, effectivePresetSha256: reference.effectivePresetSha256, logs: { reference: referenceResult.logs, artifact: result.logs }, modelCopiesPerRun: derived.layout.copiesPlaced, platePreparation };
 }
 
-module.exports = { normalizeResinPlateOptions, createResinPlate3mf, resinPlateHeightPolicy, prepareResinPlatePreset, assertPackedEffectiveSettings, preparePackedResinAttempt, verifyResinPlatePreparation };
+module.exports = { normalizeResinPlateOptions, createResinPlate3mf, resinPlateHeightPolicy, prepareResinPlatePreset, assertPackedEffectiveSettings, preparePackedResinAttempt, verifyResinPlatePreparation, deriveResinPlateLayout: layoutFor };

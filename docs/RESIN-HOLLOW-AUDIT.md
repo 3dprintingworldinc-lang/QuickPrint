@@ -236,7 +236,10 @@ outside that accounting. Binary zero/white spans use exact bounded bulk
 minimum/maximum updates rather than one JavaScript operation per pixel.
 
 The grid audit permits at most 20 million cells, 64 drains, 768 MiB of declared
-input/working-array accounting, two billion charged operations and 60 seconds.
+input/working-array accounting and two billion charged operations. Its default
+deadline is 60 seconds; a caller may explicitly declare up to 300 seconds before
+execution. The controlled workflow records its own prior budget, at most 180
+seconds. A longer declared deadline changes no geometry or uncertainty predicate.
 Its two source distance fields use Float64. Dimensions, complete array memory
 and transferable ownership are checked before growth or worker dispatch. These
 are individual allocation/work bounds, not a global process RSS guarantee.
@@ -306,7 +309,8 @@ owned added exterior cap blocks the first channel while the second channel and
 global cavity remain open. Body-masked original and capped arrays are identical:
 masking supports away would erase the obstruction and falsely reuse the earlier
 channel pass. The supported-output auditor now binds these checks to the
-source, support authority and full final artifact. Reusable controlled native
-orchestration, production workflow adoption, all six final checks, physical
-qualification and live portal activation remain separate requirements. No
-audit report creates a printer permit or enables production hollowing.
+source, support authority and full final artifact. The
+[controlled workflow](RESIN-HOLLOW-WORKFLOW.md) now supplies native orchestration,
+all six final checks and order-workflow integration. Physical qualification and
+live portal activation remain separate requirements. No standalone audit report
+creates a printer permit.

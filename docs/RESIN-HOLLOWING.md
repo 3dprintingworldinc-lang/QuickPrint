@@ -1,13 +1,13 @@
 # Source-bound hollowing and drain requests
 
-QuickPrint can now build a deterministic native hollowing/drain request from a
-reviewed, sized, zero-origin millimetre STL. This is an automation interface for
-provider verification. It does **not** qualify hollow output for an order.
-The production engine still requires `hollowing_enable = 0` and returns
-`RESIN_DRAIN_PLAN_REQUIRED` for a hollow preset.
-The separate [source-bound reference raster audit](RESIN-HOLLOW-AUDIT.md) now
-checks paired native body references, including cavity coverage and individual
-drains. It remains unqualified pending the final supported-output contract.
+QuickPrint builds a deterministic native hollowing/drain request from a
+reviewed, sized, zero-origin millimetre STL. The
+[controlled preparation workflow](RESIN-HOLLOW-WORKFLOW.md) connects this builder
+to native slicing, body/final audits, optional verified plates and portal slice
+receipts. Digital results remain unqualified for physical production.
+The baseline profile still requires `hollowing_enable = 0`; a reviewed hollow
+recipe explicitly selects the separate controlled engine. A hollow preset alone
+returns `RESIN_DRAIN_PLAN_REQUIRED`.
 
 The request pins three separate SHA-256 values: the original order source, the
 reviewed sized STL bytes, and the sizing review. The caller must supply the

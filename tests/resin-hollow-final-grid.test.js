@@ -130,6 +130,11 @@ test('nonzero final halo material is never excused by an enlarged support envelo
   const result = auditResinHollowFinalGrid(input); assert.equal(result.disposition, 'nonconforming'); assert.equal(result.counts.finalHaloMaterialCells, 1);
 });
 
+test('an explicit longer final deadline retains the default, cell/memory/work bounds and complete geometry checks', () => {
+  const input=fixture(), normal=auditResinHollowFinalGrid(input), declared=auditResinHollowFinalGrid({...input,limits:{maxTimeMs:180000}});
+  assert.equal(normal.limits.maxTimeMs,60000);assert.equal(declared.limits.maxTimeMs,180000);assert.equal(RESIN_HOLLOW_FINAL_GRID_LIMITS.maxTimeMs,300000);assert.deepEqual(declared.counts,normal.counts);assert.deepEqual(declared.finalMaterialAudit.counts,normal.finalMaterialAudit.counts);assert.equal(declared.limits.maxVoxels,normal.limits.maxVoxels);assert.equal(declared.limits.maxWorkingBytes,normal.limits.maxWorkingBytes);assert.throws(()=>auditResinHollowFinalGrid({...input,limits:{maxTimeMs:300001}}),{code:'RESIN_HOLLOW_FINAL_LIMITS'});
+});
+
 test('a bad body reference cannot be promoted by a corrected final print', () => {
   const input = fixture(), i = index(input.frame, 12, 12, 20); input.hollowBody.lower[i] = input.hollowBody.upper[i] = 255;
   const result = auditResinHollowFinalGrid(input); assert.equal(result.disposition, 'nonconforming'); assert.ok(result.counts.definitelyChangedBodyCells > 0);

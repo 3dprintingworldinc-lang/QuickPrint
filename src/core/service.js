@@ -155,6 +155,7 @@ class QuickPrintService extends EventEmitter {
     this._pendingPreparations = new Set();
     this._resinPermitIssuers = new WeakMap();
     this._resinDispatchPermits = new Map();
+    this._resinHollowVerifications = new Map();
     this._closing = false;
     this._ready = false;
   }
@@ -762,19 +763,19 @@ class QuickPrintService extends EventEmitter {
   async _resinSliceFile(job, result = job.resinSlice) {
     if (!result || result.format !== 'goo' || typeof result.filePath !== 'string' || !path.isAbsolute(result.filePath) || !/^[a-f0-9]{64}$/.test(result.sha256 || '')) throw error(409, 'No captured resin slice is available.', 'RESIN_SLICE_UNAVAILABLE');
     const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
-    const relative = path.relative(directory, result.filePath);
-    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw error(502, 'Resin output is outside its job work directory.', 'INVALID_RESIN_OUTPUT');
-    const stat = await fs.lstat(result.filePath);
+    let managed;
+    try { managed = await require('./resin-managed-path').resolveManagedResinFile(directory, result.filePath); } catch { throw error(502, 'Resin output is outside its ordinary managed job directory.', 'INVALID_RESIN_OUTPUT'); }
+    const stat = await fs.lstat(managed.filePath);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 512 * 1024 * 1024 || stat.size !== result.bytes) throw error(502, 'Resin output size or file type is invalid.', 'INVALID_RESIN_OUTPUT');
-    const realRelative = path.relative(await fs.realpath(directory), await fs.realpath(result.filePath));
-    if (!realRelative || realRelative === '..' || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) throw error(502, 'Resin output resolves outside its job work directory.', 'INVALID_RESIN_OUTPUT');
-    const bytes = await fs.readFile(result.filePath);
+    const bytes = await fs.readFile(managed.filePath);
     if (digest(bytes) !== result.sha256) throw error(409, 'The captured resin file changed. Slice this ticket again.', 'RESIN_ARTIFACT_CHANGED');
     return bytes;
   }
 
   async sliceResinJob(id, request = {}) {
-    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate'].includes(key))) throw error(400, 'Resin slicing accepts reviewed sizing, plate policy, confirmations, a reviewed derivative geometry hash and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Reflect.ownKeys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate', 'hollow', 'confirmedHollowPreparation'].includes(key))) throw error(400, 'Resin slicing accepts reviewed geometry, preparation and plate choices, confirmations and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    const hollow = request.hollow === undefined ? undefined : require('./resin-hollow-review').normalizeResinHollowReview(request.hollow);
+    if (hollow ? request.confirmedHollowPreparation !== true : request.confirmedHollowPreparation !== undefined) throw error(400, 'Review the sized source, exact hollow recipe, support regions, profile and resolution policy before hollow preparation.', 'RESIN_HOLLOW_REVIEW_REQUIRED');
     if (request.expectedGeometrySha256 !== undefined && (typeof request.expectedGeometrySha256 !== 'string' || !SHA256.test(request.expectedGeometrySha256))) throw error(400, 'The reviewed geometry hash must be a SHA-256 value.', 'INVALID_RESIN_SLICE_REQUEST');
     const plate = request.plate === undefined ? undefined : resinPlateRequest(request.plate);
     let sizing;
@@ -807,10 +808,22 @@ class QuickPrintService extends EventEmitter {
         if (expectedGeometry.repairPreparation && request.expectedGeometrySha256 !== expectedGeometry.engineSourceSha256) throw error(409, 'The repaired geometry changed or has not been reviewed. Refresh its measurements and confirm sizing again.', 'RESIN_REPAIR_REVIEW_STALE');
         const module = require('../slicing/resin-engine');
         const loaded = await module.loadProfile(settings.profilePath);
+        if (hollow && (hollow.geometrySha256 !== expectedGeometry.inputGeometry.sha256 || hollow.profileSha256 !== loaded.profileSha256)) throw error(409, 'The sized geometry or selected profile changed after hollow review. Refresh both before preparing.', 'RESIN_HOLLOW_REVIEW_STALE');
         const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-slicing');
-        const implementation = this.resinEngine || module;
+        const implementation = hollow ? this.resinEngine?.prepareControlledResinHollow ? this.resinEngine : require('../slicing/resin-hollow-engine') : this.resinEngine || module;
         controller.signal.throwIfAborted();
-        const result = await implementation.prepareResin({ ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), signal: controller.signal });
+        const nativeOptions = { ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, signal: controller.signal };
+        // Settings may contain slots/dispatch toggles. The controlled native
+        // boundary accepts only explicit paths and preparation fields.
+        let result = hollow ? await implementation.prepareControlledResinHollow({ inputPath: nativeOptions.inputPath, outputDir, profilePath: settings.profilePath, prusaExecutable: settings.prusaExecutable, uvtoolsExecutable: settings.uvtoolsExecutable, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, timeoutMs: settings.timeoutMs,
+          hollowRequest: hollow.recipe, supportRequest: hollow.supportRequest, resolutionRequest: hollow.resolutionRequest, boundaryPolicy: hollow.boundaryPolicy, signal: controller.signal }) : await implementation.prepareResin({ ...nativeOptions, ...(plate ? { plate } : {}) });
+        let referenceCapability;
+        if (hollow && plate) {
+          const input = await this._resinGeometryInput(job);
+          const { hollowReferenceCapability, ...packed } = await require('../slicing/resin-hollow-plate').prepareResinHollowPlate({ source: input.source, hollowPreparation: result.hollowPreparation, profile: loaded.profile, ini: loaded.ini, preset: loaded.preset, requested: plate, directory: outputDir, signal: controller.signal });
+          referenceCapability = hollowReferenceCapability;
+          result = { ...result, ...packed };
+        }
         controller.signal.throwIfAborted();
         if (result && ['cadPreparation', 'meshSourceSha256', 'rawSliceTool', 'repairPreparation', 'repairedSourceSha256', 'repairSliceTool'].some(key => result[key] !== undefined)) throw error(502, 'The slicing engine cannot supply unrelated source preparation evidence.', 'INVALID_RESIN_OUTPUT');
         if (!result || !result.analysis || !Number.isSafeInteger(result.analysis.count) || result.analysis.count < 0 || result.analysis.passed !== (result.analysis.count === 0) || !Array.isArray(result.analysis.issues) || result.analysis.issues.length !== result.analysis.count || result.analysis.issues.some(issue => typeof issue !== 'string') || !Array.isArray(result.analysis.checks) || result.analysis.checks.length !== RESIN_ANALYSIS_CHECKS.length || RESIN_ANALYSIS_CHECKS.some(check => !result.analysis.checks.includes(check)) || result.sourceSha256 !== expectedGeometry.engineSourceSha256 || result.profileSha256 !== loaded.profileSha256 || result.printerId !== loaded.profile.printerId || result.printerModel !== loaded.profile.printerModel || result.material !== loaded.profile.material || !result.tool || !/^[a-f0-9]{64}$/.test(result.tool.executableSha256 || '')) throw error(502, 'Resin slicing returned incomplete or mismatched evidence.', 'INVALID_RESIN_OUTPUT');
@@ -819,7 +832,10 @@ class QuickPrintService extends EventEmitter {
         const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
         module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
         if (inspection.perLayerSettings) throw error(502, 'Per-layer resin parameters require separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
-        await this._verifyResinPlateEvidence(job, { ...result, inputGeometry }, { loaded, artifactBytes: bytes, requested: plate });
+        const reviewedSlice = { ...result, inputGeometry, operatorReview: { ...(hollow ? { hollow, confirmedHollowPreparation: true } : {}) } };
+        const hollowEvidence = await this._verifyResinHollowEvidence(job, reviewedSlice, { loaded, allowFreshEngineRecord: true, signal: controller.signal });
+        if (hollowEvidence && referenceCapability) hollowEvidence.cacheEntry.referenceCapability = referenceCapability;
+        await this._verifyResinPlateEvidence(job, reviewedSlice, { loaded, artifactBytes: bytes, requested: plate, hollowEvidence, signal: controller.signal });
         await this._readResinGeometrySource(job);
         if (expectedGeometry.cadPreparation) {
           const checked = await this._expectedResinGeometry(job, sizing);
@@ -835,7 +851,7 @@ class QuickPrintService extends EventEmitter {
           const current = this._job(id);
           const cad = expectedGeometry.cadPreparation;
           const repair = expectedGeometry.repairPreparation;
-          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), ...(repair ? { repairedSourceSha256: expectedGeometry.engineSourceSha256, repairPreparation: repair, repairSliceTool: result.tool, tool: this._resinRepairSliceTool(result.tool, repair) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad || repair ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true } : {}), ...(repair ? { exactRepair: true } : {}), ...(cad || repair ? { ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
+          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), ...(repair ? { repairedSourceSha256: expectedGeometry.engineSourceSha256, repairPreparation: repair, repairSliceTool: result.tool, tool: this._resinRepairSliceTool(result.tool, repair) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(hollow ? { hollow: clone(hollow), confirmedHollowPreparation: true } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad || repair ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true } : {}), ...(repair ? { exactRepair: true } : {}), ...(cad || repair ? { ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
           if (result.analysis.passed) delete current.error;
           else current.error = `${result.analysis.count} resin print issue(s) require review. Inspect the captured file and change the model or profile before retrying.`;
           this._transition(current, 'review', result.analysis.passed ? 'Resin slice captured. Printer/material qualification is still required.' : current.error);
@@ -868,12 +884,12 @@ class QuickPrintService extends EventEmitter {
     } finally { await file.close(); }
   }
 
-  async _expectedResinGeometry(job, sizing) {
+  async _expectedResinGeometry(job, sizing, { includeSource = false } = {}) {
     const input = await this._resinGeometryInput(job);
     const prepared = require('../slicing/resin-geometry').prepareResinGeometry(input.source, { format: input.format, units: input.units, sizing });
     const meshAudit = this._auditResinSlicingSource(prepared.stl);
     // Do not retain the potentially 100 MiB normalized Buffer during providers.
-    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), ...(input.repairPreparation ? { repairPreparation: input.repairPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit } };
+    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), ...(input.repairPreparation ? { repairPreparation: input.repairPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit }, ...(includeSource ? { preparedSource: prepared.stl } : {}) };
   }
 
   _auditResinSlicingSource(bytes) {
@@ -927,23 +943,59 @@ class QuickPrintService extends EventEmitter {
     });
   }
 
+  async planResinGeometry(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => key !== 'sizing')) throw error(400, 'Geometry review accepts an explicit numeric sizing plan only.', 'RESIN_SIZING_INVALID');
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), expected = await this._expectedResinGeometry(job, sizing);
+      return { schemaVersion: 1, sourceSha256: job.sha256, engineSourceSha256: expected.engineSourceSha256, geometrySha256: expected.inputGeometry.sha256,
+        sizingSha256: expected.sizingPlan.sizingSha256, coordinateUnits: 'mm', sizingPlan: expected.sizingPlan, dimensionsMm: expected.sizingPlan.dimensionsMm,
+        sourceBounds: expected.inputGeometry.bounds, triangleCount: expected.sizingPlan.triangleCount, meshAudit: expected.inputGeometry.meshAudit };
+    });
+  }
+
+  async reviewResinHollowPreparation(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => !['hollow', 'sizing', 'profileSlotId'].includes(key))) throw error(400, 'Hollow review accepts the current sizing, selected slot and explicit recipe only.', 'RESIN_HOLLOW_REVIEW_INVALID');
+    const hollow = require('./resin-hollow-review').normalizeResinHollowReview(request.hollow);
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), expected = await this._expectedResinGeometry(job, sizing, { includeSource: true }), settings = resinEngineConfiguration(this.state.settings.resinEngine || {}), slots = settings.slots || [];
+      let slot;
+      if (slots.length) { slot = request.profileSlotId === undefined && slots.length === 1 ? slots[0] : slots.find(item => item.id === request.profileSlotId); if (!slot) throw error(400, 'Choose a configured resin profile slot for this review.', 'RESIN_PROFILE_SLOT_REQUIRED'); }
+      else if (request.profileSlotId !== undefined) throw error(400, 'The selected resin slot is no longer configured.', 'RESIN_PROFILE_SLOT_REQUIRED');
+      const profilePath = slot?.profilePath || settings.profilePath;
+      if (!profilePath) throw error(400, 'Configure a resin profile before reviewing hollow preparation.', 'RESIN_ENGINE_CONFIGURATION');
+      const loaded = await require('../slicing/resin-engine').loadProfile(profilePath);
+      if (hollow.geometrySha256 !== expected.inputGeometry.sha256 || hollow.profileSha256 !== loaded.profileSha256) throw error(409, 'This recipe belongs to different sized geometry or profile. Regenerate it for the current choices.', 'RESIN_HOLLOW_REVIEW_STALE');
+      if ((hollow.supportRequest.mode === 'none') !== (loaded.ini.supports_enable === '0')) throw error(400, 'The reviewed support mode must match the selected profile.', 'RESIN_HOLLOW_REVIEW_INVALID');
+      if (hollow.supportRequest.points.some(point => point.sourceFaceIndex >= expected.sizingPlan.triangleCount || ['x', 'y', 'z'].some(axis => point.positionMm[axis] > expected.sizingPlan.dimensionsMm[axis]))) throw error(400, 'Authored contacts must address faces and coordinates in this exact sized source.', 'RESIN_HOLLOW_REVIEW_INVALID');
+      require('../slicing/resin-hollow-plan').prepareResinHollowPlan(expected.preparedSource, { binding: { sourceSha256: expected.engineSourceSha256, geometrySha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256 }, ...hollow.recipe });
+      return { hollow, geometry: { geometrySha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256, dimensionsMm: expected.sizingPlan.dimensionsMm, coordinateUnits: 'mm', triangleCount: expected.sizingPlan.triangleCount },
+        profile: require('../slicing/resin-profiles').profileView(loaded), profileSha256: loaded.profileSha256, digitalValidationPending: true, printReady: false, ...(slot ? { profileSlot: { id: slot.id, name: slot.name } } : {}) };
+    });
+  }
+
+  async getResinGeometrySource(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => key !== 'sizing')) throw error(400, 'Geometry review accepts an explicit numeric sizing plan only.', 'RESIN_SIZING_INVALID');
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const expected = await this._expectedResinGeometry(this._job(id), sizing, { includeSource: true });
+      return { fileName: 'reviewed-sized-source.stl', bytes: expected.preparedSource, sha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256 };
+    });
+  }
+
   async _verifyResinInputGeometry(job, result, expected) {
     const descriptor = result.inputGeometry, anticipated = expected.inputGeometry;
     const same = require('node:util').isDeepStrictEqual;
     if (result.sizingPlan?.sizingSha256 !== expected.sizingPlan.sizingSha256 || !same(result.sizingPlan, expected.sizingPlan) || !descriptor || typeof descriptor.filePath !== 'string' || descriptor.filePath.length > 4000 || /[\0\r\n]/.test(descriptor.filePath) || !path.isAbsolute(descriptor.filePath) || descriptor.sha256 !== anticipated.sha256 || descriptor.bytes !== anticipated.bytes || !same(descriptor.bounds, anticipated.bounds)) throw error(502, 'The engine did not return the independently verified sizing plan and normalized input.', 'INVALID_RESIN_GEOMETRY');
     const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
-    const relative = path.relative(directory, descriptor.filePath);
-    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || path.extname(descriptor.filePath).toLowerCase() !== '.stl') throw error(502, 'Normalized resin input is outside its job work directory.', 'INVALID_RESIN_GEOMETRY');
-    const fromData = path.relative(this.dataDir, descriptor.filePath);
-    let component = this.dataDir;
-    for (const name of fromData.split(path.sep)) {
-      component = path.join(component, name);
-      const stat = await fs.lstat(component);
-      if (stat.isSymbolicLink()) throw error(502, 'Normalized resin input cannot use symbolic links.', 'INVALID_RESIN_GEOMETRY');
-    }
-    const actualRelative = path.relative(await fs.realpath(directory), await fs.realpath(descriptor.filePath));
-    if (!actualRelative || actualRelative === '..' || actualRelative.startsWith(`..${path.sep}`) || path.isAbsolute(actualRelative)) throw error(502, 'Normalized resin input resolves outside its job work directory.', 'INVALID_RESIN_GEOMETRY');
-    const file = await fs.open(descriptor.filePath, 'r');
+    if (path.extname(descriptor.filePath).toLowerCase() !== '.stl') throw error(502, 'Normalized resin input must be a managed STL.', 'INVALID_RESIN_GEOMETRY');
+    let managed;
+    try { managed = await require('./resin-managed-path').resolveManagedResinFile(directory, descriptor.filePath); } catch { throw error(502, 'Normalized resin input is outside its ordinary managed job directory.', 'INVALID_RESIN_GEOMETRY'); }
+    const file = await fs.open(managed.filePath, 'r');
     let bytes;
     try {
       const stat = await file.stat();
@@ -968,7 +1020,39 @@ class QuickPrintService extends EventEmitter {
     return loaded;
   }
 
-  async _verifyResinPlateEvidence(job, slice, { loaded, artifactBytes, requested = slice.operatorReview?.plate } = {}) {
+  async _verifyResinHollowEvidence(job, slice, { loaded, allowFreshEngineRecord = false, signal } = {}) {
+    signal?.throwIfAborted();
+    const reviewed = slice.operatorReview?.hollow, record = slice.hollowPreparation;
+    if (!reviewed && !record) return null;
+    if (!reviewed || !record || slice.operatorReview?.confirmedHollowPreparation !== true) throw error(409, 'Hollowed output requires its reviewed recipe and controlled native evidence.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
+    const review = require('./resin-hollow-review').normalizeResinHollowReview(reviewed), same = require('node:util').isDeepStrictEqual;
+    const profile = loaded || await this._loadResinSliceProfile(slice);
+    if (review.geometrySha256 !== slice.inputGeometry?.sha256 || review.profileSha256 !== profile.profileSha256 || record.profileSha256 !== profile.profileSha256 || record.inputs?.sourceBinding?.geometrySha256 !== review.geometrySha256 ||
+        !same(record.request?.hollowRequest, review.recipe) || !same(record.request?.supportRequest, review.supportRequest) || !same(record.request?.resolutionRequest, review.resolutionRequest) || record.request?.boundaryPolicy !== review.boundaryPolicy || record.request?.placement !== undefined) throw error(409, 'The hollow recipe, sized source, support authority or reviewed profile changed.', 'RESIN_HOLLOW_REVIEW_STALE');
+    const input = await this._resinGeometryInput(job), directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
+    if (record.source?.sha256 !== input.engineSourceSha256) throw error(409, 'The hollow source no longer matches the reviewed original or derivative.', 'RESIN_HOLLOW_SOURCE_CHANGED');
+    const module = require('../slicing/resin-hollow-engine'), options = { source: input.source, directory, signal };
+    const binding = await module.inspectControlledResinHollowBindings(record, options);
+    let cacheEntry = this._resinHollowVerifications.get(job.id);
+    if (!cacheEntry || cacheEntry.bindingHash !== binding.bindingHash) {
+      if (!(allowFreshEngineRecord && module.isVerifiedControlledHollowPreparation?.(record, binding.bindingHash))) {
+        const checked = await module.verifyControlledResinHollowPreparation(record, options);
+        if (checked.bindingHash !== binding.bindingHash || checked.hollowPreparationSha256 !== record.sha256 || checked.sha256 !== record.roles?.final?.artifact?.sha256) throw error(409, 'Hollow verification did not confirm the complete current artifact bindings.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+      }
+      cacheEntry = { bindingHash: binding.bindingHash, preparationSha256: record.sha256 };
+      this._resinHollowVerifications.delete(job.id);
+      this._resinHollowVerifications.set(job.id, cacheEntry);
+      while (this._resinHollowVerifications.size > 128) this._resinHollowVerifications.delete(this._resinHollowVerifications.keys().next().value);
+    }
+    if (!slice.platePreparation) {
+      const pipelineTool = slice.rawSliceTool || slice.repairSliceTool || slice.tool;
+      if (binding.sha256 !== slice.sha256 || binding.bytes !== slice.bytes || !same(record.tool, pipelineTool)) throw error(409, 'The slice no longer matches its verified one-unit hollow artifact or tool.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+    } else if (slice.platePreparation.method !== 'controlled-hollow-reference-raster-replication-v1') throw error(409, 'Hollowed copies require the verified hollow reference replication method.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+    return { bindingHash: binding.bindingHash, source: input.source, directory, cacheEntry };
+  }
+
+  async _verifyResinPlateEvidence(job, slice, { loaded, artifactBytes, requested = slice.operatorReview?.plate, hollowEvidence, signal } = {}) {
+    signal?.throwIfAborted();
     const copies = slice.modelCopiesPerRun;
     if (!Number.isSafeInteger(copies) || copies < 1 || copies > 500) throw error(409, 'The slice must identify its actual bounded source-instance count.', 'RESIN_PLATE_EVIDENCE_INVALID');
     if (!requested && !slice.platePreparation && copies === 1) return 1;
@@ -977,6 +1061,16 @@ class QuickPrintService extends EventEmitter {
     if (copies > policy.copies) throw error(409, 'The artifact contains more source instances than requested.', 'RESIN_PLATE_EVIDENCE_INVALID');
     const profile = loaded || await this._loadResinSliceProfile(slice);
     const bytes = artifactBytes || await this._resinSliceFile(job,slice);
+    if (slice.hollowPreparation || slice.platePreparation.method === 'controlled-hollow-reference-raster-replication-v1') {
+      const evidence = hollowEvidence || await this._verifyResinHollowEvidence(job, slice, { loaded: profile, signal });
+      if (!evidence || !slice.hollowPreparation || slice.platePreparation.method !== 'controlled-hollow-reference-raster-replication-v1') throw error(409, 'Hollowed plates require their exact controlled reference.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
+      const module = require('../slicing/resin-hollow-plate');
+      if (!evidence.cacheEntry.referenceCapability) evidence.cacheEntry.referenceCapability = await module.verifyResinHollowPlateReference(slice.hollowPreparation, { source: evidence.source, directory: evidence.directory, signal });
+      const checked = await module.verifyResinHollowPlatePreparation(evidence.source, slice.platePreparation, { hollowPreparation: slice.hollowPreparation, profile: profile.profile, ini: profile.ini, preset: profile.preset, artifactBytes: bytes, directory: evidence.directory, referenceCapability: evidence.cacheEntry.referenceCapability, signal });
+      const pipelineTool = slice.rawSliceTool || slice.repairSliceTool || slice.tool;
+      if (!checked || checked.modelCopiesPerRun !== copies || checked.layout?.copiesPlaced !== copies || checked.rasterProof?.copiesPerRun !== copies || checked.artifactSha256 !== slice.sha256 || checked.sourceSha256 !== slice.inputGeometry.sha256 || !require('node:util').isDeepStrictEqual(checked.requested, policy) || !require('node:util').isDeepStrictEqual(slice.platePreparation.tool, pipelineTool)) throw error(409, 'Hollow plate count, layout, exact raster proof or controlled tool changed.', 'RESIN_PLATE_EVIDENCE_INVALID');
+      return copies;
+    }
     const normalized = await this._readResinGeometrySource({ ...job, inputPath: slice.inputGeometry.filePath, sha256: slice.inputGeometry.sha256 });
     const checked = await require('../slicing/resin-plate-engine').verifyResinPlatePreparation(normalized,slice.platePreparation,{ profile: profile.profile, ini: profile.ini, preset: profile.preset, artifactBytes: bytes, directory: path.join(this.dataDir,'jobs',job.id,'resin-slicing') });
     if (!checked || checked.modelCopiesPerRun !== copies || checked.layout?.copiesPlaced !== copies || checked.rasterProof?.copiesPerRun !== copies || checked.artifactSha256 !== slice.sha256 || checked.sourceSha256 !== slice.inputGeometry.sha256 || !require('node:util').isDeepStrictEqual(checked.requested,policy)) throw error(409, 'The layout, exact raster proof, reviewed request and artifact count disagree.', 'RESIN_PLATE_EVIDENCE_INVALID');
@@ -989,6 +1083,7 @@ class QuickPrintService extends EventEmitter {
     if (!isCad && (slice.cadPreparation || slice.meshSourceSha256 || slice.rawSliceTool)) throw error(409, 'Mesh-only slices cannot carry unrelated CAD evidence.', 'RESIN_CAD_CHANGED');
     if (!isRepair && (slice.repairPreparation || slice.repairedSourceSha256 || slice.repairSliceTool || slice.operatorReview?.exactRepair)) throw error(409, 'This source cannot carry unrelated exact mesh repair evidence.', 'RESIN_REPAIR_CHANGED');
     if (!slice.sizingPlan) {
+      if (slice.hollowPreparation || slice.operatorReview?.hollow || slice.operatorReview?.confirmedHollowPreparation !== undefined) throw error(409, 'Hollowed output requires its complete sized source and controlled preparation evidence.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
       if (isCad) throw error(409, 'STEP resin slices require source-bound CAD and sizing evidence.', 'RESIN_CAD_REQUIRED');
       if (isRepair) throw error(409, 'Repaired resin slices require source-bound exact repair and sizing evidence.', 'RESIN_REPAIR_REQUIRED');
       if (slice.platePreparation || slice.operatorReview?.plate || slice.modelCopiesPerRun > 1) throw error(409, 'Packed slices require normalized source sizing evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
@@ -1001,7 +1096,8 @@ class QuickPrintService extends EventEmitter {
     if (isCad && (slice.sourceSha256 !== job.sha256 || slice.meshSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.embeddedUnits !== true || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.cadPreparation, expected.cadPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinCadSliceTool(slice.rawSliceTool, expected.cadPreparation)))) throw error(409, 'CAD source, conversion, slicing provider or reviewed units changed.', 'RESIN_CAD_CHANGED');
     if (isRepair && (slice.sourceSha256 !== job.sha256 || slice.repairedSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.exactRepair !== true || slice.operatorReview.ticketUnits !== job.order.units || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.repairPreparation, expected.repairPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinRepairSliceTool(slice.repairSliceTool, expected.repairPreparation)))) throw error(409, 'Original source, exact repair, slicing provider or reviewed units changed.', 'RESIN_REPAIR_CHANGED');
     await this._verifyResinInputGeometry(job, slice, expected);
-    await this._verifyResinPlateEvidence(job,slice,options);
+    const hollowEvidence = await this._verifyResinHollowEvidence(job, slice, options);
+    await this._verifyResinPlateEvidence(job, slice, { ...options, hollowEvidence });
   }
 
   async getResinSliceDownload(id) {
@@ -1358,6 +1454,7 @@ class QuickPrintService extends EventEmitter {
         if (!upload?.remotePath || basename(upload.remotePath) !== remoteName) throw error(502, 'Upload did not return this run’s exact remote filename.', 'UPLOAD_IDENTITY');
         await this._mutate(() => { const run = this._currentRun(this._job(id)); run.remotePath = upload.remotePath; run.phase = 'uploaded'; });
         const context = { jobId: id, ...targetFields(permit.target), portalJobId: job.order.portalJobId, portalUrl: job.order.portalUrl, printerId: printer.id, receiptId: bindings.receiptId, runId, deviceFingerprint: bindings.deviceFingerprint, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, plannedParts: bindings.partsPerRun, authorization: clone(permit.authorization) };
+        await this._resinDispatchBindings(job, permit.receipt, bindings.deviceFingerprint);
         const proof = await authority.reauthorize(clone(context));
         await this._resinDispatchBindings(job, proof?.receipt, bindings.deviceFingerprint);
         const refreshed = this._validateResinAuthorization(job, bindings, proof, permit.authorization);

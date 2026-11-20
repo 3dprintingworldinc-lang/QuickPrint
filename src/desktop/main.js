@@ -188,6 +188,68 @@ async function smokeWindowsNativeJob() {
   return { executed: true, count: files.length, nativeExitCode: result.code, resourceReceipt: receipt, files };
 }
 
+async function smokeControlledHollow() {
+  // Exercise the shipped controller's asynchronous source pins and the plate
+  // adapter's rejection boundary without installing or launching a provider.
+  const controller = require('../slicing/resin-hollow-engine');
+  const adapter = require('../slicing/resin-hollow-plate');
+  const root = await fs.realpath(app.getPath('userData'));
+  const directory = await fs.realpath(await fs.mkdtemp(path.join(root, '.hollow-controller-smoke-')));
+  try {
+    const names = [
+      'resin-hollow-engine.js', 'resin-controlled-capture.js', 'windows-native-job.js', 'windows-native-job.ps1', 'windows-native-job.cs',
+      'resin-hollow-inputs.js', 'resin-hollow-preset.js', 'resin-hollow-resolution.js', 'resin-hollow-plan.js', 'resin-hollow-supports.js',
+      'resin-hollow-audit.js', 'resin-hollow-final-audit.js', 'resin-hollow-raster.js', 'resin-hollow-grid-async.js', 'resin-hollow-final-grid-async.js',
+      'resin-geometry.js', 'resin-mesh.js', 'resin-plate.js', 'resin-plate-engine.js', 'resin-engine.js', 'resin-profiles.js', 'psam/zip-inspection.js',
+      'resin-hollow-grid-worker.js', 'resin-hollow-grid.js', 'resin-hollow-final-grid-worker.js', 'resin-hollow-final-grid.js',
+      'resin-hollow-plate.js', 'goo-replication.js', 'goo-plate.js', 'goo.js',
+    ];
+    const files = [];
+    for (const name of names) {
+      const bytes = await fs.readFile(path.join(__dirname, '..', 'slicing', name));
+      if (!bytes.length || bytes.length > 1024 * 1024) throw new Error('Controlled hollow smoke source is missing or exceeds its bound.');
+      files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+    }
+    // Owned twelve-triangle outward cube; no test/private fixture dependency.
+    const vertices = [[0,0,0],[3,0,0],[3,3,0],[0,3,0],[0,0,3],[3,0,3],[3,3,3],[0,3,3]];
+    const faces = [[0,2,1],[0,3,2],[4,5,6],[4,6,7],[0,1,5],[0,5,4],[1,2,6],[1,6,5],[2,3,7],[2,7,6],[3,0,4],[3,4,7]];
+    const source = Buffer.alloc(84 + faces.length * 50); source.writeUInt32LE(faces.length, 80);
+    faces.forEach((face, index) => face.forEach((vertex, corner) => vertices[vertex].forEach((coordinate, axis) => source.writeFloatLE(coordinate, 84 + index * 50 + 12 + corner * 12 + axis * 4))));
+    let adapterRejected = false;
+    try { await adapter.verifyResinHollowPlateReference({}, { source, directory, timeoutMs: 10000 }); }
+    catch (error) { if (error.code !== 'RESIN_HOLLOW_PREPARATION_CHANGED' || error.message !== 'A complete unchanged controlled hollow receipt is required.') throw error; adapterRejected = true; }
+    if (!adapterRejected) throw new Error('The packaged hollow adapter accepted an untrusted receipt.');
+    if (process.platform !== 'win32') return { executed: false, reason: 'requires-windows', adapterRejectedUntrustedRecord: true, count: files.length, files };
+    const inputPath = path.join(directory, 'owned-cube.stl'), profilePath = path.join(directory, 'profile.json');
+    const missingPrusa = path.join(directory, 'absent-prusa.exe'), missingUvtools = path.join(directory, 'absent-uvtools.exe');
+    const expected = { resolutionX: 32, resolutionY: 32, displayWidthMm: 40, displayHeightMm: 40, machineZMm: 30, layerHeightMm: .05, mirrorX: false, mirrorY: false };
+    const profile = { schemaVersion: 1, printerId: 'smoke-no-printer', printerModel: 'Owned smoke fixture', material: 'Synthetic digital fixture', presetPath: 'profile.ini', expected,
+      orientationCandidates: [{ x: 0, y: 0, z: 0 }], uvtoolsProperties: { MachineName: 'Owned smoke fixture', LayerHeight: .05, ExposureTime: 2, BottomExposureTime: 20, BottomLayerCount: 1, BottomLiftHeight: 5, LiftHeight: 5, BottomLiftSpeed: 100, LiftSpeed: 100, RetractSpeed: 100, LightPWM: 255, BottomLightPWM: 255 } };
+    await fs.writeFile(inputPath, source, { flag: 'wx' });
+    await fs.writeFile(profilePath, JSON.stringify(profile), { flag: 'wx' });
+    await fs.writeFile(path.join(directory, 'profile.ini'), 'printer_technology=SLA\nsla_archive_format=SL1\nhollowing_enable=0\ndisplay_pixels_x=32\ndisplay_pixels_y=32\ndisplay_width=40\ndisplay_height=40\nbed_shape=0x0,40x0,40x40,0x40\ndisplay_mirror_x=0\ndisplay_mirror_y=0\ndisplay_orientation=landscape\nsupports_enable=0\npad_enable=0\nlayer_height=0.05\ninitial_layer_height=0.05\nexposure_time=2\ninitial_exposure_time=20\nmax_print_height=30\n', { flag: 'wx' });
+    const outputDir = path.join(directory, 'captures');
+    let missingProviderRejected = false;
+    try {
+      await controller.prepareControlledResinHollow({ inputPath, profilePath, outputDir, prusaExecutable: missingPrusa, uvtoolsExecutable: missingUvtools, timeoutMs: 10000,
+        hollowRequest: { orientation: { x: 0, y: 0, z: 0 }, wallThicknessMm: 1, quality: .5, closingDistanceMm: 0, drains: [{ id: 'smoke-drain', startMm: { x: 1.5, y: 1.5, z: 0 }, direction: { x: 0, y: 0, z: 1 }, radiusMm: .2, lengthMm: 3 }] },
+        supportRequest: { mode: 'none', clearanceMm: 0, points: [], regions: [] }, resolutionRequest: { maximumUncertaintyMm: .2 }, boundaryPolicy: 'voxel-enclosure' });
+    } catch (error) { if (error.code !== 'ENOENT' || error.path !== missingPrusa) throw error; missingProviderRejected = true; }
+    if (!missingProviderRejected) throw new Error('The packaged hollow controller did not stop at the missing owned provider.');
+    const captures = await fs.readdir(outputDir, { withFileTypes: true });
+    if (captures.length !== 1 || !captures[0].isDirectory() || !/^hollow-/.test(captures[0].name)) throw new Error('The hollow smoke did not create one private capture.');
+    const captureDirectory = path.join(outputDir, captures[0].name);
+    const progress = (await fs.readFile(path.join(captureDirectory, 'native-progress.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const failure = JSON.parse(await fs.readFile(path.join(captureDirectory, 'failure.json'), 'utf8'));
+    if (progress.length !== 2 || progress[0].stage !== 'provider-probes' || progress[0].status !== 'started' || progress[1].stage !== 'preparation' || progress[1].status !== 'failed' || progress[1].code !== 'ENOENT' || failure.error?.code !== 'ENOENT' || !Array.isArray(failure.invocations) || failure.invocations.length !== 0 || failure.nativeInvocationAttested !== false || failure.productionEligible !== false) throw new Error('The packaged hollow smoke advanced beyond the missing-provider boundary.');
+    return { executed: true, controllerInitialized: true, adapterRejectedUntrustedRecord: true, asyncSourceVerification: true, missingProviderRejected: true, failureCode: 'ENOENT', nativeCalls: 0, count: files.length, files };
+  } finally {
+    const actual = await fs.realpath(directory);
+    if (path.dirname(actual) !== root || !path.basename(actual).startsWith('.hollow-controller-smoke-')) throw new Error('Hollow smoke cleanup is outside its private directory.');
+    await fs.rm(actual, { recursive: true, force: true });
+  }
+}
+
 async function smokeCheck(credentials) {
   const response = await fetch(new URL('/api/health', backend.url), { signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Health check failed: HTTP ${response.status}`);
@@ -218,13 +280,14 @@ async function smokeCheck(credentials) {
   const hollowGridWorker = await smokeHollowGridWorker();
   const hollowFinalGridWorker = await smokeHollowFinalGridWorker();
   const windowsNativeJob = await smokeWindowsNativeJob();
+  const controlledHollow = await smokeControlledHollow();
   let credentialRoundTrip = 'unavailable-on-this-platform';
   if (process.platform === 'win32' || safeStorage.isEncryptionAvailable() && safeStorage.getSelectedStorageBackend?.() !== 'basic_text') {
     const probe = 'quickprint-smoke-test-not-a-secret';
     if (credentials.unseal(credentials.seal(probe)) !== probe) throw new Error('Credential storage validation failed.');
     credentialRoundTrip = 'passed';
   }
-  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, hollowGridWorker, hollowFinalGridWorker, windowsNativeJob, checkedAt: new Date().toISOString() });
+  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, hollowGridWorker, hollowFinalGridWorker, windowsNativeJob, controlledHollow, checkedAt: new Date().toISOString() });
   stopping = true;
   await stopBackend();
   mainWindow.destroy();
