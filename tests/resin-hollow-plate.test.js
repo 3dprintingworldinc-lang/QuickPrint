@@ -3,6 +3,9 @@
 const test=require('node:test'), assert=require('node:assert/strict');
 const fs=require('node:fs/promises'), path=require('node:path'), os=require('node:os'), Module=require('node:module');
 const {createHash}=require('node:crypto');
+const {execFile}=require('node:child_process');
+const {promisify}=require('node:util');
+const execute=promisify(execFile);
 const {MODEL}=require('./helpers/resin-slice');
 const {createPlateSliceFixture,gooForInstances}=require('./helpers/resin-plate-slice');
 const {loadProfile,parseIssueReport}=require('../src/slicing/resin-engine');
@@ -42,8 +45,10 @@ const adapterPath=require.resolve('../src/slicing/resin-hollow-plate'),originalL
 let adapter;
 try{Module._load=function(request,parent,isMain){if(parent?.filename===adapterPath&&request==='./resin-hollow-engine')return engine;if(parent?.filename===adapterPath&&request==='./resin-controlled-capture')return capture;return originalLoad.call(this,request,parent,isMain);};delete require.cache[adapterPath];adapter=require(adapterPath);}finally{Module._load=originalLoad;delete require.cache[adapterPath];}
 
-async function fixture(t,{mirrorX=false,mirrorY=true}={}){
-  const root=await fs.mkdtemp(path.join(os.tmpdir(),'quickprint-hollow-plate-'));t.after(()=>fs.rm(root,{recursive:true,force:true}));await createPlateSliceFixture(root);
+async function fixture(t,{mirrorX=false,mirrorY=true,temporaryRoot=os.tmpdir()}={}){
+  // GitHub Windows TEMP can contain RUNNER~1. Freeze physical paths before
+  // writing descriptors, matching the real engine's canonical managed root.
+  const canonicalTemp=await fs.realpath(temporaryRoot),root=await fs.realpath(await fs.mkdtemp(path.join(temporaryRoot,'quickprint-hollow-plate-')));t.after(async()=>{assert.equal(path.dirname(root).toLowerCase(),canonicalTemp.toLowerCase());assert.match(path.basename(root),/^quickprint-hollow-plate-/);await fs.rm(root,{recursive:true,force:true});});await createPlateSliceFixture(root);
   const profilePath=path.join(root,'resin-profile.json'),profile=JSON.parse(await fs.readFile(profilePath));profile.expected.mirrorX=mirrorX;profile.expected.mirrorY=mirrorY;await fs.writeFile(profilePath,JSON.stringify(profile));
   const presetPath=profile.presetPath,preset=(await fs.readFile(presetPath,'utf8')).replace(/display_mirror_x=[01]/,`display_mirror_x=${+mirrorX}`).replace(/display_mirror_y=[01]/,`display_mirror_y=${+mirrorY}`);await fs.writeFile(presetPath,preset);
   const loaded=await loadProfile(profilePath),prepared=prepareResinGeometry(MODEL,{format:'stl',units:'mm',sizing:{mode:'original'}}),refDir=path.join(root,'reference');await fs.mkdir(refDir);
@@ -122,4 +127,15 @@ test('resealed native guard accounting and broad ancestor cwd remain invalid rep
 test('an opaque shared session is accepted only at the exact managed parent and remains owned by its caller',async t=>{
   const f=await fixture(t),session=await capture.createControlledNativeCapture({cwd:f.root});
   const result=await adapter.prepareResinHollowPlate({...f.options,capture:session});assert.equal(result.platePreparation.captureDirectory,f.root);assert.equal(f.factories,1);assert.equal(f.closed,0);assert.equal(capture.isControlledNativeCapture(session),true);await f.verify(result);await session.close();assert.equal(f.closed,1);
+});
+
+test('fixture descriptors use the canonical physical temp directory when Windows exposes a DOS alias', {skip:process.platform!=='win32'}, async t=>{
+  const parent=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'quickprint-hollow-alias-with-spaces-'))),tempRoot=await fs.realpath(os.tmpdir());
+  t.after(async()=>{assert.equal(path.dirname(parent).toLowerCase(),tempRoot.toLowerCase());assert.match(path.basename(parent),/^quickprint-hollow-alias-with-spaces-/);await fs.rm(parent,{recursive:true,force:true});});
+  if(/[\r\n"%!&|<>^]/.test(parent))return t.skip('This temporary root cannot be represented by the bounded read-only DOS-name probe.');
+  const command=`for %I in ("${parent}") do @echo %~sI`,result=await execute(path.join(process.env.SystemRoot||'C:\\Windows','System32','cmd.exe'),['/d','/s','/c',`"${command}"`],{timeout:5000,maxBuffer:16384,windowsHide:true,windowsVerbatimArguments:true});
+  const alias=result.stdout.trim();assert.ok(path.isAbsolute(alias));assert.equal(await fs.realpath(alias),parent);
+  if(alias.toLowerCase()===parent.toLowerCase())return t.skip('The fixture volume does not create DOS short-name aliases.');
+  const a=await fs.lstat(alias,{bigint:true}),b=await fs.lstat(parent,{bigint:true});assert.equal(a.dev,b.dev);assert.equal(a.ino,b.ino);
+  const f=await fixture(t,{temporaryRoot:alias}),capture=await f.prepare();assert.equal(f.root,await fs.realpath(f.root));for(const descriptor of f.descriptors)assert.equal(path.relative(f.root,descriptor.filePath).startsWith('..'),false);assert.equal((await f.verify(capture)).modelCopiesPerRun,3);
 });

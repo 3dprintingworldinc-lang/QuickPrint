@@ -194,3 +194,35 @@ before native execution; no failed record was retroactively accepted.
 No hollowing software result resolves the outstanding physical geometry, resin,
 exposure, drainage, washing, curing or dimensional qualification work. No printer
 upload, start or control command was sent during these checks.
+
+### Observed local order-to-receipt flow
+
+The opt-in [hollow portal flow test](../tests/layr-hollow-production-flow.test.js)
+passed with the real Windows native providers and actual reviewed private portal
+handlers backed by local SQLite and fixture model storage. It imported a paid,
+frozen two-unit STL ticket, reviewed the original 3 mm cube at an explicit 10 mm
+size, and captured a hollow unit with two bottom drains. The selected profile
+used 512 x 512 pixels, a 40 x 40 mm bed, 0.1 mm layers, no supports or pad, quality
+0.75, a requested 2 mm wall, and a prior maximum raster uncertainty of 0.25 mm.
+The default prior cell budget remained 12 million.
+
+The 100-layer one-unit file passed all six native issue checks and the full
+source-bound final audit/replay. After its preparation receipt committed, a
+deliberately lost response and local restart replayed the exact saved operation
+UUID, version and body; the outbox confirmed the original receipt. A separately
+confirmed two-unit plate then passed complete pixel replication proof and its
+own real guarded six-check native analysis. The original model, frozen ticket
+and earlier one-unit receipt remained unchanged.
+
+The one-unit artifact was 306,698 bytes with SHA-256
+`087bd3b3dd925d7aef6a3610f2c2128a215b65ae4c47d43fed2ef880e4d83bde`.
+The two-unit artifact was 400,020 bytes with SHA-256
+`3a57b6c954b790905c316c19c18661779b0101a69daad94e38d3df2ccd3e4087`;
+its independent raster-proof SHA-256 was
+`a510882bebf18e42781071df6242e9f22cea32bd84c4498750fa0168d2bf4466`.
+The complete flow passed in 211.5 seconds. Both portal receipts bound the
+original source, current profile, pipeline tool fingerprint, artifact and actual
+parts per run (one, then two). Both remained unqualified with `printReady:false`.
+The portal stayed in preparation with zero printed units, zero QC credit and no
+printer upload, start or control calls. These local fixture results do not deploy
+the portal or qualify physical production.

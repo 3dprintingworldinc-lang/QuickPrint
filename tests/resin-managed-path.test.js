@@ -56,11 +56,14 @@ test('canonicalization cannot substitute a different file or directory with othe
 });
 
 test('a changed inode, zero inode or missing device identity is rejected through repeated ancestor observations', async t => {
-  const f = await fixture(t), original = fs.lstat;
+  const f = await fixture(t), original = fs.lstat, target = await original(f.filePath, { bigint: true });
   for (const mode of ['changed', 'zero', 'device']) {
-    let observed = 0;
-    fs.lstat = async function (filename, ...args) { const info = await original.call(this, filename, ...args); if (path.resolve(String(filename)) !== path.resolve(f.filePath)) return info; observed++; if (mode === 'changed' && observed < 3) return info; return { ...info, ino: mode === 'zero' ? 0n : mode === 'changed' ? info.ino + 1n : info.ino, dev: mode === 'device' ? undefined : info.dev, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false }; };
-    try { await assert.rejects(resolveManagedResinFile(f.directory, f.filePath), { code: 'RESIN_MANAGED_PATH_INVALID' }); } finally { fs.lstat = original; }
+    let observed = 0, injected = 0;
+    // Windows temporary paths can already use DOS aliases. Count the known
+    // physical leaf under BOTH input and realpath spellings, rather than only
+    // the input string (which otherwise receives just two of four observations).
+    fs.lstat = async function (filename, ...args) { const info = await original.call(this, filename, ...args); if (info.dev !== target.dev || info.ino !== target.ino) return info; observed++; if (mode === 'changed' && observed < 3) return info; injected++; return { ...info, ino: mode === 'zero' ? 0n : mode === 'changed' ? info.ino + 1n : info.ino, dev: mode === 'device' ? undefined : info.dev, isFile: () => true, isDirectory: () => false, isSymbolicLink: () => false }; };
+    try { await assert.rejects(resolveManagedResinFile(f.directory, f.filePath), { code: 'RESIN_MANAGED_PATH_INVALID' }); assert.ok(injected > 0, `${mode} identity fault must actually reach the resolver`); if (mode === 'changed') assert.ok(observed >= 3, 'changed identity must be injected after the initial input/canonical binding'); } finally { fs.lstat = original; }
   }
 });
 

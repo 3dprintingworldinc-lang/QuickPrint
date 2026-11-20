@@ -72,3 +72,30 @@ or a clean software-analysis report does not establish that qualification.
 Slice-receipt metadata accepts artifacts up to 512 MiB, including the locally
 validated 218,451,945-byte native GOO export. This stores only hashes and size
 evidence; raw-model limits remain 100 MiB in QuickPrint and 200 MiB at intake.
+
+The opt-in [controlled hollow portal flow](../tests/layr-hollow-production-flow.test.js)
+also passed against the actual private handlers and SQLite with real PrusaSlicer
+2.9.7 and UVtools 7.1.2 processes. Authenticated local HTTP routes imported a paid
+frozen STL, reviewed its numeric size and intended hollow/drain recipe, captured
+and verified its artifact, and queued source/profile/tool/artifact evidence. A
+lost reply after `record_slice` committed was reconciled after local restart by
+replaying the exact persisted operation UUID, version and body. A second explicit
+capture proved a two-copy hollow plate, ran native analysis on the repeated file,
+and recorded `partsPerRun:2` while preserving the earlier `partsPerRun:1` receipt.
+Both receipts remained unqualified with `printReady:false`; the original ticket
+and model bytes were preserved, the order stayed `preparing`, and printed units,
+QC credit and printer control calls remained zero. The
+[hollow workflow](RESIN-HOLLOW-WORKFLOW.md#observed-local-order-to-receipt-flow)
+records the observed artifact/proof hashes and limits.
+
+Run this additional check only with the reviewed private checkout and configured
+Windows native providers; ordinary CI skips it explicitly:
+
+```powershell
+$env:QUICKPRINT_HOLLOW_PORTAL_NATIVE = '1'
+node --test tests/layr-hollow-production-flow.test.js
+```
+
+Its portal, storage and read-only printer identity are local fixtures. Native
+slicing, complete raster verification and final issue analysis use the real
+controlled provider path; no public portal or physical printer is contacted.
