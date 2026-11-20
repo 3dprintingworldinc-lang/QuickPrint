@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { createHash } = require('node:crypto');
+const { execFileSync } = require('node:child_process');
 const { expandedSlaPreset } = require('./helpers/resin-hollow-preset');
 const { prepareResinGeometry } = require('../src/slicing/resin-geometry');
 const { prepareControlledResinHollow, verifyControlledResinHollowPreparation, inspectControlledResinHollowBindings, isVerifiedControlledHollowPreparation } = require('../src/slicing/resin-hollow-engine');
@@ -21,6 +22,16 @@ async function fixture() {
   const profile = JSON.parse(await fs.readFile(path.join(__dirname, 'fixtures/resin/verification-profile.json'))); profile.presetPath = 'profile.ini';
   await fs.writeFile(path.join(root, 'profile.json'), JSON.stringify(profile));
   return { root, options: baseRequest(root), async absentOutput() { await assert.rejects(fs.lstat(path.join(root, 'captures')), { code: 'ENOENT' }); } };
+}
+function shortProviderPaths(providers) {
+  // Query a public filesystem API with stdin data, not shell-interpolated paths.
+  const script = String.raw`Add-Type -TypeDefinition @'
+using System;using System.Text;using System.Runtime.InteropServices;public class QuickPrintProviderShortPath { [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] public static extern uint GetShortPathName(string p,StringBuilder b,uint n); }
+'@
+$paths = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$results = foreach ($p in $paths) { $b=New-Object Text.StringBuilder 32768; $n=[QuickPrintProviderShortPath]::GetShortPathName($p,$b,32768); if($n -eq 0){throw 'GetShortPathName failed'}; $b.ToString() }
+ConvertTo-Json -InputObject @($results) -Compress`;
+  return JSON.parse(execFileSync(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'), ['-NoProfile', '-NonInteractive', '-Command', script], { input: JSON.stringify(providers), encoding: 'utf8', windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }));
 }
 
 test('strict request/path/unit/resource schemas reject before files or providers are touched', async () => {
@@ -70,16 +81,23 @@ test('JSON claims cannot mint the private successful-verification capability', a
 });
 
 const native = process.platform === 'win32' && process.env.QUICKPRINT_NATIVE_HOLLOW_TEST === '1';
-test('owned native controlled hollow: immutable recipes, all six checks, full audit, restart replay and tamper holds', { skip: !native, timeout: 360000 }, async () => {
-  const root = await fs.mkdtemp(path.resolve('artifacts/hollow-engine-native-')), inputPath = path.join(root, 'source.stl'), original = await fs.readFile(SOURCE); await fs.writeFile(inputPath, original);
+test('owned native DOS-alias providers: full hollow/restart proof, tamper holds and a predeclared resource diagnostic', { skip: !native, timeout: 360000 }, async t => {
+  const providers = await Promise.all([path.resolve(process.env.QUICKPRINT_PRUSA_EXE || '.cache/prusa/PrusaSlicer-2.9.7/prusa-slicer-console.exe'), path.resolve(process.env.QUICKPRINT_UVTOOLS_EXE || '.cache/uvtools/UVtoolsCmd.exe')].map(value => fs.realpath(value)));
+  const aliases = shortProviderPaths(providers);
+  if (aliases.length !== 2 || aliases.some((value, index) => value.toLowerCase() === providers[index].toLowerCase())) { t.skip('Both configured provider files need existing Windows DOS 8.3 aliases for this actual-provider regression.'); return; }
+  for (let index = 0; index < providers.length; index++) { assert.equal((await fs.realpath(aliases[index])).toLowerCase(), providers[index].toLowerCase()); assert.match(aliases[index], /~/); }
+  const root = await fs.mkdtemp(path.resolve('artifacts/hollow-engine-native-alias-')), inputPath = path.join(root, 'source.stl'), original = await fs.readFile(SOURCE); await fs.writeFile(inputPath, original);
+  await fs.writeFile(path.join(root, 'provider-aliases-before-native.json'), JSON.stringify({ providers, aliases, pid: process.pid, sourceSha256: hash(original) }, null, 2), { flag: 'wx' });
   const profile = JSON.parse(await fs.readFile(path.join(__dirname, 'fixtures/resin/verification-profile.json')));
   profile.presetPath = 'profile.ini'; profile.expected = { resolutionX: 512, resolutionY: 512, displayWidthMm: 40, displayHeightMm: 40, layerHeightMm: .1, mirrorX: false, mirrorY: false };
   profile.uvtoolsProperties.LayerHeight = .1;
   await fs.writeFile(path.join(root, 'profile.ini'), expandedSlaPreset({ hollowing_enable: '0', supports_enable: '0', pad_enable: '0' })); await fs.writeFile(path.join(root, 'profile.json'), JSON.stringify(profile));
-  const result = await prepareControlledResinHollow({ inputPath, outputDir: path.join(root, 'captures'), profilePath: path.join(root, 'profile.json'), prusaExecutable: path.resolve(process.env.QUICKPRINT_PRUSA_EXE || '.cache/prusa/PrusaSlicer-2.9.7/prusa-slicer-console.exe'), uvtoolsExecutable: path.resolve(process.env.QUICKPRINT_UVTOOLS_EXE || '.cache/uvtools/UVtoolsCmd.exe'), sizing: { mode: 'dimension', axis: 'z', millimeters: 10 },
-    hollowRequest: { orientation: { x: -0, y: 0, z: 0 }, wallThicknessMm: 2, quality: .75, closingDistanceMm: 0, drains: [3, 7].map(x => ({ id: 'bottom-' + x, startMm: { x, y: 5, z: 0 }, direction: { x: 0, y: 0, z: 1 }, radiusMm: 1.25, lengthMm: 3 })) }, supportRequest: { mode: 'none', clearanceMm: 0, points: [], regions: [] }, resolutionRequest: { maximumUncertaintyMm: .16 }, timeoutMs: 300000 });
+  const nativeOptions = { inputPath, outputDir: path.join(root, 'captures'), profilePath: path.join(root, 'profile.json'), prusaExecutable: aliases[0], uvtoolsExecutable: aliases[1], sizing: { mode: 'dimension', axis: 'z', millimeters: 10 },
+    hollowRequest: { orientation: { x: -0, y: 0, z: 0 }, wallThicknessMm: 2, quality: .75, closingDistanceMm: 0, drains: [3, 7].map(x => ({ id: 'bottom-' + x, startMm: { x, y: 5, z: 0 }, direction: { x: 0, y: 0, z: 1 }, radiusMm: 1.25, lengthMm: 3 })) }, supportRequest: { mode: 'none', clearanceMm: 0, points: [], regions: [] }, resolutionRequest: { maximumUncertaintyMm: .16 }, timeoutMs: 300000 };
+  const result = await prepareControlledResinHollow(nativeOptions);
   assert.deepEqual(await fs.readFile(inputPath), original); assert.equal(result.sourceSha256, hash(original)); assert.equal(result.printReady, false); assert.equal(result.printerCompatible, false); assert.equal(result.modelCopiesPerRun, 1);
   const record = result.hollowPreparation; assert.equal(record.invocations.length, 15); assert.equal(record.commandPlan.commands.length, 12); assert.equal(record.finalAudit.disposition, 'conforming'); assert.equal(record.finalAudit.nativeInvocationAttested, false); assert.equal(record.effectiveResolutionRequest.maxCells, 12000000); assert.equal(Object.hasOwn(record.request.resolutionRequest, 'maxCells'), false); assert.equal(result.analysis.count, 0); assert.equal(result.analysis.checks.length, 6);
+  for (const [index, id] of ['prusa', 'uvtools'].entries()) { assert.equal(record.providerManifest.providers[id].executable.toLowerCase(), providers[index].toLowerCase()); assert.equal(record.providerManifest.providers[id].files[0].filePath.toLowerCase(), providers[index].toLowerCase()); }
   for (const limits of [record.finalAudit.limits, record.finalAudit.limits.reference]) { assert.equal(limits.scan.maxCells, 12000000); assert.equal(limits.grid.maxVoxels, 12000000); assert.equal(limits.grid.maxWorkingBytes, record.resolution.request.maxWorkingBytes); assert.equal(limits.grid.maxTimeMs, 180000); }
   assert.equal(record.finalAudit.limits.timeoutMs, 300000); assert.equal(record.nativeBounds.perCommandMaximumMs, 300000); assert.equal(record.nativeBounds.overallTimeoutMs, 300000);
   assert.equal(record.nativeBounds.auditGridTimeoutMs, 180000); assert.deepEqual(JSON.parse(await fs.readFile(record.nativePolicyFile.filePath)), record.nativeBounds);
@@ -98,5 +116,14 @@ test('owned native controlled hollow: immutable recipes, all six checks, full au
   await assert.rejects(inspectControlledResinHollowBindings(resealed, options), { code: 'RESIN_HOLLOW_EXECUTION_CHANGED' });
   await fs.writeFile(record.commandPlanFile.filePath, JSON.stringify(record.commandPlan, null, 2)); await fs.writeFile(record.recordPath, JSON.stringify(record, null, 2));
   assert.equal((await inspectControlledResinHollowBindings(record, options)).bindingHash, light.bindingHash);
-  await fs.writeFile(path.join(root, 'verification.json'), JSON.stringify({ researchOnly: true, physicalPrintTested: false, root, result, restartHeavyVerified: true, scriptTamperHeld: true, resealedCommandPlanHeld: true, restoredBindingsVerified: true, bindingHash: light.bindingHash }, null, 2), { flag: 'wx' });
+  const heldOptions = { ...nativeOptions, outputDir: path.join(root, 'captures-held'), resolutionRequest: { maximumUncertaintyMm: .16, reduction: { x: 1, y: 1, z: 1 }, maxCells: 1 } };
+  await fs.writeFile(path.join(root, 'resource-hold-request-before-native.json'), JSON.stringify(heldOptions, null, 2), { flag: 'wx' });
+  let heldError; try { await prepareControlledResinHollow(heldOptions); } catch (error) { heldError = error; }
+  assert.equal(heldError?.code, 'RESIN_HOLLOW_AUDIT_LIMIT'); assert.equal(heldError.status, 413); assert.match(heldError.message, /did not complete: Declared grid exceeds/);
+  assert.equal(heldError.heldAudit.disposition, 'not_completed'); assert.equal(path.basename(heldError.heldAudit.filePath), 'final-audit-held.json'); assert.ok(heldError.heldAudit.bytes <= 8 * 1024 * 1024);
+  const heldBytes = await fs.readFile(heldError.heldAudit.filePath), held = JSON.parse(heldBytes), failure = JSON.parse(await fs.readFile(path.join(path.dirname(heldError.heldAudit.filePath), 'failure.json')));
+  assert.equal(hash(heldBytes), heldError.heldAudit.sha256); assert.equal(held.method, 'controlled-hollow-audit-failure-v1'); assert.equal(held.disposition, 'not_completed'); assert.equal(held.nativeInvocationAttested, false); assert.equal(held.productionEligible, false); assert.equal(held.error.code, 'RESIN_HOLLOW_AUDIT_LIMIT');
+  assert.equal(held.limits.reference.scan.maxCells, 1); assert.equal(held.limits.grid.maxVoxels, 1); assert.deepEqual(failure.heldAudit, heldError.heldAudit); assert.equal(failure.error.code, 'RESIN_HOLLOW_AUDIT_LIMIT'); assert.equal(failure.invocations.length, 15);
+  await assert.rejects(fs.lstat(path.join(path.dirname(heldError.heldAudit.filePath), 'hollow-preparation.json')), { code: 'ENOENT' });
+  await fs.writeFile(path.join(root, 'verification.json'), JSON.stringify({ researchOnly: true, physicalPrintTested: false, root, providers, aliases, result, restartHeavyVerified: true, scriptTamperHeld: true, resealedCommandPlanHeld: true, restoredBindingsVerified: true, boundedResourceHold: failure, bindingHash: light.bindingHash }, null, 2), { flag: 'wx' });
 });

@@ -138,6 +138,14 @@ requires full verification again. Persisted JSON flags cannot seed that cache or
 prove controlled execution. Exact attempted portal operations retain the existing
 durable replay semantics after a lost response.
 
+Held audits are preserved as bounded `final-audit-held.json` files, with their
+file hash, byte count and disposition referenced by `failure.json`. A completed
+negative or inconclusive audit is retained unchanged. If the auditor throws
+before completing, the separate `controlled-hollow-audit-failure-v1` diagnostic
+uses `disposition: "not_completed"` and records the original error and limits;
+it does not manufacture an audit result. Cancellation and resource error codes
+remain distinct, and diagnostic storage cannot accept a held artifact.
+
 ## Reproduce software verification
 
 The standalone tests use synthetic fixtures and do not require native providers:
@@ -158,6 +166,8 @@ $env:QUICKPRINT_HOLLOW_SERVICE_NATIVE = '1'
 node --test tests/resin-hollow-service.test.js
 $env:QUICKPRINT_HOLLOW_PORTAL_NATIVE = '1'
 node --test tests/layr-hollow-production-flow.test.js
+$env:QUICKPRINT_NATIVE_HOLLOW_TEST = '1'
+node --test tests/resin-hollow-engine.test.js
 ```
 
 ## Observed native validation
@@ -232,3 +242,72 @@ parts per run (one, then two). Both remained unqualified with `printReady:false`
 The portal stayed in preparation with zero printed units, zero QC credit and no
 printer upload, start or control calls. These local fixture results do not deploy
 the portal or qualify physical production.
+
+### Observed 16K hold
+
+A separate owned synthetic target used 15120 x 6230 pixels, 211.68 x 118.37 mm,
+0.05 mm layers and the same tilted 10 mm source, two corner-adjacent drains,
+7.037 mm elevation, four contacts and prior 8 mm support permissions. Its prior
+policy fixed reductions at `(8,5,2)`, maximum uncertainty at 0.2 mm, the actual
+crop at at most 20 million cells, and the overall deadline at 3,600 seconds.
+All 15 real guarded calls completed. The 456-layer final GOO passed all six issue
+checks, structural validation and target checks. Native process/tree commit
+peaked at 329,039,872 / 330,289,152 bytes under the unchanged 1 GiB limits.
+
+The complete body reference audit conformed, but the final unmasked audit was
+**inconclusive** with reason `final-drain-inconclusive`. At the actual 0.177687505
+mm allowance and 7,897,740-cell grid, both requested cylinder cores were clear,
+the body had no definite or ambiguous unauthorized changes, and all 461,835
+added exterior support cells fit their prior permissions. Nevertheless, neither
+drain had a proven fully black exterior-to-cavity path in the final intervals;
+the upper intervals permitted 131 and 124 inner cells respectively. This is an
+unresolved connectivity result, not evidence of either an open or blocked
+physical channel.
+
+Identical-policy standalone auditing and exact re-verification preserved proof
+SHA-256 `2f06aa9cd10b19bb27aa801b626c246aea0261e8ddb029928e726347af3dd4dd`.
+The controlled attempt stopped after 25.5 minutes without returning a successful
+preparation. Its 4,043,819-byte final file has SHA-256
+`b6824894908c50f80d22a1279b75ebd4fe7b64c27360a9078fb5907a6cd489db`.
+The engine source SHA-256 for this attempt was
+`01ba44e7155c65653a3b28a32ad16c81fa83c25fcf86d2fa35beb9a127797e0f`.
+Owned native files and diagnostics are retained under
+`artifacts/hollow-controlled-16k-2tQslE/` and excluded from publication. Subsequent
+diagnostic policies cannot retroactively accept this held controlled request.
+
+One separate post-hoc diagnostic used the same native files and support
+permissions with finer fixed reductions `(6,4,2)` and maximum uncertainty 0.16
+mm. It conformed at an actual 0.151113447 mm allowance, with both lower channels
+reaching the cavity (18 and 13 inner cells). Its 13,026,050-cell grid charged
+1,715,105,269 operations and 494,994,728 declared array bytes under the same hard
+caps. Diagnostic proof SHA-256:
+`cc6adcbcf1a4c339b8499229821e96eeacf25a7d0c4b7aaed26e6b187f4820d5`.
+This isolates the resolution sensitivity. It is not a controlled preparation
+success or an order receipt: `nativeInvocationAttested` and `productionEligible`
+remain false, and the original fixed-policy attempt remains held. A future
+controlled request must declare its chosen policy before capture.
+
+The original public implementation bytes are archived alongside the native
+evidence under `policy-source/`, with a source snapshot manifest, so the earlier
+proofs can be re-verified after subsequent provider-path and diagnostic changes.
+
+### Final provider-path and diagnostic regression
+
+The final controller revision also passed an actual-provider regression using
+genuine Windows DOS 8.3 aliases for both executables. Capture records correctly
+retain canonical provider paths. A 100-layer, support-disabled 10 mm fixture
+passed all 15 calls, all six final issue checks, full audit/replay, heavy
+verification after JSON reload, current binding checks and script/command
+tamper rejection. Its conforming audit SHA-256 was
+`556216414bf94fdc53f2827077f8ee0cdf4e00af2b9d97b4c7d9f65d90cede90`.
+
+A separate request declared a one-cell limit before its native calls. It
+correctly returned the original HTTP 413 `RESIN_HOLLOW_AUDIT_LIMIT` and preserved
+a 1,256-byte `not_completed` diagnostic with SHA-256
+`48a8e7d09ec0c87457c6609c67727533f8aa83fce3814ddbc6fb2c6392b86a0e`.
+No preparation was accepted for that limit failure. The complete regression
+passed in 153.5 seconds with the original source unchanged. Its engine source
+SHA-256 was `b6658822266fdd79fecd631fa4738a91d02237460a3c6afe0228a68581e172a2`;
+owned evidence remains under `artifacts/hollow-engine-native-alias-XVF0vK/`.
+This verifies configured-byte execution and digital checks without qualifying
+physical output or a live portal deployment.

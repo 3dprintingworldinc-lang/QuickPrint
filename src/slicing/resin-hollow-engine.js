@@ -78,6 +78,16 @@ async function readFile(filePath, maximum, { root, expected, bytes = false, empt
 }
 async function put(filePath, bytes) { await fs.writeFile(filePath, bytes, { flag: 'wx' }); return { filePath, bytes: bytes.length, sha256: hash(bytes) }; }
 const json = value => Buffer.from(JSON.stringify(value, null, 2));
+async function preserveHeldAudit(root, value) {
+  // Diagnostic persistence never changes the original hold/cancel/error into
+  // success, and never overwrites an earlier report in this unique attempt.
+  try {
+    const bytes = json(value); if (bytes.length > MAX_RECORD) return null;
+    await local(root, true);
+    return { ...await put(path.join(root, 'final-audit-held.json'), bytes), disposition: value.disposition,
+      ...(typeof value.sha256 === 'string' && HASH.test(value.sha256) ? { semanticSha256: value.sha256 } : {}) };
+  } catch { return null; }
+}
 const ZIP_LIMITS = { maxArchiveBytes: MAX_GOO, maxEntryBytes: 128 * MiB, maxTotalUncompressedBytes: 1024 * MiB, maxEntries: 25010, maxCompressionRatio: 10000 };
 function effectiveFromSl1(bytes) { const archive = inspectZip(bytes, ZIP_LIMITS), entry = archive.entries.find(item => item.name === 'prusaslicer.ini'); if (!entry || entry.uncompressedSize > MiB) throw fail('Missing bounded native effective SLA preset.', 'RESIN_HOLLOW_EFFECTIVE_MISMATCH', 502); return readZipEntry(bytes, entry, ZIP_LIMITS); }
 
@@ -166,7 +176,7 @@ function auditOptions(record, source, buffers, signal) {
 
 async function prepareControlledResinHollow(options) {
   const config = configuration(options), started = performance.now(), deadline = new AbortController();
-  let timedOut = false, capture, root, progressHandle, progress;
+  let timedOut = false, capture, root, progressHandle, progress, heldAudit;
   const timer = setTimeout(() => { timedOut = true; deadline.abort(); }, config.timeoutMs); timer.unref?.();
   const signal = config.signal ? AbortSignal.any([config.signal, deadline.signal]) : deadline.signal;
   const remaining = () => { const left = Math.floor(config.timeoutMs - (performance.now() - started)); if (left < 100) { timedOut = true; deadline.abort(); } if (signal.aborted) throw fail(timedOut ? 'Controlled hollow preparation exceeded its deadline.' : 'Hollow preparation cancelled.', timedOut ? 'RESIN_HOLLOW_TIMEOUT' : 'ABORTED', 409); return left; };
@@ -252,9 +262,23 @@ async function prepareControlledResinHollow(options) {
     if (record.invocations.length !== 15 || record.invocations.some(item => !capture.ownsInvocation(item) || item.status !== 'succeeded')) throw fail('The native execution trace is incomplete.', 'RESIN_HOLLOW_EXECUTION_INVALID', 409);
     remaining(); const args = auditOptions(record, prepared.stl, inputs.artifacts, signal);
     await progress('final-audit', 'started', { auditGridTimeoutMs: nativeBounds.auditGridTimeoutMs });
-    record.finalAudit = await auditResinHollowFinal(args);
+    try { record.finalAudit = await auditResinHollowFinal(args); }
+    catch (error) {
+      if (!signal.aborted) {
+        heldAudit = await preserveHeldAudit(root, { schemaVersion: 1, method: 'controlled-hollow-audit-failure-v1', disposition: 'not_completed',
+          error: { code: error.code || 'RESIN_HOLLOW_AUDIT_FAILED', message: String(error.message).slice(0, 512) }, sourceBinding: inputs.record.sourceBinding, policy: inputs.record.policy, limits: args.limits,
+          nativeInvocationAttested: false, productionEligible: false, geometricWallCertification: false, physicalDrainageCertification: false });
+        error.message = `Controlled hollow audit did not complete: ${String(error.message).slice(0, 384)}`;
+      }
+      if (heldAudit) error.heldAudit = heldAudit;
+      throw error;
+    }
     await progress('final-audit', 'completed', { disposition: record.finalAudit.disposition, sha256: record.finalAudit.sha256 });
-    if (record.finalAudit.disposition !== 'conforming') throw fail('Final supported hollow raster proof is held.', 'RESIN_HOLLOW_FINAL_NONCONFORMING', 409);
+    if (record.finalAudit.disposition !== 'conforming') {
+      heldAudit = await preserveHeldAudit(root, record.finalAudit);
+      const reasons = (record.finalAudit.gridAudit?.reasons ?? []).filter(value => typeof value === 'string').slice(0, 6).map(value => value.slice(0, 64)).join(', ');
+      throw Object.assign(fail(`Controlled hollow audit is ${record.finalAudit.disposition}: ${reasons || 'required predicates were not established'}.`, 'RESIN_HOLLOW_FINAL_NONCONFORMING', 409), heldAudit ? { heldAudit } : {});
+    }
     remaining(); await progress('final-replay', 'started', { auditGridTimeoutMs: nativeBounds.auditGridTimeoutMs }); const replay = await verifyResinHollowFinalAudit(args, record.finalAudit);
     await progress('final-replay', 'completed', { sha256: replay.sha256 });
     record.finalAuditReverified = replay.sha256 === record.finalAudit.sha256;
@@ -270,7 +294,7 @@ async function prepareControlledResinHollow(options) {
       sourceSha256: original.descriptor.sha256, profileSha256: loaded.profileSha256, printerId: loaded.profile.printerId, printerModel: loaded.profile.printerModel, material: loaded.profile.material, tool, inputGeometry, sizingPlan: prepared.plan, orientation: inputs.record.hollowPlan.request.orientation, modelCopiesPerRun: 1, hollowPreparation: freeze(record), createdAt: record.createdAt };
   } catch (error) {
     if (progress) await progress('preparation', 'failed', { code: error.code || 'RESIN_HOLLOW_FAILED' }).catch(() => {});
-    if (root) await fs.writeFile(path.join(root, 'failure.json'), json({ method: METHOD, error: { code: error.code || 'RESIN_HOLLOW_FAILED', message: error.message }, nativeInvocationAttested: false, productionEligible: false, invocations: capture?.getInvocations() ?? [] }), { flag: 'wx' }).catch(() => {});
+    if (root) await fs.writeFile(path.join(root, 'failure.json'), json({ method: METHOD, error: { code: error.code || 'RESIN_HOLLOW_FAILED', message: error.message }, ...(heldAudit ? { heldAudit } : {}), nativeInvocationAttested: false, productionEligible: false, invocations: capture?.getInvocations() ?? [] }), { flag: 'wx' }).catch(() => {});
     if (config.signal?.aborted) throw fail('Hollow preparation cancelled.', 'ABORTED', 409);
     if (timedOut) throw fail('Controlled hollow preparation exceeded its deadline.', 'RESIN_HOLLOW_TIMEOUT', 409);
     throw error;
@@ -340,7 +364,11 @@ async function inspectState(record, options) {
     if (!provider || provider.version !== (id === 'prusa' ? '2.9.7' : '7.1.2') || !/\.exe$/i.test(provider.executable) || provider.files.length !== names.length + 1) throw fail('The selected native provider manifest changed.', 'RESIN_HOLLOW_TOOL_CHANGED', 409);
     for (let index = 0; index < provider.files.length; index++) {
       const item = provider.files[index], expectedPath = index === 0 ? provider.executable : path.join(path.dirname(provider.executable), names[index - 1]);
-      if (path.resolve(item.filePath).toLowerCase() !== path.resolve(expectedPath).toLowerCase() || item.name !== (index === 0 ? id + '-executable' : names[index - 1])) throw fail('The selected dependency path changed.', 'RESIN_HOLLOW_TOOL_CHANGED', 409);
+      // A valid DOS 8.3 spelling may differ from the canonical descriptor.
+      // Check both complete ancestor chains and their physical leaf identity
+      // before comparing canonical locations; links still fail closed.
+      const canonicalExpected = await local(expectedPath, false);
+      if (path.resolve(item.filePath).toLowerCase() !== canonicalExpected.toLowerCase() || item.name !== (index === 0 ? id + '-executable' : names[index - 1])) throw fail('The selected dependency path changed.', 'RESIN_HOLLOW_TOOL_CHANGED', 409);
       const checked = await readFile(item.filePath, 256 * MiB, { expected: item, signal }); files.push(checked.descriptor);
     }
   }

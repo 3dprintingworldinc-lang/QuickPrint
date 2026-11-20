@@ -191,11 +191,12 @@ async function openJob(page, workspace) {
   await page.getByRole('button', { name: workspace.job.name, exact: true }).click();
 }
 
-test('two resin units require separate physical confirmations and counted runs, with no quality acceptance', async ({ page, workspace }) => {
+test('two resin units require separate physical confirmations and counted runs, with no quality acceptance', async ({ page, workspace }, testInfo) => {
   test.setTimeout(60000);
-  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  const errors = []; page.on('pageerror', error => { if (errors.length < 8) errors.push(error.message.slice(0, 1024)); });
   const dispatchBodies = [];
   page.on('request', request => { if (request.url().endsWith('/resin/production/dispatch')) dispatchBodies.push(request.postDataJSON()); });
+  try {
   expect(workspace.service.getSettings().resinEngine.dispatchEnabled).toBe(false);
   await approve(page, workspace);
   // The disabled setting is enforced on the API as well as the HTML button.
@@ -230,7 +231,16 @@ test('two resin units require separate physical confirmations and counted runs, 
     await page.getByLabel('Printed order units from this run (0 or 1)').fill('1');
     await page.getByLabel('Operator notes', { exact: true }).fill('One order unit printed; washing, curing and QC remain separate.');
     await page.getByRole('checkbox', { name: /I checked the stopped printer/ }).check();
+    const reconciliation = page.waitForResponse(response => response.url() === `${workspace.url}/api/jobs/${workspace.job.id}/resin/production/reconcile` && response.request().method() === 'POST');
     await page.getByRole('button', { name: 'Record resin run', exact: true }).click();
+    const recorded = await reconciliation;
+    let failureBody = '';
+    if (!recorded.ok()) {
+      const text = (await recorded.text()).slice(0, 4096);
+      try { const body = JSON.parse(text); failureBody = JSON.stringify({ error: String(body.error || '').slice(0, 100), message: String(body.message || '').slice(0, 1000) }); }
+      catch { failureBody = text.slice(0, 1000); }
+    }
+    expect(recorded.status(), failureBody || 'The exact resin reconciliation request must complete successfully before the modal transition.').toBe(200);
     await expect(page.getByRole('heading', { name: 'Job details', exact: true })).toBeVisible();
     await expect.poll(() => workspace.remote.printedParts).toBe(index + 1);
     const current = workspace.service.getJob(workspace.job.id);
@@ -291,6 +301,14 @@ test('two resin units require separate physical confirmations and counted runs, 
   expect(replacementSlice.material).toBe('Revised replacement fixture');
   expect(await fs.readFile(workspace.service.getJob(workspace.job.id).inputPath)).toEqual(MODEL);
   expect(workspace.remote.totals.printedParts).toBe(2); expect(errors).toEqual([]);
+  } catch (error) {
+    const current = workspace.service.getJob(workspace.job.id), run = current.runs.find(value => value.id === current.currentRunId) || current.runs.at(-1);
+    const diagnostic = { pageErrors: errors.slice(-4).map(message => message.slice(0, 512)), job: { status: current.status, currentRunId: current.currentRunId || null, acceptedQuantity: current.acceptedQuantity, printedParts: current.resinProduction?.printedParts, remainingParts: current.resinProduction?.remainingParts }, run: run ? { phase: run.phase, outcome: run.outcome, plannedParts: run.plannedParts, printedParts: run.printedParts, resolved: Boolean(run.resolvedAt), terminalOutcome: run.terminalEvidence?.outcome } : null };
+    const body = JSON.stringify(diagnostic, null, 2);
+    console.error('Bounded resin production failure state:', body);
+    await testInfo.attach('resin-production-failure-state', { body: Buffer.from(body), contentType: 'application/json' });
+    throw error;
+  }
 });
 
 test('a current qualification revocation is visible and cannot approve or start a resin order', async ({ page, workspace }) => {
