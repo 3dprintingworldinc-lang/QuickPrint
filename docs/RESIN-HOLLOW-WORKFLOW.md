@@ -115,6 +115,12 @@ predicate. Each native process and its complete child tree have a 1 GiB committe
 memory limit, plus bounded time, output and file sizes. These bounds are checked
 before or during execution and are recorded in the preparation evidence.
 
+For controlled hollow reference preparation, the Settings timeout covers all
+three native roles and their audits together: 900 seconds by default, configurable
+up to 3,600 seconds before capture. High-resolution captures can exceed the
+default; the observed 16K verification request declared 3,600 seconds in advance.
+An optional subsequent plate-replication operation has its own bounded deadline.
+
 The engine freezes the prior policy, native inputs, command plans, generated
 scripts and expected effective presets before exporting geometry. It captures
 provider and selected implementation hashes, actual arguments, input/output

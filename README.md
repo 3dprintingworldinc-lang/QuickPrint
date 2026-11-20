@@ -65,8 +65,10 @@ deterministic headless 3MF request. A [bounded streaming reference audit](docs/R
 now checks source-derived cavities, individual drain paths and complete supported
 output with exact native sampling elevation. A separate
 [Windows runner](docs/RESIN-NATIVE-RUNNER.md) bounds native process/tree committed
-memory. Controlled production adoption and physical qualification remain pending,
-so production hollowing is still unavailable.
+memory. The [controlled hollow workflow](docs/RESIN-HOLLOW-WORKFLOW.md) connects
+explicit recipe review, guarded native preparation, body/final verification and
+optional hollow plates to the order manager and portal receipts. Physical
+qualification and live portal activation remain pending.
 
 Explicit multi-copy resin plates reserve the native single-copy support/pad
 footprint and replicate that reference's exact grayscale layer images on the
