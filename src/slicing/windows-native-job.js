@@ -47,21 +47,37 @@ function configuration(executable, args, options) {
   return { executable, args: [...args], cwd: options.cwd, processCommitLimitBytes, jobCommitLimitBytes, timeoutMs, maxOutputBytes, signal: options.signal, environment };
 }
 
-// Check every ancestor; a leaf-only realpath check would miss a linked job root.
-async function localPath(filePath, directory) {
-  if (!/^[a-z]:\\/i.test(filePath) || filePath.startsWith('\\\\')) throw fail('Native work and executables must use local Windows drive paths.', 'WINDOWS_NATIVE_PATH');
-  const absolute = path.resolve(filePath), root = path.parse(absolute).root;
+// Check every input and canonical ancestor. DOS 8.3 aliases are allowed only
+// when both spellings resolve to the same pinned physical file/directory ID.
+const sameIdentity = (left, right) => left.dev === right.dev && left.ino === right.ino && left.directory === right.directory;
+async function pathChain(absolute, directory) {
+  const root = path.parse(absolute).root, parts = path.relative(root, absolute).split(path.sep).filter(Boolean), paths = [root];
   let at = root;
-  const parts = path.relative(root, absolute).split(path.sep).filter(Boolean);
-  for (let index = 0; index < parts.length; index++) {
-    at = path.join(at, parts[index]);
-    const info = await fs.lstat(at);
-    if (info.isSymbolicLink() || (index < parts.length - 1 || directory ? !info.isDirectory() : !info.isFile())) throw fail('Native paths cannot contain links or unexpected file types.', 'WINDOWS_NATIVE_PATH');
+  for (const part of parts) { at = path.join(at, part); paths.push(at); }
+  const chain = [];
+  for (let index = 0; index < paths.length; index++) {
+    const info = await fs.lstat(paths[index], { bigint: true }), needsDirectory = index < paths.length - 1 || directory;
+    if (info.isSymbolicLink() || (needsDirectory ? !info.isDirectory() : !info.isFile()) || typeof info.dev !== 'bigint' || typeof info.ino !== 'bigint' || info.ino <= 0n) throw fail('Native paths require nonlinked ordinary objects with stable file identities.', 'WINDOWS_NATIVE_PATH');
+    chain.push({ filePath: paths[index], dev: info.dev, ino: info.ino, directory: info.isDirectory() });
   }
-  const actual = await fs.realpath(absolute);
-  if (actual.toLowerCase() !== absolute.toLowerCase()) throw fail('Native path resolves to a different location.', 'WINDOWS_NATIVE_PATH');
-  return actual;
+  return chain;
 }
+async function verifyPathBinding(binding) {
+  const input = await pathChain(binding.input, binding.directory), canonical = await pathChain(binding.canonical, binding.directory);
+  const unchanged = (actual, expected) => actual.length === expected.length && actual.every((entry, index) => sameIdentity(entry, expected[index]));
+  if (!unchanged(input, binding.inputChain) || !unchanged(canonical, binding.canonicalChain) || !sameIdentity(input.at(-1), canonical.at(-1))) throw fail('Native path identity changed during canonicalization or execution.', 'WINDOWS_NATIVE_PATH', 409);
+}
+async function bindLocalPath(filePath, directory) {
+  if (!/^[a-z]:\\/i.test(filePath) || filePath.startsWith('\\\\')) throw fail('Native work and executables must use local Windows drive paths.', 'WINDOWS_NATIVE_PATH');
+  const input = path.resolve(filePath), inputChain = await pathChain(input, directory), canonical = await fs.realpath(input);
+  if (!/^[a-z]:\\/i.test(canonical) || canonical.startsWith('\\\\')) throw fail('Native canonical path must remain on a local Windows drive.', 'WINDOWS_NATIVE_PATH');
+  const canonicalChain = await pathChain(canonical, directory);
+  if (!sameIdentity(inputChain.at(-1), canonicalChain.at(-1))) throw fail('Native input and canonical paths refer to different objects.', 'WINDOWS_NATIVE_PATH');
+  const binding = { input, canonical, directory, inputChain, canonicalChain };
+  await verifyPathBinding(binding);
+  return binding;
+}
+async function localPath(filePath, directory) { return (await bindLocalPath(filePath, directory)).canonical; }
 async function readPinned(filePath, maximum) {
   const before = await fs.lstat(filePath, { bigint: true });
   if (!before.isFile() || before.isSymbolicLink() || before.size < 1n || before.size > BigInt(maximum)) throw fail('Native helper resource exceeds its file bounds.', 'WINDOWS_NATIVE_RESOURCE');
@@ -218,8 +234,8 @@ async function runWindowsNative(executable, args, options = {}) {
   if (config.signal?.aborted) throw abortError();
   if (process.platform !== 'win32') throw fail('Hard native job supervision requires Windows 10 or later.', 'WINDOWS_NATIVE_UNSUPPORTED', 501);
   let resources, outcome, error;
-  const cwd = await localPath(config.cwd, true); config.cwd = cwd;
-  await localPath(executable, false);
+  const cwdBinding = await bindLocalPath(config.cwd, true), executableBinding = await bindLocalPath(executable, false);
+  const cwd = cwdBinding.canonical; config.cwd = cwd; config.executable = executableBinding.canonical;
   const systemRoot = process.env.SystemRoot;
   if (typeof systemRoot !== 'string' || !/^[a-z]:\\/i.test(systemRoot)) throw fail('The Windows system directory is unavailable.', 'WINDOWS_NATIVE_UNAVAILABLE', 502);
   const powershell = await localPath(path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), false);
@@ -229,15 +245,16 @@ async function runWindowsNative(executable, args, options = {}) {
     const entries = resources.sources.map(source => ({ name: source.name, bytes: source.bytes.length, sha256: source.sha256 }));
     entries.push({ name: 'windows-powershell.exe', bytes: powershellBytes.length, sha256: hash(powershellBytes) });
     const manifest = freeze({ sha256: hash(JSON.stringify(entries)), files: entries });
-    const request = { schemaVersion: 1, requestId: randomBytes(16).toString('hex'), executable, arguments: config.args, directory: cwd, environment: config.environment, processCommitLimitBytes: config.processCommitLimitBytes, jobCommitLimitBytes: config.jobCommitLimitBytes, maxOutputBytes: config.maxOutputBytes, timeoutMs: config.timeoutMs };
+    const request = { schemaVersion: 1, requestId: randomBytes(16).toString('hex'), executable: config.executable, arguments: config.args, directory: cwd, environment: config.environment, processCommitLimitBytes: config.processCommitLimitBytes, jobCommitLimitBytes: config.jobCommitLimitBytes, maxOutputBytes: config.maxOutputBytes, timeoutMs: config.timeoutMs };
     if (Buffer.byteLength(JSON.stringify(request)) > LIMITS.maxRequestBytes) throw fail('Native arguments exceed the request bound.');
     await verifyResources(resources, cwd);
+    await verifyPathBinding(cwdBinding); await verifyPathBinding(executableBinding);
     if (config.signal?.aborted) throw abortError();
     outcome = await supervise(powershell, path.join(resources.directory, RESOURCES[0]), request, config, manifest);
   } catch (caught) { error = caught; }
   finally {
     if (resources) {
-      try { await verifyResources(resources, cwd); if (hash(await readPinned(powershell, 16 * 1024 * 1024)) !== hash(powershellBytes)) throw fail('Windows supervisor binary changed.', 'WINDOWS_NATIVE_RESOURCE_CHANGED', 409); }
+      try { await verifyPathBinding(cwdBinding); await verifyPathBinding(executableBinding); await verifyResources(resources, cwd); if (hash(await readPinned(powershell, 16 * 1024 * 1024)) !== hash(powershellBytes)) throw fail('Windows supervisor binary changed.', 'WINDOWS_NATIVE_RESOURCE_CHANGED', 409); }
       catch (caught) { error = caught; }
       try { await cleanup(resources, cwd); } catch (caught) { error ||= caught; }
     }

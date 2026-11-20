@@ -290,12 +290,23 @@ material exceeds its prior 3 mm authorization; replay preserves that result.
 Full-wrapper positive/replay tests use an owned support-disabled fixture, while
 the pure final-grid tests also include a tilted body and authorized pad.
 
+A separate fresh native attempt froze 8 mm fixture authorization regions,
+contacts, source, profiles, complete 3MFs, provider/source hashes and all command
+arguments before its first native call. All 12 slicing/conversion/check stages
+completed through the 1 GiB process/tree runner. Its full final audit and replay
+conform: all 793,197 exterior support/pad cells fit the prior regions, required
+voids remain clear, and both requested drain cores and individual paths pass.
+All six final native checks are zero, and all 684 PNG planes again match GOO
+decoding exactly. The original 3 mm rejection remains preserved. The 8 mm
+authorization is a fixture-specific choice; each new request declares its own
+regions and still undergoes the complete audit.
+
 The full final supported raster must remain unmasked during drain checks. An
 owned added exterior cap blocks the first channel while the second channel and
 global cavity remain open. Body-masked original and capped arrays are identical:
 masking supports away would erase the obstruction and falsely reuse the earlier
 channel pass. The supported-output auditor now binds these checks to the
-source, support authority and full final artifact. Trusted bounded native
+source, support authority and full final artifact. Reusable controlled native
 orchestration, production workflow adoption, all six final checks, physical
 qualification and live portal activation remain separate requirements. No
 audit report creates a printer permit or enables production hollowing.

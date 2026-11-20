@@ -43,9 +43,11 @@ using System.Text;
 using System.Threading;
 public static class OwnedNativeFixture {
  [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr VirtualAlloc(IntPtr address,UIntPtr bytes,uint allocation,uint protection);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern uint GetShortPathNameW(string path,StringBuilder output,uint length);
  public static int Main(string[] args) {
   Console.OutputEncoding=new UTF8Encoding(false);
   string mode=args[0];
+  if(mode=="short-path") {for(int i=1;i<args.Length;i++){var text=new StringBuilder(32768);uint n=GetShortPathNameW(args[i],text,(uint)text.Capacity);if(n==0||n>=text.Capacity)return 23;Console.WriteLine(text.ToString());}return 0;}
   if(mode=="allocate"||mode=="hold-allocation") {
    ulong size=UInt64.Parse(args[1])*1024*1024;IntPtr p=VirtualAlloc(IntPtr.Zero,new UIntPtr(size),0x3000,4);int error=Marshal.GetLastWin32Error();
    Console.WriteLine("allocated="+(p!=IntPtr.Zero)+" error="+error);Console.Out.Flush();
@@ -117,6 +119,29 @@ test('real Windows Job kernel limits, framing and owned process lifecycle', { sk
     const old = process.env.QUICKPRINT_JOB_TEST_SECRET; process.env.QUICKPRINT_JOB_TEST_SECRET = 'never-in-resource-receipts';
     try { const result = await run(['env'], { env: { DOTNET_PROCESSOR_COUNT: '1', OPENCV_FOR_THREADS_NUM: '1' } }); assert.equal(result.stdout, '1'); assert.ok(!JSON.stringify(result.resourceReceipt).includes('never-in-resource-receipts')); }
     finally { if (old === undefined) delete process.env.QUICKPRINT_JOB_TEST_SECRET; else process.env.QUICKPRINT_JOB_TEST_SECRET = old; }
+  });
+  await t.test('actual DOS short-name aliases preserve executable and cwd identity without weakening link rejection', async t => {
+    const canonicalRoot = await fs.realpath(root), canonicalExe = await fs.realpath(executable), names = await run(['short-path', canonicalRoot, canonicalExe]);
+    assert.equal(names.code, 0, names.stderr);
+    const [shortRoot, shortExe] = names.stdout.trim().split(/\r?\n/);
+    if (shortRoot.toLowerCase() === canonicalRoot.toLowerCase() && shortExe.toLowerCase() === canonicalExe.toLowerCase()) return t.skip('The owned volume does not assign DOS short names to these fixture paths.');
+    for (const [alias, canonical] of [[shortRoot, canonicalRoot], [shortExe, canonicalExe]]) {
+      const a = await fs.lstat(alias, { bigint: true }), b = await fs.lstat(canonical, { bigint: true }); assert.equal(a.dev, b.dev); assert.equal(a.ino, b.ino); assert.ok(a.ino > 0n);
+    }
+    const result = await runWindowsNative(shortExe, ['env'], { cwd: shortRoot, timeoutMs: 5000, maxOutputBytes: 4096 });
+    assert.equal(result.code, 0); assert.equal(result.stdout, '1'); assert.equal(result.resourceReceipt.assignedAtCreation, true);
+    const junction = path.join(root, 'alias-junction'); await fs.symlink(canonicalRoot, junction, 'junction');
+    try { const shortLink = await run(['short-path', junction]); assert.equal(shortLink.code, 0); await assert.rejects(runWindowsNative(shortExe, ['env'], { cwd: shortLink.stdout.trim() }), { code: 'WINDOWS_NATIVE_PATH' }); }
+    finally { await fs.unlink(junction); }
+    await noResources(root);
+  });
+  await t.test('canonicalization cannot substitute a different directory identity', async () => {
+    const other = path.join(root, 'different-canonical-object'); await fs.mkdir(other);
+    const original = fs.realpath;
+    fs.realpath = async function (value, ...args) { return path.resolve(String(value)).toLowerCase() === path.resolve(root).toLowerCase() ? other : original.call(this, value, ...args); };
+    try { await assert.rejects(runWindowsNative(executable, ['env'], { cwd: root }), { code: 'WINDOWS_NATIVE_PATH' }); }
+    finally { fs.realpath = original; }
+    await noResources(root);
   });
   await t.test('below-limit commit succeeds and over-limit commit is denied by the kernel', async () => {
     const small = await run(['allocate', '32']); assert.equal(small.code, 0); assert.match(small.stdout, /allocated=True/);
