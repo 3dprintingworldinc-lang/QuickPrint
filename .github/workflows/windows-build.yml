@@ -62,8 +62,8 @@ jobs:
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2) {
-            throw 'QuickPrint packaged startup, credential encryption or CAD resource extraction failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming') {
+            throw 'QuickPrint packaged startup, credentials, CAD resources or hollow raster worker failed.'
           }
           Copy-Item $report 'dist/windows-smoke-test.json'
       - name: Smoke test the portable executable
@@ -77,8 +77,8 @@ jobs:
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "Portable QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2) {
-            throw 'QuickPrint portable startup, credential encryption or CAD resource extraction failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming') {
+            throw 'QuickPrint portable startup, credentials, CAD resources or hollow raster worker failed.'
           }
           Copy-Item $report 'dist/windows-portable-smoke-test.json'
       - name: Verify the installer can be uninstalled

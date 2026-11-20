@@ -133,6 +133,24 @@ async function smokeCadWorkers() {
   }
 }
 
+async function smokeHollowGridWorker() {
+  const { auditResinHollowGridAsync, resolveHollowGridWorkerPath } = require('../slicing/resin-hollow-grid-async');
+  const workerPath = resolveHollowGridWorkerPath(), files = [];
+  for (const name of ['resin-hollow-grid-worker.js', 'resin-hollow-grid.js']) {
+    const filename = path.join(path.dirname(workerPath), name), stat = await fs.lstat(filename);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Hollow raster worker resource is not an ordinary file.');
+    const bytes = await fs.readFile(filename), packaged = await fs.readFile(path.join(__dirname, '..', 'slicing', name));
+    if (!bytes.length || !bytes.equals(packaged)) throw new Error('Hollow raster worker bytes differ from the packaged source.');
+    files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+  }
+  const solid = new Uint8Array(125), hollow = new Uint8Array(125);
+  for (let z = 1; z < 4; z++) for (let y = 1; y < 4; y++) for (let x = 1; x < 4; x++) solid[(z * 5 + y) * 5 + x] = hollow[(z * 5 + y) * 5 + x] = 255;
+  const result = await auditResinHollowGridAsync({ solid: { lower: solid, upper: solid }, hollow: { lower: hollow, upper: hollow }, frame: { nx: 5, ny: 5, nz: 5, pitchMm: { x: 1, y: 1, z: 1 }, originMm: { x: 0, y: 0, z: 0 }, direction: { x: 1, y: 1, z: 1 } }, wallThicknessMm: 1, uncertaintyMm: 0.2,
+    drains: [{ id: 'owned-smoke-drain', startMm: { x: 2.5, y: 2.5, z: -1 }, direction: { x: 0, y: 0, z: 1 }, radiusMm: 2, lengthMm: 7 }], limits: { maxTimeMs: 10000 } });
+  if (result.disposition !== 'nonconforming' || !result.counts.definitelyRetainedExpectedCavity) throw new Error('Packaged hollow raster worker did not reject the owned solid control.');
+  return { executed: true, count: files.length, disposition: result.disposition, files };
+}
+
 async function smokeCheck(credentials) {
   const response = await fetch(new URL('/api/health', backend.url), { signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Health check failed: HTTP ${response.status}`);
@@ -160,13 +178,14 @@ async function smokeCheck(credentials) {
   })()`);
   if (!apiReady) throw new Error('The desktop could not read its authenticated local API.');
   const cadWorkers = await smokeCadWorkers();
+  const hollowGridWorker = await smokeHollowGridWorker();
   let credentialRoundTrip = 'unavailable-on-this-platform';
   if (process.platform === 'win32' || safeStorage.isEncryptionAvailable() && safeStorage.getSelectedStorageBackend?.() !== 'basic_text') {
     const probe = 'quickprint-smoke-test-not-a-secret';
     if (credentials.unseal(credentials.seal(probe)) !== probe) throw new Error('Credential storage validation failed.');
     credentialRoundTrip = 'passed';
   }
-  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, checkedAt: new Date().toISOString() });
+  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, hollowGridWorker, checkedAt: new Date().toISOString() });
   stopping = true;
   await stopBackend();
   mainWindow.destroy();

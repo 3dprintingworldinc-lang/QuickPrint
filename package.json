@@ -37,6 +37,10 @@
     "appId": "com.3dprintingworld.quickprint",
     "productName": "QuickPrint",
     "asar": true,
+    "asarUnpack": [
+      "src/slicing/resin-hollow-grid-worker.js",
+      "src/slicing/resin-hollow-grid.js"
+    ],
     "npmRebuild": false,
     "directories": {
       "output": "dist",

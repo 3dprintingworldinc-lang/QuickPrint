@@ -61,8 +61,9 @@ accounts for every source face, preserves the frozen original and binds the
 reviewed derivative through sizing, slicing and production evidence.
 The separate [hollow/drain request builder](docs/RESIN-HOLLOWING.md) binds explicit
 cylinders and native settings to the reviewed sized model and generates a
-deterministic headless 3MF request. Resulting cavity/wall verification remains
-pending, so production hollowing is still unavailable.
+deterministic headless 3MF request. A [bounded streaming reference audit](docs/RESIN-HOLLOW-AUDIT.md)
+now checks source-derived cavities and individual drain paths. Final supported
+output verification remains pending, so production hollowing is still unavailable.
 
 Explicit multi-copy resin plates reserve the native single-copy support/pad
 footprint and replicate that reference's exact grayscale layer images on the

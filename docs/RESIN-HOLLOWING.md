@@ -5,6 +5,9 @@ reviewed, sized, zero-origin millimetre STL. This is an automation interface for
 provider verification. It does **not** qualify hollow output for an order.
 The production engine still requires `hollowing_enable = 0` and returns
 `RESIN_DRAIN_PLAN_REQUIRED` for a hollow preset.
+The separate [source-bound reference raster audit](RESIN-HOLLOW-AUDIT.md) now
+checks paired native body references, including cavity coverage and individual
+drains. It remains unqualified pending the final supported-output contract.
 
 The request pins three separate SHA-256 values: the original order source, the
 reviewed sized STL bytes, and the sizing review. The caller must supply the
