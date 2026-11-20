@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const Zip = require('adm-zip');
 const { auditResinHollowReferences, verifyResinHollowReferenceAudit } = require('../src/slicing/resin-hollow-audit');
+const { prepareResinHollowSupports, createSupportedHollow3mf } = require('../src/slicing/resin-hollow-supports');
 const { fixture, hash } = require('./helpers/resin-hollow-reference');
 function options(f) { const { directory, ...input } = f; return input; }
 
@@ -37,6 +38,30 @@ test('stale source/sizing review and changed full 3MF payloads stop before inter
   await assert.rejects(auditResinHollowReferences({ ...options(f), hollow: { ...f.hollow, input3mf: archive.toBuffer() } }), { code: 'RESIN_HOLLOW_REFERENCE_CHANGED' });
   const extra = new Zip(f.hollow.input3mf); extra.addFile('extra.dat', Buffer.from('Extra unreviewed metadata'));
   await assert.rejects(auditResinHollowReferences({ ...options(f), hollow: { ...f.hollow, input3mf: extra.toBuffer() } }));
+});
+
+test('inactive authored support metadata requires the independently frozen support authority and unchanged profile', async t => {
+  const f = await fixture(t), preset = Buffer.from(f.hollow.effectivePreset.toString().replace('supports_enable = 0', 'supports_enable = 1').replace('pad_enable = 0', 'pad_enable = 1') + 'support_tree_type = default\npad_around_object = 0\npad_around_object_everywhere = 0\nsupport_object_elevation = 5\npad_wall_thickness = 2\npad_wall_height = 0\nsupport_head_penetration = 0.4\nsupport_head_front_diameter = 0.8\n');
+  const support = prepareResinHollowSupports(f.source, f.plan, f.expectedBinding, preset, { mode: 'points', clearanceMm: 4, regions: [], points: [{ id: 'contact-0', sourceFaceIndex: 0, positionMm: { x: 0, y: 0, z: 0 }, headRadiusMm: 0.4, allowedRadiusMm: 3 }] });
+  const hollowInput = createSupportedHollow3mf(f.source, f.plan, f.expectedBinding, preset, support.plan, f.placement).threeMf, solidInput = new Zip(hollowInput);
+  solidInput.deleteFile(f.plan.native.drainMetadataPath);
+  const inactivePreset = Buffer.from(preset.toString().replace('supports_enable = 1', 'supports_enable = 0').replace('pad_enable = 1', 'pad_enable = 0'));
+  const input = { ...options(f), solid: { ...f.solid, input3mf: solidInput.toBuffer(), effectivePreset: Buffer.from(inactivePreset.toString().replace('hollowing_enable = 1', 'hollowing_enable = 0')) }, hollow: { ...f.hollow, input3mf: hollowInput, effectivePreset: inactivePreset }, supports: { plan: support.plan, preset } };
+  const result = await auditResinHollowReferences(input);
+  assert.equal(result.disposition, 'conforming'); assert.deepEqual(result.supportBinding, { supportPlanSha256: support.plan.sha256, presetSha256: hash(preset), inactiveInReferences: true });
+  await assert.rejects(auditResinHollowReferences({ ...input, policy: { ...input.policy, referenceMode: 'suppressed-support-elevation' } }), { code: 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED' });
+  const without = { ...input }; delete without.supports; await assert.rejects(auditResinHollowReferences(without));
+  await assert.rejects(auditResinHollowReferences({ ...input, hollow: { ...input.hollow, effectivePreset: Buffer.from(inactivePreset.toString().replace('support_head_penetration = 0.4', 'support_head_penetration = 0.5')) } }), { code: 'RESIN_HOLLOW_REFERENCE_CHANGED' });
+  const changed = new Zip(hollowInput), metadataPath = support.plan.native.supportMetadataPath;
+  changed.updateFile(metadataPath, Buffer.from(changed.readAsText(metadataPath).replace('0.4000000059604645', '0.5')));
+  await assert.rejects(auditResinHollowReferences({ ...input, hollow: { ...input.hollow, input3mf: changed.toBuffer() } }), { code: 'RESIN_HOLLOW_SUPPORT_CHANGED' });
+});
+
+test('enclosure boundary policy is explicit and preserves its unchanged uncertainty and full foreground accounting', async t => {
+  const f = await fixture(t), result = await auditResinHollowReferences({ ...options(f), policy: { ...f.policy, boundaryPolicy: 'voxel-enclosure' } });
+  assert.equal(result.disposition, 'conforming'); assert.equal(result.policy.boundaryPolicy, 'voxel-enclosure'); assert.equal(result.gridAudit.boundaryPolicy, 'voxel-enclosure'); assert.equal(result.foregroundOutsideCropPixels, 0);
+  await assert.rejects(auditResinHollowReferences({ ...options(f), policy: { ...f.policy, boundaryPolicy: 'adaptive' } }));
+  await assert.rejects(auditResinHollowReferences({ ...options(f), policy: { ...f.policy, referenceMode: 'suppressed-support-elevation' } }));
 });
 
 test('effective profile, support/elevation, correction and physical layer mismatches cannot be hidden by matching model hashes', async t => {
@@ -84,6 +109,18 @@ test('matching global properties cannot qualify an enabled arbitrary per-layer p
     await fs.writeFile(reference.filePath, bytes); reference.sha256 = hash(bytes);
   }
   await assert.rejects(auditResinHollowReferences(options(f)), { code: 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED' });
+});
+
+test('blank terminal definitions cannot hide a shortened source with otherwise coherent cavity and top wall', async t => {
+  const f = await fixture(t), solid = await fs.readFile(f.solid.filePath), hollow = await fs.readFile(f.hollow.filePath);
+  function layers(bytes) { const result = []; let at = 195477; for (let index = 0; index < 100; index++) { const length = bytes.readUInt32BE(at + 66); result.push({ definition: Buffer.from(bytes.subarray(at, at + 70)), image: bytes.subarray(at + 70, at + 72 + length) }); at += 72 + length; } return result; }
+  const solidLayers = layers(solid), hollowLayers = layers(hollow), blackImage = Buffer.from([0x55, 0x20, 0x09, 0xc4, 0x12, 13, 10]);
+  for (const [reference, original, values, isHollow] of [[f.solid, solid, solidLayers, false], [f.hollow, hollow, hollowLayers, true]]) {
+    const parts = [original.subarray(0, 195477)];
+    for (let index = 0; index < 100; index++) { const definition = values[index].definition, image = index >= 50 ? blackImage : isHollow && index >= 40 ? solidLayers[index].image : values[index].image; definition.writeUInt32BE(image.length - 2, 66); parts.push(definition, image); }
+    parts.push(original.subarray(original.length - 11)); const bytes = Buffer.concat(parts); await fs.writeFile(reference.filePath, bytes); reference.sha256 = hash(bytes);
+  }
+  await assert.rejects(auditResinHollowReferences(options(f)), { code: 'RESIN_HOLLOW_REFERENCE_CHANGED' });
 });
 
 test('audit CLI creates and revalidates a source-bound report without overwriting earlier evidence', async t => {

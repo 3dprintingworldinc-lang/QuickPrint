@@ -151,6 +151,43 @@ async function smokeHollowGridWorker() {
   return { executed: true, count: files.length, disposition: result.disposition, files };
 }
 
+async function smokeHollowFinalGridWorker() {
+  const { auditResinHollowFinalGridAsync, resolveHollowFinalGridWorkerPath } = require('../slicing/resin-hollow-final-grid-async');
+  const workerPath = resolveHollowFinalGridWorkerPath(), files = [];
+  for (const name of ['resin-hollow-final-grid-async.js', 'resin-hollow-final-grid-worker.js', 'resin-hollow-final-grid.js', 'resin-hollow-grid.js']) {
+    const filename = path.join(path.dirname(workerPath), name), stat = await fs.lstat(filename);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Final hollow worker resource is not an ordinary file.');
+    const bytes = await fs.readFile(filename), packaged = await fs.readFile(path.join(__dirname, '..', 'slicing', name));
+    if (!bytes.length || !bytes.equals(packaged)) throw new Error('Final hollow worker resource differs from the packaged source.');
+    files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+  }
+  const arrays = Array.from({ length: 6 }, () => new Uint8Array(125));
+  for (let z = 1; z < 4; z++) for (let y = 1; y < 4; y++) for (let x = 1; x < 4; x++) for (const array of arrays) array[(z * 5 + y) * 5 + x] = 255;
+  const result = await auditResinHollowFinalGridAsync({ solidBody: { lower: arrays[0], upper: arrays[1] }, hollowBody: { lower: arrays[2], upper: arrays[3] }, final: { lower: arrays[4], upper: arrays[5] }, frame: { nx: 5, ny: 5, nz: 5, pitchMm: { x: 1, y: 1, z: 1 }, originMm: { x: 0, y: 0, z: 0 }, direction: { x: 1, y: 1, z: 1 } }, wallThicknessMm: 1, uncertaintyMm: 0.2,
+    drains: [{ id: 'owned-final-smoke-drain', startMm: { x: 2.5, y: 2.5, z: -1 }, direction: { x: 0, y: 0, z: 1 }, radiusMm: 2, lengthMm: 7 }], supportEnvelope: { minMm: { x: 0, y: 0, z: 0 }, maxMm: { x: 5, y: 5, z: 5 } }, supportRegions: [], limits: { maxTimeMs: 10000 } });
+  if (result.disposition !== 'nonconforming' || !result.finalMaterialAudit.counts.definitelyRetainedExpectedCavity || arrays.some(array => array.byteLength !== 0)) throw new Error('Packaged final hollow worker failed its six-buffer solid control.');
+  return { executed: true, count: files.length, disposition: result.disposition, inputBuffersTransferred: 6, files };
+}
+
+async function smokeWindowsNativeJob() {
+  const root = path.resolve(app.getPath('userData')), files = [];
+  for (const name of ['windows-native-job.js', 'windows-native-job.ps1', 'windows-native-job.cs']) {
+    const source = path.join(__dirname, '..', 'slicing', name);
+    const physical = app.isPackaged ? path.join(process.resourcesPath, 'app.asar.unpacked', 'src', 'slicing', name) : source;
+    const stat = await fs.lstat(physical), bytes = await fs.readFile(physical), packaged = await fs.readFile(source);
+    if (!stat.isFile() || stat.isSymbolicLink() || !bytes.length || !bytes.equals(packaged)) throw new Error('Native job supervisor resource differs from the packaged source.');
+    files.push({ name, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') });
+  }
+  if (process.platform !== 'win32') return { executed: false, reason: 'requires-windows', count: files.length, files };
+  const { runWindowsNative } = require('../slicing/windows-native-job');
+  const executable = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const result = await runWindowsNative(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', "[Console]::Write('quickprint-native-job-smoke'); exit 7"], { cwd: root, processCommitLimitBytes: 1024 * 1024 * 1024, jobCommitLimitBytes: 1024 * 1024 * 1024, timeoutMs: 10000, maxOutputBytes: 4096 });
+  const receipt = result.resourceReceipt;
+  if (result.code !== 7 || result.stdout !== 'quickprint-native-job-smoke' || !receipt.assignedAtCreation || !receipt.killOnJobClose || receipt.memoryAccounting !== 'committed-virtual-memory-not-rss') throw new Error('Packaged native job supervisor did not preserve its guarded native exit.');
+  for (const file of files) if (receipt.supervisorManifest.files.filter(item => item.name === file.name && item.sha256 === file.sha256 && item.bytes === file.bytes).length !== 1) throw new Error('Executed native job resource differs from its packaged hash.');
+  return { executed: true, count: files.length, nativeExitCode: result.code, resourceReceipt: receipt, files };
+}
+
 async function smokeCheck(credentials) {
   const response = await fetch(new URL('/api/health', backend.url), { signal: AbortSignal.timeout(10000) });
   if (!response.ok) throw new Error(`Health check failed: HTTP ${response.status}`);
@@ -179,13 +216,15 @@ async function smokeCheck(credentials) {
   if (!apiReady) throw new Error('The desktop could not read its authenticated local API.');
   const cadWorkers = await smokeCadWorkers();
   const hollowGridWorker = await smokeHollowGridWorker();
+  const hollowFinalGridWorker = await smokeHollowFinalGridWorker();
+  const windowsNativeJob = await smokeWindowsNativeJob();
   let credentialRoundTrip = 'unavailable-on-this-platform';
   if (process.platform === 'win32' || safeStorage.isEncryptionAvailable() && safeStorage.getSelectedStorageBackend?.() !== 'basic_text') {
     const probe = 'quickprint-smoke-test-not-a-secret';
     if (credentials.unseal(credentials.seal(probe)) !== probe) throw new Error('Credential storage validation failed.');
     credentialRoundTrip = 'passed';
   }
-  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, hollowGridWorker, checkedAt: new Date().toISOString() });
+  await writeSmokeReport({ ok: true, version: app.getVersion(), platform: process.platform, arch: process.arch, packaged: app.isPackaged, health, renderer, uiReady, apiReady, nativeVersion, credentialRoundTrip, cadWorkers, hollowGridWorker, hollowFinalGridWorker, windowsNativeJob, checkedAt: new Date().toISOString() });
   stopping = true;
   await stopBackend();
   mainWindow.destroy();

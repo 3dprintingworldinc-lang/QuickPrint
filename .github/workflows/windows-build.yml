@@ -62,8 +62,8 @@ jobs:
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming') {
-            throw 'QuickPrint packaged startup, credentials, CAD resources or hollow raster worker failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming' -or $result.hollowFinalGridWorker.executed -ne $true -or $result.hollowFinalGridWorker.count -ne 4 -or $result.hollowFinalGridWorker.inputBuffersTransferred -ne 6 -or $result.hollowFinalGridWorker.disposition -ne 'nonconforming' -or $result.windowsNativeJob.executed -ne $true -or $result.windowsNativeJob.count -ne 3 -or $result.windowsNativeJob.nativeExitCode -ne 7 -or $result.windowsNativeJob.resourceReceipt.assignedAtCreation -ne $true -or $result.windowsNativeJob.resourceReceipt.memoryAccounting -ne 'committed-virtual-memory-not-rss' -or $result.windowsNativeJob.resourceReceipt.processCommitLimitBytes -ne 1073741824 -or $result.windowsNativeJob.resourceReceipt.jobCommitLimitBytes -ne 1073741824) {
+            throw 'QuickPrint packaged startup, credentials, worker resources or hard native job guard failed.'
           }
           Copy-Item $report 'dist/windows-smoke-test.json'
       - name: Smoke test the portable executable
@@ -77,22 +77,29 @@ jobs:
           if (Test-Path $report) { Get-Content $report }
           if ($process.ExitCode -ne 0) { throw "Portable QuickPrint exited with $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming') {
-            throw 'QuickPrint portable startup, credentials, CAD resources or hollow raster worker failed.'
+          if (-not $result.ok -or -not $result.packaged -or $result.credentialRoundTrip -ne 'passed' -or $result.cadWorkers.extracted -ne $true -or $result.cadWorkers.count -ne 2 -or $result.hollowGridWorker.executed -ne $true -or $result.hollowGridWorker.count -ne 2 -or $result.hollowGridWorker.disposition -ne 'nonconforming' -or $result.hollowFinalGridWorker.executed -ne $true -or $result.hollowFinalGridWorker.count -ne 4 -or $result.hollowFinalGridWorker.inputBuffersTransferred -ne 6 -or $result.hollowFinalGridWorker.disposition -ne 'nonconforming' -or $result.windowsNativeJob.executed -ne $true -or $result.windowsNativeJob.count -ne 3 -or $result.windowsNativeJob.nativeExitCode -ne 7 -or $result.windowsNativeJob.resourceReceipt.assignedAtCreation -ne $true -or $result.windowsNativeJob.resourceReceipt.memoryAccounting -ne 'committed-virtual-memory-not-rss' -or $result.windowsNativeJob.resourceReceipt.processCommitLimitBytes -ne 1073741824 -or $result.windowsNativeJob.resourceReceipt.jobCommitLimitBytes -ne 1073741824) {
+            throw 'QuickPrint portable startup, credentials, worker resources or hard native job guard failed.'
           }
           Copy-Item $report 'dist/windows-portable-smoke-test.json'
-      - name: Verify packaged hollow worker source hashes
+      - name: Verify packaged worker and native guard source hashes
         shell: pwsh
         run: |
           foreach ($reportPath in @('dist/windows-smoke-test.json', 'dist/windows-portable-smoke-test.json')) {
             $report = Get-Content $reportPath -Raw | ConvertFrom-Json
-            foreach ($workerName in @('resin-hollow-grid-worker.js', 'resin-hollow-grid.js')) {
-              $actual = @($report.hollowGridWorker.files | Where-Object { $_.name -ceq $workerName })
-              if ($actual.Count -ne 1) { throw "Packaged worker report is missing a unique $workerName." }
-              $sourcePath = Join-Path 'src/slicing' $workerName
-              $sourceSha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
-              if ($actual[0].sha256 -cne $sourceSha256) { throw "Packaged worker differs from the checked-out source: $workerName." }
-              Write-Host "Verified $reportPath $workerName $sourceSha256"
+            $groups = @(
+              @{ field = 'hollowGridWorker'; names = @('resin-hollow-grid-worker.js', 'resin-hollow-grid.js') },
+              @{ field = 'hollowFinalGridWorker'; names = @('resin-hollow-final-grid-async.js', 'resin-hollow-final-grid-worker.js', 'resin-hollow-final-grid.js', 'resin-hollow-grid.js') },
+              @{ field = 'windowsNativeJob'; names = @('windows-native-job.js', 'windows-native-job.ps1', 'windows-native-job.cs') }
+            )
+            foreach ($group in $groups) {
+              foreach ($workerName in $group.names) {
+                $actual = @($report.($group.field).files | Where-Object { $_.name -ceq $workerName })
+                if ($actual.Count -ne 1) { throw "Packaged resource report is missing a unique $workerName." }
+                $sourcePath = Join-Path 'src/slicing' $workerName
+                $sourceSha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($actual[0].sha256 -cne $sourceSha256) { throw "Packaged resource differs from the checked-out source: $workerName." }
+                Write-Host "Verified $reportPath $workerName $sourceSha256"
+              }
             }
           }
       - name: Verify the installer can be uninstalled

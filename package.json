@@ -39,7 +39,13 @@
     "asar": true,
     "asarUnpack": [
       "src/slicing/resin-hollow-grid-worker.js",
-      "src/slicing/resin-hollow-grid.js"
+      "src/slicing/resin-hollow-grid.js",
+      "src/slicing/resin-hollow-final-grid-async.js",
+      "src/slicing/resin-hollow-final-grid-worker.js",
+      "src/slicing/resin-hollow-final-grid.js",
+      "src/slicing/windows-native-job.js",
+      "src/slicing/windows-native-job.ps1",
+      "src/slicing/windows-native-job.cs"
     ],
     "npmRebuild": false,
     "directories": {

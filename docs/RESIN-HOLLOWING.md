@@ -172,9 +172,11 @@ Additional independent research established useful failure controls:
   [CLI action implementation](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/CLI/ProcessActions.cpp)
   and [SLA processing stages](https://github.com/prusa3d/PrusaSlicer/blob/version_2.9.7/src/libslic3r/SLAPrintSteps.cpp).
 
-Production enablement still needs a bounded result verifier that binds the
-original source, exact request, effective settings and final layer artifact;
-checks intended cavity coverage, each drain's exterior connectivity and wall
-policy; and accounts for supports, pad elevation and native numerical error.
-The six native issue checks remain required after that verification. There is
-no hollowing success receipt, order approval or printer permit in this module.
+The [bounded body and final raster auditors](RESIN-HOLLOW-AUDIT.md) now bind the
+original source, requests, support authority, effective settings and final layer
+artifact. They check cavity coverage, each drain, wall policy and full unmasked
+support material at the exact native sampling elevation. Reports remain
+unqualified: controlled native orchestration and production workflow adoption
+are still required, followed by all six native issue checks and physical
+qualification. There is no hollowing production receipt, order approval or
+printer permit in this request module.

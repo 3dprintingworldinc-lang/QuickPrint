@@ -44,6 +44,83 @@ test('a blocked first drill cannot borrow the second drill exterior opening',()=
   const result=auditResinHollowGrid(input);assert.equal(result.counts.cavityUnreachableLower,0);assert.equal(result.drains[0].fullyBlackExteriorToCavity,false);assert.equal(result.drains[0].possibleExteriorToCavity,false);assert.equal(result.drains[0].disposition,'nonconforming');assert.equal(result.drains[1].disposition,'conforming');assert.equal(result.disposition,'nonconforming');
 });
 
+test('every shrunken drill cell must be black even when a thin path remains open',()=>{
+  for(const value of[255,128]){
+    const input=copy(fixture());setHollow(input,7,10,3,value);
+    const result=auditResinHollowGrid(input),first=result.drains[0];
+    assert.equal(first.fullyBlackExteriorToCavity,true,'the remaining center thread still reaches the cavity');
+    assert.equal(first.distinctDefinitelyRemovedWallCells>0,true);
+    assert.equal(first.retainedLowerCylinderCells,value===255?1:0);assert.equal(first.ambiguousLowerCylinderCells,value===128?1:0);
+    assert.equal(first.disposition,value===255?'nonconforming':'inconclusive');assert.equal(result.disposition,first.disposition);
+    assert.ok(first.reasons.includes(value===255?'requested-channel-obstruction':'requested-channel-ambiguous'));
+    assert.equal(first.lowerCylinderWitnesses[value===255?'retained':'ambiguous'][0].index,index(input.frame,7,10,3));
+    assert.equal(result.drains[1].disposition,'conforming');
+  }
+});
+
+test('processed-source exterior seeds cannot borrow a second drill through a capped source-exterior pocket',()=>{
+  const input=copy(fixture());
+  // A box outside the reference encloses the first drill mouth. Its only void
+  // connection is through that drill, the inner cavity and the second drill.
+  for(let z=0;z<=1;z++)for(let y=6;y<=14;y++)for(let x=2;x<=10;x++)if(z===0||x===2||x===10||y===6||y===14)setHollow(input,x,y,z,255);
+  const original=auditResinHollowGrid(input),restricted=auditResinHollowGrid({...input,exteriorSeedPolicy:'processed-source-exterior'});
+  assert.equal(original.drains[0].fullyBlackExteriorToCavity,true);
+  assert.equal(restricted.drains[0].fullyBlackExteriorToCavity,false);assert.equal(restricted.drains[0].possibleExteriorToCavity,false);
+  assert.equal(restricted.drains[0].lowerFlood.seeds,0);assert.equal(restricted.drains[1].fullyBlackExteriorToCavity,true);
+  assert.ok(restricted.connectivity.processedSourceExteriorLower.visitedCells<original.connectivity.sourceExteriorLower.visitedCells);
+  assert.equal(original.exteriorSeedPolicy,'source-exterior');assert.equal(original.connectivity.processedSourceExteriorLower,null);
+});
+
+test('explicit voxel enclosure accepts only witnessed boundary-band changes at the unchanged uncertainty',()=>{
+  const input=copy(fixture());input.wallThicknessMm=.9;input.uncertaintyMm=.26;
+  for(const[y,source,result]of[[4,128,129],[5,128,127]]){const i=index(input.frame,2,y,14);input.solid.lower[i]=input.solid.upper[i]=source;setHollow(input,2,y,14,result);}
+  // Set enclosure treats black/white/gray through the same distance policy.
+  setHollow(input,1,10,14,255);
+  const exact=auditResinHollowGrid(input),explicitExact=auditResinHollowGrid({...input,boundaryPolicy:'exact-raster'}),enclosed=auditResinHollowGrid({...input,boundaryPolicy:'voxel-enclosure'});
+  assert.deepEqual(exact,explicitExact);assert.equal(exact.disposition,'nonconforming');assert.equal(exact.boundaryPolicy,'exact-raster');assert.equal(exact.boundaryEnclosure,null);
+  assert.equal(enclosed.disposition,'conforming');assert.equal(enclosed.uncertaintyMm,input.uncertaintyMm);assert.equal(enclosed.counts.addedOutsideSource,1);assert.equal(enclosed.counts.changedOuterBandOutsideDrains,3);
+  assert.equal(enclosed.boundaryEnclosure.counts.changedOuterBandWithinBoundaryBand,3);assert.equal(enclosed.boundaryEnclosure.counts.upperMaterialOutsideSourceDilation,0);assert.equal(enclosed.boundaryEnclosure.counts.protectedOuterWallLoss,0);assert.equal(enclosed.boundaryEnclosure.counts.changedOuterBandOutsideBoundaryBand,0);
+  assert.ok(enclosed.boundaryEnclosure.counts.protectedOuterWallCells>0);assert.deepEqual(JSON.parse(JSON.stringify(enclosed)),enclosed);
+  assert.equal(enclosed.resources.additionalArrayBytes,exact.resources.additionalArrayBytes,'material EDT reuses the existing field and mask');
+  const lost=copy(input);setHollow(lost,3,10,14,254);const loss=auditResinHollowGrid({...lost,boundaryPolicy:'voxel-enclosure'});assert.equal(loss.disposition,'nonconforming');assert.equal(loss.boundaryEnclosure.counts.protectedOuterWallLoss,1);assert.equal(loss.boundaryEnclosure.counts.changedOuterBandOutsideBoundaryBand,1);
+  const far=copy(input);setHollow(far,0,10,14,1);const addition=auditResinHollowGrid({...far,boundaryPolicy:'voxel-enclosure'});assert.equal(addition.disposition,'nonconforming');assert.equal(addition.boundaryEnclosure.counts.upperMaterialOutsideSourceDilation,1);
+  // Enclosure never relaxes a definite thin wall, expected cavity, or drill.
+  const thin=copy(input);setHollow(thin,2,10,14,0);assert.equal(auditResinHollowGrid({...thin,boundaryPolicy:'voxel-enclosure'}).counts.definitelyThinWallOutsideDrains,1);
+  const missing=copy(input);setHollow(missing,10,10,10,255);assert.ok(auditResinHollowGrid({...missing,boundaryPolicy:'voxel-enclosure'}).counts.definitelyRetainedExpectedCavity>0);
+});
+
+test('reverse enclosure prevents complete loss of a thin gray antenna without an eroded-white core',()=>{
+  const input=copy(fixture());input.boundaryPolicy='voxel-enclosure';input.wallThicknessMm=.9;input.uncertaintyMm=.26;
+  // A connected gray feature grows along Z beyond the top of the white cube.
+  // Neither protected-white nor definite-white-removal checks can see it.
+  for(let z=17;z<=19;z++){const i=index(input.frame,10,10,z);input.solid.lower[i]=input.solid.upper[i]=128;setHollow(input,10,10,z,128);}
+  const baseline=auditResinHollowGrid(input);assert.equal(baseline.disposition,'conforming');assert.equal(baseline.boundaryEnclosure.counts.sourceUpperOuterWallBeyondHollowDilation,0);
+  for(let z=17;z<=19;z++)setHollow(input,10,10,z,0);
+  const result=auditResinHollowGrid(input);assert.equal(result.boundaryEnclosure.counts.protectedOuterWallLoss,0);assert.equal(result.counts.definitelyThinWallOutsideDrains,0);assert.ok(result.boundaryEnclosure.counts.sourceUpperOuterWallBeyondHollowDilation>0);assert.equal(result.disposition,'nonconforming');assert.ok(result.reasons.includes('sourceUpperOuterWallBeyondHollowDilation'));
+  assert.ok(result.boundaryEnclosure.witnesses.sourceUpperOuterWallBeyondHollowDilation.length>0);
+});
+
+test('enclosure source distances and protected wall counts match an independent anisotropic exhaustive oracle',()=>{
+  let seed=195503;const random=()=>((seed=(1664525*seed+1013904223)>>>0)/4294967296);
+  for(let trial=0;trial<24;trial++){
+    const frame={nx:7,ny:6,nz:5,pitchMm:{x:.071,y:.123,z:.057},originMm:{x:0,y:0,z:0},direction:{x:trial%2?-1:1,y:1,z:1}},n=frame.nx*frame.ny*frame.nz,lo=new Uint8Array(n),hi=new Uint8Array(n),hl=new Uint8Array(n),hu=new Uint8Array(n);
+    for(let z=1;z<frame.nz-1;z++)for(let y=1;y<frame.ny-1;y++)for(let x=1;x<frame.nx-1;x++){const i=index(frame,x,y,z),r=random();lo[i]=r>.45?255:r>.2?128:0;hi[i]=r>.1?255:0;}
+    for(let i=0;i<n;i++){const r=random();hl[i]=r>.7?255:r>.3?1:0;hu[i]=r>.2?255:0;}
+    const wall=.25,delta=.04+random()*.11,expected={upperMaterialOutsideSourceDilation:0,protectedOuterWallCells:0,protectedOuterWallLoss:0,changedOuterBandOutsideBoundaryBand:0,changedOuterBandWithinBoundaryBand:0,sourceUpperOuterWallSamples:0,sourceUpperOuterWallBeyondHollowDilation:0};
+    for(let i=0;i<n;i++){
+      const x=i%frame.nx,y=Math.floor(i/frame.nx)%frame.ny,z=Math.floor(i/(frame.nx*frame.ny));let material=Infinity,black=Infinity,notWhite=Infinity,hollowMaterial=Infinity;
+      for(let j=0;j<n;j++){const xx=j%frame.nx,yy=Math.floor(j/frame.nx)%frame.ny,zz=Math.floor(j/(frame.nx*frame.ny)),d=((x-xx)*frame.pitchMm.x)**2+((y-yy)*frame.pitchMm.y)**2+((z-zz)*frame.pitchMm.z)**2;if(hi[j]>0)material=Math.min(material,d);else black=Math.min(black,d);if(lo[j]!==255)notWhite=Math.min(notWhite,d);if(hu[j]>0)hollowMaterial=Math.min(hollowMaterial,d);}
+      if(hu[i]>0&&material>delta**2)expected.upperMaterialOutsideSourceDilation++;
+      if(lo[i]===255&&notWhite>delta**2&&black<(wall-delta)**2){expected.protectedOuterWallCells++;if(hl[i]!==255)expected.protectedOuterWallLoss++;}
+      if(black<(wall-delta)**2&&(lo[i]!==hl[i]||hi[i]!==hu[i]))expected[material<=delta**2&&black<=delta**2?'changedOuterBandWithinBoundaryBand':'changedOuterBandOutsideBoundaryBand']++;
+      if(hi[i]>0&&black<(wall-delta)**2){expected.sourceUpperOuterWallSamples++;if(hollowMaterial>delta**2)expected.sourceUpperOuterWallBeyondHollowDilation++;}
+    }
+    const result=auditResinHollowGrid({solid:{lower:lo,upper:hi},hollow:{lower:hl,upper:hu},frame,wallThicknessMm:wall,uncertaintyMm:delta,boundaryPolicy:'voxel-enclosure',drains:[{id:'outside',startMm:{x:100,y:100,z:100},direction:{x:0,y:0,z:1},radiusMm:.1,lengthMm:1}]});
+    assert.deepEqual(result.boundaryEnclosure.counts,expected);
+  }
+  const empty=fixture();empty.solid.lower.fill(0);empty.solid.upper.fill(0);empty.hollow.lower.fill(0);empty.hollow.upper.fill(0);setHollow(empty,10,10,10,1);const result=auditResinHollowGrid({...empty,boundaryPolicy:'voxel-enclosure'});assert.equal(result.boundaryEnclosure.counts.upperMaterialOutsideSourceDilation,1,'an entirely empty source has no finite material site');
+});
+
 test('thin walls and unexpected foreground, including a changed exterior seed cell, produce definite failures',()=>{
   const thin=copy(fixture());setHollow(thin,2,2,14,0);const reduced=auditResinHollowGrid(thin);assert.equal(reduced.disposition,'nonconforming');assert.equal(reduced.counts.definitelyThinWallOutsideDrains,1);assert.equal(reduced.counts.changedOuterBandOutsideDrains,1);
   const added=copy(fixture());setHollow(added,0,0,0,255);const changed=auditResinHollowGrid(added);assert.equal(changed.disposition,'nonconforming');assert.equal(changed.counts.addedOutsideSource,1);assert.ok(changed.connectivity.hollowExteriorLower.seeds>0);assert.ok(changed.drains.every(d=>d.fullyBlackExteriorToCavity));
@@ -90,13 +167,14 @@ test('anisotropic source distance and erosion counts agree with independent brut
 test('strict interval, typed-array, halo, coordinate and drain validation happens before working allocations',()=>{
   const base=fixture();for(const change of[i=>{i.solid.lower=new Uint8Array(1);},i=>{i.solid.lower=new Uint8ClampedArray(i.solid.lower.length);},i=>{i.solid.lower=new Uint8Array(new SharedArrayBuffer(i.solid.lower.length));}]){const input=copy(base);change(input);assert.throws(()=>auditResinHollowGrid(input),{code:'RESIN_HOLLOW_GRID_ARRAY'});}
   const bad=copy(base);bad.solid.lower[0]=255;assert.throws(()=>auditResinHollowGrid(bad),{code:'RESIN_HOLLOW_GRID_INTERVAL'});const halo=copy(base);halo.solid.upper[0]=1;assert.throws(()=>auditResinHollowGrid(halo),{code:'RESIN_HOLLOW_GRID_HALO'});
-  for(const change of[i=>{i.frame.nx=3.5;},i=>{i.frame.pitchMm.x=NaN;},i=>{i.frame.direction.z=-1;},i=>{i.drains[0].direction.z=.9;},i=>{i.drains[1].id=i.drains[0].id;},i=>{i.extra=1;},i=>{i.drains=[];}]){const input=copy(base);change(input);assert.throws(()=>auditResinHollowGrid(input));}
+  for(const change of[i=>{i.frame.nx=3.5;},i=>{i.frame.pitchMm.x=NaN;},i=>{i.frame.direction.z=-1;},i=>{i.drains[0].direction.z=.9;},i=>{i.drains[1].id=i.drains[0].id;},i=>{i.extra=1;},i=>{i.drains=[];},i=>{i.boundaryPolicy='automatic';},i=>{i.boundaryPolicy=null;},i=>{i.exteriorSeedPolicy='final';},i=>{i.exteriorSeedPolicy=null;}]){const input=copy(base);change(input);assert.throws(()=>auditResinHollowGrid(input));}
   for(const limits of[{constructor:1},{toString:1},{[Symbol('unexpected')]:1},{maxVoxels:20000001},{maxOperations:2000000001},{maxTimeMs:60001},{maxWorkingBytes:768*1024*1024+1}])assert.throws(()=>auditResinHollowGrid({...base,limits}),{code:'RESIN_HOLLOW_GRID_LIMITS'});
 });
 
 test('voxel, dimension, drain, memory, operation, deadline and cancellation budgets fail closed',()=>{
   const input=fixture();for(const[limits,code]of[[{maxVoxels:1000},'RESIN_HOLLOW_GRID_VOXELS'],[{maxAxisLength:10},'RESIN_HOLLOW_GRID_DIMENSIONS'],[{maxDrains:1},'RESIN_HOLLOW_GRID_DRAINS'],[{maxWorkingBytes:1000},'RESIN_HOLLOW_GRID_MEMORY'],[{maxOperations:100},'RESIN_HOLLOW_GRID_OPERATIONS']])assert.throws(()=>auditResinHollowGrid({...input,limits}),{code});
   const record=auditResinHollowGrid(input),oversized=copy(input);oversized.solid.lower=new Uint8Array(new ArrayBuffer(oversized.solid.lower.length*10),0,oversized.solid.lower.length);oversized.solid.lower.set(input.solid.lower);assert.throws(()=>auditResinHollowGrid({...oversized,limits:{maxWorkingBytes:record.resources.conservativeVisiblePeakBytes}}),{code:'RESIN_HOLLOW_GRID_MEMORY'});
+  const enclosure=auditResinHollowGrid({...input,boundaryPolicy:'voxel-enclosure'});assert.equal(enclosure.resources.additionalArrayBytes,record.resources.additionalArrayBytes);assert.ok(enclosure.resources.chargedOperations>record.resources.chargedOperations);assert.throws(()=>auditResinHollowGrid({...input,boundaryPolicy:'voxel-enclosure',limits:{maxOperations:record.resources.chargedOperations}}),{code:'RESIN_HOLLOW_GRID_OPERATIONS'});
   const controller=new AbortController();controller.abort();assert.throws(()=>auditResinHollowGrid({...input,signal:controller.signal}),{code:'RESIN_HOLLOW_GRID_ABORTED'});
   const n=81**3,large={...input,solid:{lower:new Uint8Array(n),upper:new Uint8Array(n)},hollow:{lower:new Uint8Array(n),upper:new Uint8Array(n)},frame:{...input.frame,nx:81,ny:81,nz:81},limits:{maxTimeMs:1}};assert.throws(()=>auditResinHollowGrid(large),{code:'RESIN_HOLLOW_GRID_TIMEOUT'});
   assert.equal(RESIN_HOLLOW_GRID_LIMITS.maxVoxels,20000000);assert.equal(RESIN_HOLLOW_GRID_LIMITS.maxOperations,2000000000);assert.ok(record.resources.chargedOperations<record.limits.maxOperations);assert.equal(record.resources.inputViewBytes,21**3*4);assert.equal(record.resources.additionalArrayBytes,21**3*25+21*20+8);

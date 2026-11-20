@@ -49,6 +49,13 @@ test('layer callback owns its definition copy and cannot corrupt validation or o
   assert.equal(result.sha256,hash(f.bytes));assert.equal(result.definitionsSha256,definitionsHash(f.bytes));assert.ok(seen.every(buffer=>buffer.every(v=>v===0)));
 });
 
+test('occupied layer range records exposed material separately from blank declared leading and trailing layers',async t=>{
+  const f=await fileFixture(t,fixture({width:2,height:1,planes:[[0,0],[0,17],[255,0],[0,0],[0,0]]})),result=await scanResinGooFile(f.filePath);
+  assert.deepEqual(result.occupiedLayerRange,{firstIndex:1,lastIndex:2,firstPositionMm:Math.fround(.1),lastPositionMm:Math.fround(.15)});
+  assert.equal(result.layerPositionsMm.length,5);assert.equal(result.metadata.totalHeightMm,Math.fround(.25));assert.equal(result.metadata.nonemptyLayerCount,2);
+  await f.write(fixture({width:2,height:1,planes:[[0,0],[0,0]]}));assert.equal((await scanResinGooFile(f.filePath)).occupiedLayerRange,null);
+});
+
 test('16K layers stream from short encoded payloads without allocating a full pixel plane',async t=>{
   const bytes=fixture({width:15120,height:6230,layers:8});bytes.writeFloatBE(211.68,195320);bytes.writeFloatBE(118.37,195324);bytes.writeFloatBE(220,195328);
   const f=await fileFixture(t,bytes),result=await scanResinGooFile(f.filePath);
@@ -88,6 +95,20 @@ test('all foreground excluded by crop is counted across layers rather than silen
   const foreground=planes.flat().filter(v=>v>0),inside=[planes[0][1],planes[0][2],planes[1][1],planes[1][2]].filter(v=>v>0);
   assert.equal(grid.foregroundOutsideCropPixels,foreground.length-inside.length);assert.equal(grid.foregroundOutsideCropIntensity,foreground.reduce((a,b)=>a+b,0)-inside.reduce((a,b)=>a+b,0));
   await assert.rejects(buildResinHollowGrid(f.filePath,{expectedSha256:'0'.repeat(64),crop,reduction:{x:1,y:1,z:1}}),{code:'RESIN_HOLLOW_RASTER_CHANGED'});
+});
+
+test('explicit integer Z alignment includes every source layer and known-zero padding in interval extrema',async t=>{
+  const planes=[[255,128],[255,255],[17,255]],f=await fileFixture(t,fixture({width:2,height:1,planes})),crop={x:0,y:0,width:2,height:1};
+  for(const reductionZ of [1,2,3])for(const layerOffset of [0,1,2,3]){
+    const totalLayers=layerOffset+planes.length+2,reduction={x:1,y:1,z:reductionZ},grid=await buildResinHollowGrid(f.filePath,{expectedSha256:hash(f.bytes),crop,reduction,alignment:{layerOffset,totalLayers}}),{dimensions:d,interiorDimensions:n}=grid.frame;
+    const lower=new Uint8Array(d.x*d.y*d.z),upper=new Uint8Array(lower.length);
+    for(let z=0;z<n.z;z++)for(let x=0;x<2;x++){
+      const values=Array.from({length:reductionZ},(_,dz)=>{const native=z*reductionZ+dz-layerOffset;return native>=0&&native<planes.length?planes[native][x]:0;});
+      const i=((z+1)*d.y+1)*d.x+x+1;lower[i]=Math.min(...values);upper[i]=Math.max(...values);
+    }
+    assert.deepEqual(grid.lower,lower);assert.deepEqual(grid.upper,upper);assert.equal(grid.foregroundOutsideCropPixels,0);assert.deepEqual(grid.frame.layerAlignment,{layerOffset,totalLayers});
+  }
+  for(const alignment of [{layerOffset:-1,totalLayers:6},{layerOffset:.5,totalLayers:6},{layerOffset:2,totalLayers:4},{layerOffset:0,totalLayers:25001},{layerOffset:0,totalLayers:6,extra:1}])await assert.rejects(buildResinHollowGrid(f.filePath,{expectedSha256:hash(f.bytes),crop,reduction:{x:1,y:1,z:1},alignment}),{code:'RESIN_HOLLOW_RASTER_OPTIONS'});
 });
 
 test('all global float families and layer physical fields reject nonfinite values independently',async t=>{

@@ -13,6 +13,7 @@ const { parseIni, assertTargetProperties } = require('./resin-engine');
 const { validateUVtoolsProperties, UV_PROPERTIES } = require('./resin-profiles');
 const { auditResinMesh } = require('./resin-mesh');
 const { verifyResinHollowPlan, createResinHollow3mf } = require('./resin-hollow-plan');
+const { verifyResinHollowSupports, createSupportedHollow3mf, assertSupportedHollowInput } = require('./resin-hollow-supports');
 const { scanResinGooFile, buildResinHollowGrid, RESIN_HOLLOW_RASTER_LIMITS } = require('./resin-hollow-raster');
 const { RESIN_HOLLOW_GRID_LIMITS } = require('./resin-hollow-grid');
 const { auditResinHollowGridAsync, resolveHollowGridWorkerPath } = require('./resin-hollow-grid-async');
@@ -28,7 +29,7 @@ const freeze = value => { if (value && typeof value === 'object') { Object.value
 const canonical = value => Array.isArray(value) ? value.map(canonical) : plain(value) ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
 const digest = value => hash(JSON.stringify(canonical(value)));
 function implementationSources() {
-  const worker = resolveHollowGridWorkerPath(), files = ['resin-hollow-audit.js', 'resin-hollow-plan.js', 'resin-hollow-raster.js', 'resin-hollow-grid-async.js', 'resin-geometry.js', 'resin-mesh.js', 'resin-plate.js', 'resin-plate-engine.js', 'resin-engine.js', 'resin-profiles.js', 'psam/zip-inspection.js'].map(name => ({ name, filePath: path.join(__dirname, name) }));
+  const worker = resolveHollowGridWorkerPath(), files = ['resin-hollow-audit.js', 'resin-hollow-plan.js', 'resin-hollow-supports.js', 'resin-hollow-raster.js', 'resin-hollow-grid-async.js', 'resin-geometry.js', 'resin-mesh.js', 'resin-plate.js', 'resin-plate-engine.js', 'resin-engine.js', 'resin-profiles.js', 'psam/zip-inspection.js'].map(name => ({ name, filePath: path.join(__dirname, name) }));
   files.push({ name: 'resin-hollow-grid-worker.js', filePath: worker }, { name: 'resin-hollow-grid.js', filePath: path.join(path.dirname(worker), 'resin-hollow-grid.js') });
   return files;
 }
@@ -77,9 +78,10 @@ function assertInput(actual, expected, omitDrains) {
   const supplied = payloads(actual);
   if (supplied.size !== wanted.size || [...wanted].some(([name, bytes]) => !supplied.get(name)?.equals(bytes))) throw fail('Native 3MF content differs from the complete source, placement or drain request.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
 }
-function presets(solid, hollow, plan) {
+function presets(solid, hollow, plan, referenceMode, elevationMm) {
   for (const ini of [solid, hollow]) {
-    if (ini.printer_technology !== 'SLA' || ini.display_orientation !== 'landscape' || ini.supports_enable !== '0' || ini.pad_enable !== '0') throw fail('Paired body references require SLA landscape output with supports and pad disabled.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
+    if (ini.printer_technology !== 'SLA' || ini.display_orientation !== 'landscape' || ini.pad_enable !== '0') throw fail('Paired body references require SLA landscape output without a pad.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
+    if (referenceMode === 'suppressed-support-elevation' ? ini.supports_enable !== '1' || ini.support_enforcers_only !== '1' || Number(ini.support_object_elevation) !== elevationMm : ini.supports_enable !== '0') throw fail('The body reference must retain its explicit support suppression and elevation policy.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
     for (const key of ['relative_correction_x', 'relative_correction_y', 'relative_correction_z', 'material_correction_x', 'material_correction_y', 'material_correction_z']) if (Number(ini[key]) !== 1) throw fail('Native geometry corrections must be explicitly one.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
     for (const [key, count] of [['relative_correction', 2], ['material_correction', 3]]) if (typeof ini[key] !== 'string' || !isDeepStrictEqual(ini[key].split(',').map(Number), Array(count).fill(1))) throw fail('Native vector corrections must be explicitly one.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
     if (Number(ini.zcorrection_layers) !== 0) throw fail('Native Z correction must be explicitly disabled.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
@@ -121,7 +123,7 @@ function sameSchedule(left, right) {
 }
 
 async function auditImplementation(options) {
-  keys(options, ['source', 'plan', 'expectedBinding', 'solid', 'hollow', 'provider', 'targetProperties', 'placement', 'policy', 'limits', 'signal'], ['source', 'plan', 'expectedBinding', 'solid', 'hollow', 'provider', 'targetProperties', 'placement', 'policy'], 'hollow reference audit');
+  keys(options, ['source', 'plan', 'expectedBinding', 'solid', 'hollow', 'provider', 'targetProperties', 'placement', 'policy', 'supports', 'limits', 'signal'], ['source', 'plan', 'expectedBinding', 'solid', 'hollow', 'provider', 'targetProperties', 'placement', 'policy'], 'hollow reference audit');
   const started = performance.now();
   const signal = options.signal;
   if (signal !== undefined && !(signal instanceof AbortSignal)) throw fail('Use a native AbortSignal.');
@@ -145,20 +147,42 @@ async function auditImplementation(options) {
   keys(options.provider, ['name', 'version', 'sha256'], ['name', 'version', 'sha256'], 'native provider binding');
   if (options.provider.name !== 'PrusaSlicer' || options.provider.version !== '2.9.7' || typeof options.provider.sha256 !== 'string' || !HASH.test(options.provider.sha256)) throw fail('Pin the inspected PrusaSlicer 2.9.7 provider fingerprint.');
   const provider = { ...options.provider }, solid = reference(options.solid), hollow = reference(options.hollow);
-  const expected3mf = createResinHollow3mf(source, plan, binding, placement).threeMf; check();
-  assertInput(solid.input3mf, expected3mf, true); assertInput(hollow.input3mf, expected3mf, false); check();
-  presets(solid.ini, hollow.ini, plan);
+  keys(options.policy, ['reduction', 'maximumUncertaintyMm', 'boundaryPolicy', 'referenceMode'], ['reduction', 'maximumUncertaintyMm'], 'declared raster policy');
+  const referenceMode = options.policy.referenceMode ?? 'zero-elevation';
+  if (!['zero-elevation', 'suppressed-support-elevation'].includes(referenceMode) || (referenceMode === 'suppressed-support-elevation' && options.supports === undefined)) throw fail('Elevated body references require an explicit frozen support plan.');
+  let modelElevationMm = 0;
+  let supportBinding = null;
+  if (options.supports !== undefined) {
+    keys(options.supports, ['plan', 'preset'], ['plan', 'preset'], 'inactive reference support authority');
+    const supportPreset = snapshot(options.supports.preset, 1024 * 1024, 'Frozen support preset'), supportPlan = structuredClone(options.supports.plan);
+    verifyResinHollowSupports(source, plan, binding, supportPreset, supportPlan);
+    if (referenceMode === 'suppressed-support-elevation') modelElevationMm = supportPlan.geometry.modelElevationMm;
+    const expected = createSupportedHollow3mf(source, plan, binding, supportPreset, supportPlan, placement).threeMf;
+    assertSupportedHollowInput(solid.input3mf, expected, 'solid-reference'); assertSupportedHollowInput(hollow.input3mf, expected, 'hollow-reference');
+    if (referenceMode === 'suppressed-support-elevation' && [solid, hollow].some(item => inspectZip(item.input3mf, { ...ZIP_LIMITS, maxEntries: 5 }).entries.some(entry => entry.name === supportPlan.native.supportMetadataPath))) throw fail('Suppressed references must omit every authored support contact; manual contacts bypass native enforcer filtering.', 'RESIN_HOLLOW_ALIGNMENT_UNSUPPORTED');
+    const ini = parseIni(new TextDecoder('utf-8', { fatal: true }).decode(supportPreset));
+    const exempt = [...HOLLOW_KEYS, 'supports_enable', 'pad_enable', ...(referenceMode === 'suppressed-support-elevation' ? ['support_object_elevation', 'support_enforcers_only'] : [])];
+    const relevant = value => Object.fromEntries(Object.entries(value).filter(([key]) => !exempt.includes(key)));
+    if (!isDeepStrictEqual(relevant(ini), relevant(hollow.ini))) throw fail('The inactive body reference changed the frozen support profile beyond its disabled selectors.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
+    supportBinding = { supportPlanSha256: supportPlan.sha256, presetSha256: hash(supportPreset), inactiveInReferences: true };
+  } else {
+    const expected3mf = createResinHollow3mf(source, plan, binding, placement).threeMf;
+    assertInput(solid.input3mf, expected3mf, true); assertInput(hollow.input3mf, expected3mf, false);
+  }
+  check();
+  presets(solid.ini, hollow.ini, plan, referenceMode, modelElevationMm);
   const requiredProperties = ['MachineName', 'LayerHeight', 'ExposureTime', 'BottomExposureTime', 'BottomLayerCount', 'BottomLiftHeight', 'LiftHeight', 'BottomLiftSpeed', 'LiftSpeed', 'RetractSpeed', 'LightPWM', 'BottomLightPWM'];
   keys(options.targetProperties, UV_PROPERTIES, requiredProperties, 'frozen target properties');
   const targetProperties = { ...options.targetProperties };
   if (typeof targetProperties.MachineName !== 'string' || !targetProperties.MachineName || Buffer.byteLength(targetProperties.MachineName) > 32 || /[\r\n\0]/.test(targetProperties.MachineName)) throw fail('Use a bounded printer machine identity.');
   validateUVtoolsProperties(targetProperties, { printerModel: targetProperties.MachineName, layerHeightMm: Number(solid.ini.layer_height), maxZMm: Number(solid.ini.max_print_height), code: 'RESIN_HOLLOW_AUDIT_INVALID' });
   if (targetProperties.ExposureTime !== Number(solid.ini.exposure_time) || targetProperties.BottomExposureTime !== Number(solid.ini.initial_exposure_time)) throw fail('Effective native exposure differs from the frozen target conversion.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
-  keys(options.policy, ['reduction', 'maximumUncertaintyMm'], ['reduction', 'maximumUncertaintyMm'], 'declared raster policy');
   const reduction = vector(options.policy.reduction, 1, 512, 'grid reduction');
   if (AXES.some(axis => !Number.isSafeInteger(reduction[axis]))) throw fail('Grid reduction factors must be explicit whole numbers.');
   const maximumUncertaintyMm = finite(options.policy.maximumUncertaintyMm, Number.MIN_VALUE, plan.request.wallThicknessMm / 3, 'maximum declared uncertainty');
-  const policy = { reduction, maximumUncertaintyMm };
+  const boundaryPolicy = options.policy.boundaryPolicy ?? 'exact-raster';
+  if (!['exact-raster', 'voxel-enclosure'].includes(boundaryPolicy)) throw fail('Choose a declared supported body boundary policy.');
+  const policy = { reduction, maximumUncertaintyMm, boundaryPolicy, referenceMode };
   const tool = await implementationManifest();
   check();
   const scanOptions = () => ({ limits: { ...scanLimits, timeoutMs: Math.min(scanLimits.timeoutMs ?? 60000, Math.max(1, Math.floor(timeoutMs - (performance.now() - started)))) }, signal });
@@ -181,7 +205,16 @@ async function auditImplementation(options) {
   const displayRoundingAllowanceMm = Math.abs(metadata.displayWidthMm - Number(solid.ini.display_width)) + Math.abs(metadata.displayHeightMm - Number(solid.ini.display_height));
   const uncertaintyMm = voxelAllowanceMm + maximumLayerZDeviationMm + displayRoundingAllowanceMm;
   if (uncertaintyMm > maximumUncertaintyMm) throw fail('The chosen raster grid cannot meet the declared uncertainty policy.', 'RESIN_HOLLOW_RESOLUTION_INCONCLUSIVE', 409);
-  const crop = { ...solidScan.boundsPx };
+  // Declared terminal Z alone cannot establish occupied source height: a
+  // truncated object may retain arbitrarily many blank layer definitions.
+  const occupiedRange = solidScan.occupiedLayerRange;
+  const occupiedSourceBoundsZMm = { min: occupiedRange.firstPositionMm - nominalZ / 2 - modelElevationMm, max: occupiedRange.lastPositionMm - nominalZ / 2 - modelElevationMm };
+  if (Math.abs(occupiedSourceBoundsZMm.min) > uncertaintyMm || Math.abs(occupiedSourceBoundsZMm.max - plan.canonical.dimensionsMm.z) > uncertaintyMm) throw fail('The occupied source material does not reach the reviewed canonical Z bounds within the declared uncertainty.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
+  const sourceCrop = { ...solidScan.boundsPx }, crop = { ...sourceCrop };
+  if (boundaryPolicy === 'voxel-enclosure' && hollowScan.boundsPx) {
+    const bounds = hollowScan.boundsPx, right = Math.max(crop.x + crop.width, bounds.x + bounds.width), bottom = Math.max(crop.y + crop.height, bounds.y + bounds.height);
+    crop.x = Math.min(crop.x, bounds.x); crop.y = Math.min(crop.y, bounds.y); crop.width = right - crop.x; crop.height = bottom - crop.y;
+  }
   if (crop.x < 1 || crop.y < 1 || crop.x + crop.width >= metadata.resolutionX || crop.y + crop.height >= metadata.resolutionY) throw fail('The solid reference touches the native image boundary.', 'RESIN_HOLLOW_REFERENCE_CLIPPED', 409);
   const dimensions = { x: Math.ceil(crop.width / reduction.x) + 2, y: Math.ceil(crop.height / reduction.y) + 2, z: Math.ceil(metadata.layerCount / reduction.z) + 2 };
   const cells = dimensions.x * dimensions.y * dimensions.z;
@@ -193,15 +226,15 @@ async function auditImplementation(options) {
   const direction = { x: metadata.mirrorX ? -1 : 1, y: metadata.mirrorY ? 1 : -1, z: 1 };
   const pixelX = metadata.displayWidthMm / metadata.resolutionX, pixelY = metadata.displayHeightMm / metadata.resolutionY;
   const physicalBounds = {
-    x: metadata.mirrorX ? [(metadata.resolutionX - crop.x - crop.width) * pixelX - placement.x, (metadata.resolutionX - crop.x) * pixelX - placement.x] : [crop.x * pixelX - placement.x, (crop.x + crop.width) * pixelX - placement.x],
-    y: metadata.mirrorY ? [crop.y * pixelY - placement.y, (crop.y + crop.height) * pixelY - placement.y] : [(metadata.resolutionY - crop.y - crop.height) * pixelY - placement.y, (metadata.resolutionY - crop.y) * pixelY - placement.y],
+    x: metadata.mirrorX ? [(metadata.resolutionX - sourceCrop.x - sourceCrop.width) * pixelX - placement.x, (metadata.resolutionX - sourceCrop.x) * pixelX - placement.x] : [sourceCrop.x * pixelX - placement.x, (sourceCrop.x + sourceCrop.width) * pixelX - placement.x],
+    y: metadata.mirrorY ? [sourceCrop.y * pixelY - placement.y, (sourceCrop.y + sourceCrop.height) * pixelY - placement.y] : [(metadata.resolutionY - sourceCrop.y - sourceCrop.height) * pixelY - placement.y, (metadata.resolutionY - sourceCrop.y) * pixelY - placement.y],
   };
   for (const [axis, pitchMm] of [['x', pixelX], ['y', pixelY]]) if (Math.abs(physicalBounds[axis][0]) > 2 * pitchMm + displayRoundingAllowanceMm || Math.abs(physicalBounds[axis][1] - plan.canonical.dimensionsMm[axis]) > 2 * pitchMm + displayRoundingAllowanceMm) throw fail('The native source footprint does not match the reviewed canonical geometry and placement.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
-  if (Math.abs(metadata.totalHeightMm - plan.canonical.dimensionsMm.z) > nominalZ + maximumLayerZDeviationMm) throw fail('The native source height does not match the reviewed canonical geometry.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
+  if (Math.abs(metadata.totalHeightMm - modelElevationMm - plan.canonical.dimensionsMm.z) > nominalZ + maximumLayerZDeviationMm) throw fail('The native source height does not match the reviewed canonical geometry and model elevation.', 'RESIN_HOLLOW_REFERENCE_CHANGED', 409);
   const originMm = {
     x: (metadata.mirrorX ? metadata.resolutionX - crop.x + reduction.x : crop.x - reduction.x) * pixelX - placement.x,
     y: (metadata.mirrorY ? crop.y - reduction.y : metadata.resolutionY - crop.y + reduction.y) * pixelY - placement.y,
-    z: -pitch.z,
+    z: -modelElevationMm - pitch.z,
   };
   const frame = { nx: solidGrid.frame.dimensions.x, ny: solidGrid.frame.dimensions.y, nz: solidGrid.frame.dimensions.z, pitchMm: pitch, originMm, direction };
   // Check actual black channels against the intended canonical cylinders. Native
@@ -210,7 +243,7 @@ async function auditImplementation(options) {
     const unit = requestedDirection(plan.request.orientation, plan.request.drains[index].direction);
     return { id: native.id, startMm: Object.fromEntries(AXES.map(axis => [axis, native.requestedCanonicalStartMm[axis] - unit[axis]])), direction: unit, radiusMm: plan.request.drains[index].radiusMm, lengthMm: plan.request.drains[index].lengthMm + 1 };
   });
-  const result = await auditResinHollowGridAsync({ solid: { lower: solidGrid.lower, upper: solidGrid.upper }, hollow: { lower: hollowGrid.lower, upper: hollowGrid.upper }, frame, wallThicknessMm: plan.request.wallThicknessMm, uncertaintyMm, drains,
+  const result = await auditResinHollowGridAsync({ solid: { lower: solidGrid.lower, upper: solidGrid.upper }, hollow: { lower: hollowGrid.lower, upper: hollowGrid.upper }, frame, wallThicknessMm: plan.request.wallThicknessMm, uncertaintyMm, drains, boundaryPolicy, exteriorSeedPolicy: 'processed-source-exterior',
     limits: { ...gridLimits, maxTimeMs: Math.min(gridLimits.maxTimeMs ?? 60000, Math.max(1, Math.floor(timeoutMs - (performance.now() - started)))) }, signal }); check();
   if (!isDeepStrictEqual(tool, await implementationManifest())) throw fail('The audit implementation changed while checking its native artifacts.', 'RESIN_HOLLOW_AUDIT_TOOL_CHANGED', 409);
   check();
@@ -219,7 +252,7 @@ async function auditImplementation(options) {
   const disposition = outside > 0 ? 'nonconforming' : result.disposition === 'conforming' && !wallPolicyResolved ? 'inconclusive' : result.disposition;
   const record = { schemaVersion: 1, method: 'source-bound-hollow-reference-raster-v1', sourceBinding: binding, planSha256: plan.sha256, canonicalGeometrySha256: prepared.plan.canonical.sha256, tool,
     native: { provider, solid: { sha256: solid.sha256, input3mfSha256: hash(solid.input3mf), effectivePresetSha256: hash(solid.effectivePreset) }, hollow: { sha256: hollow.sha256, input3mfSha256: hash(hollow.input3mf), effectivePresetSha256: hash(hollow.effectivePreset) }, definitionsSha256: solidScan.definitionsSha256 },
-    targetProperties, alignment: { placement, supportsEnabled: false, padEnabled: false, modelElevationMm: 0, frame, crop }, policy, limits: { scan: { ...RESIN_HOLLOW_RASTER_LIMITS, ...scanLimits }, grid: { ...RESIN_HOLLOW_GRID_LIMITS, ...gridLimits }, timeoutMs },
+    targetProperties, supportBinding, alignment: { placement, supportsEnabled: referenceMode === 'suppressed-support-elevation', supportsGenerated: false, padEnabled: false, modelElevationMm, frame, crop, sourceCrop, occupiedLayerRange: occupiedRange, occupiedSourceBoundsZMm, drains }, policy, limits: { scan: { ...RESIN_HOLLOW_RASTER_LIMITS, ...scanLimits }, grid: { ...RESIN_HOLLOW_GRID_LIMITS, ...gridLimits }, timeoutMs },
     uncertainty: { voxelAllowanceMm, maximumLayerZDeviationMm, displayRoundingAllowanceMm, totalMm: uncertaintyMm, drainEnvelope: 'requested canonical cylinder plus documented 1 mm exterior extension; no inferred native displacement exemption' },
     disposition, foregroundOutsideCropPixels: outside, wallPolicyResolved, gridAudit: result, sourceMeshAudit: meshAudit, canonicalMeshAudit,
     nativeInvocationAttested: false, geometricWallCertification: false, physicalDrainageCertification: false, productionEligible: false,

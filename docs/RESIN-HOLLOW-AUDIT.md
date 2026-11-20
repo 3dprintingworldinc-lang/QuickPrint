@@ -1,4 +1,4 @@
-# Source-bound hollow reference audit
+# Source-bound hollow and supported-output audits
 
 The headless auditor compares actual solid/hollow reference GOO files with the
 reviewed source and [hollow request](RESIN-HOLLOWING.md). It detects missing or
@@ -6,10 +6,10 @@ sealed cavities, unresolved gray occupancy, changes to the protected outer wall,
 unexpected foreground and failed individual drain channels. A separate opened
 drain cannot excuse a blocked one.
 
-This is a **paired body-reference verification stage**, not a production slice
-or a native invocation attestation. Both references currently require supports
-and pad disabled, zero model Z placement, identical uniform layer positions and
-the inspected PrusaSlicer 2.9.7 contract. Every report has
+The paired reference audit and complete supported-output audit use the inspected
+PrusaSlicer 2.9.7 contract and identical uniform native layer positions. References
+contain only the body; their sampling elevation can match the supported output
+exactly. Every report has
 `nativeInvocationAttested: false`, `productionEligible: false`,
 `geometricWallCertification: false` and `physicalDrainageCertification: false`.
 The order engine's `hollowing_enable = 0` gate remains in place.
@@ -28,11 +28,22 @@ await auditResinHollowReferences({
   targetProperties,       // frozen slot's explicit UVtools properties
   placement,              // canonical source XY placement; z must be 0
   policy,                 // explicit reduction and maximum uncertainty
+  supports,               // optional { plan, preset } support authority
   limits, signal          // optional lower resource bounds / AbortSignal
 });
 
 await verifyResinHollowReferenceAudit(options, savedReport);
+
+// Same source/reference options, plus the final native artifact and mandatory
+// support authority. Includes a freshly verified conforming body audit.
+await auditResinHollowFinal({ ...options, supports, final });
+await verifyResinHollowFinalAudit({ ...options, supports, final }, savedFinalReport);
 ```
+
+The final functions are exported by `src/slicing/resin-hollow-final-audit.js`.
+`final` uses the same four descriptor fields as a reference. Its complete
+effective preset must equal the frozen support preset, and its complete 3MF
+must match the source, placement, drains and authored contacts.
 
 Each reference descriptor contains `filePath`, the frozen GOO `sha256`, a Buffer
 of its actual `input3mf`, and a Buffer of its actual native `effectivePreset`
@@ -50,7 +61,8 @@ node scripts/audit-resin-hollow.js --request audit-request.json --verify saved-r
 All paths in `audit-request.json` resolve relative to that JSON file. Its exact
 top-level fields are `schemaVersion: 1`, `sourcePath`, `planPath`,
 `expectedBinding`, `solid`, `hollow`, `provider`, `targetProperties`, `placement`,
-`policy`, and optional `limits`. Both reference objects contain exactly
+`policy`, and optional `limits`, `supports` and `final`. `supports` contains
+exactly `planPath` and `presetPath`. Each native artifact object contains exactly
 `filePath`, `sha256`, `input3mfPath` and `effectivePresetPath`. Populate bindings,
 provider fingerprint and target properties from the frozen review/native run,
 not from an unrelated current profile or a newly edited plan.
@@ -60,7 +72,9 @@ For the owned 20 mm verification cube, the explicit policy is:
 ```json
 {
   "reduction": { "x": 1, "y": 1, "z": 1 },
-  "maximumUncertaintyMm": 0.16
+  "maximumUncertaintyMm": 0.16,
+  "boundaryPolicy": "voxel-enclosure",
+  "referenceMode": "suppressed-support-elevation"
 }
 ```
 
@@ -84,11 +98,15 @@ resource/provider-binding failure. Reports remain unqualified in every case.
   compression may differ; additional or changed entry contents are rejected.
   The actual whole 3MF digests remain in the report.
 - Effective settings must agree except for the four requested hollowing
-  settings. Unit printer/material correction factors and disabled automatic Z
+  settings, with the explicit support-suppression exceptions described below.
+  Unit printer/material correction factors and disabled automatic Z
   correction are explicit. Native raster dimensions, handedness, height and
   exposure must match their effective presets. Source image bounds and height
   must agree with canonical dimensions and placement within the stated raster
-  sampling bounds, and the source must have an empty image margin.
+  sampling bounds, and the source must have an empty image margin. The first
+  and last layers containing actual source material must reach the canonical
+  Z bounds within the unchanged uncertainty. Blank terminal definitions cannot
+  substitute for occupied source height.
 - The explicit UVtools target-property allowlist, required fields and numeric
   ranges are validated. Both GOO headers must match those properties. Native
   SLA exposure must also agree with the conversion targets. Native SLA lift
@@ -139,6 +157,15 @@ before checking and cannot exceed one third of the nominal requested wall.
 Reduction factors are explicit; the code never coarsens until a failed part
 passes. An unresolved grid fails rather than selecting a wider allowance.
 
+`boundaryPolicy` defaults to `exact-raster`. The explicit `voxel-enclosure`
+policy permits changes only in the original source boundary band, with both
+source-material and source-black distance witnesses within the same allowance.
+The eroded full-white outer wall must remain full white. Reverse enclosure
+requires protected source-upper outer-wall samples to remain within the band
+of hollow-upper material, catching loss of a thin gray feature. Exact change
+counts remain visible. The stricter definite thin-wall guard also remains
+active; some binary erosion inside the band can therefore still be held.
+
 The audit derives the expected deep cavity and protected outer band from the
 **solid source reference**, independently of the hollow result. Definite
 retained material, gray ambiguity, thin-wall witnesses, changed protected
@@ -152,12 +179,51 @@ Gray-only straight or diagonal paths stay inconclusive. Drain seeds must lie
 in source exterior connected to the boundary, not a sealed pre-existing air
 pocket. Each requested cylinder needs its own fully black exterior-to-cavity
 path and distinct definitely removed wall evidence outside the other drain
-envelopes. Small unresolved holes and ambiguous overlapping claims are held.
+envelopes. The entire resolved, shrunken requested cylinder must also be black;
+an open thread through a partly blocked channel is insufficient. Exterior seeds
+must remain connected to the halo through actual processed void while staying
+outside the original source. A second open drain cannot supply exterior access
+through the cavity for a capped first drain. Small unresolved holes and
+ambiguous overlapping claims are held.
 
 Drain envelopes use the **requested canonical** start, direction, radius and
 length, with the documented native 1 mm outside extension. No inferred actual
 float32 displacement grants a larger exemption. Actual encoded cuts must meet
 that intended envelope and its declared raster band.
+
+## Support authority and native sampling phase
+
+`resin-hollow-supports.js` provides `prepareResinHollowSupports`,
+`verifyResinHollowSupports`, `createSupportedHollow3mf` and
+`assertSupportedHollowInput`. Requests declare `mode` (`none`, `automatic`, or
+`points`), `clearanceMm`, `points` and `regions`. Authored points identify a
+reviewed source face and a position on that exact triangle, head radius and
+prior allowed radius. Rotation and native object centering travel with the
+contacts. Native manual type 2, version 1, object ordinal 1 and float32 fields
+are checked. Automatic generation requires specifically approved prior regions.
+The combined contacts, explicit regions and pad are limited to 512 regions.
+Default and branching support head settings use their corresponding native
+fields and supported material overrides.
+
+Regions authorize temporary support occupancy. They do not certify that all
+functional holes remain clear before supports are removed. The final audit
+requires each added exterior cell's whole box to fit both the global envelope
+and a specific approved region, in original black air connected to the halo.
+The default empty region list permits no additions. New hollow voids and drain
+cores are protected regardless of support regions. The complete unmasked final
+grid supplies all cavity and individual drain traversals.
+
+The default reference mode is `zero-elevation`, with supports and pad disabled.
+For supported output, `suppressed-support-elevation` uses native
+`supports_enable=1`, `support_enforcers_only=1`, `pad_enable=0` and
+`support_object_elevation` equal to the verified full model elevation. Exact
+reference 3MFs contain no enforcer volumes and **no manual contact sidecar**:
+manual contacts bypass native enforcer filtering. Other profile fields remain
+identical except the four hollow settings and these declared selectors.
+Native-generated empty leading layers are retained. The coordinate frame
+subtracts the full elevation; there is no integer layer rounding or resampling.
+The current final audit requires complete physical layer definitions and layer
+counts to match all three stacks; differing schedules are held explicitly.
 
 ## Resources, cancellation and desktop delivery
 
@@ -174,8 +240,9 @@ input/working-array accounting, two billion charged operations and 60 seconds.
 Its two source distance fields use Float64. Dimensions, complete array memory
 and transferable ownership are checked before growth or worker dispatch. These
 are individual allocation/work bounds, not a global process RSS guarantee.
-The wrapper has a 180-second total deadline and preflights both stages' grid
-bounds together.
+The body wrapper has a 180-second total deadline. The final wrapper has a
+300-second total deadline, runs the body audit first, and preflights six input
+arrays plus a conservative 32N working-array bound before final dispatch.
 
 The CPU audit runs in a worker with unique input ArrayBuffers transferred and
 detached instead of copied. Timers and cancellation remain responsive in the
@@ -184,14 +251,16 @@ clean up the worker. Initial bounded source/3MF preparation remains synchronous,
 with cancellation/deadline checks before and between stages. It is not a
 real-time mid-instruction interrupt.
 
-The worker and matching pure auditor are explicitly unpacked beside the
-desktop package. Development, installed and portable smoke checks run the real
-worker on an owned solid negative control and record both resource hashes.
-CI independently compares those hashes with the checked-out source bytes for
-both installed and portable packages. A solid cannot become a successful hollow fixture merely
-because the worker started.
+The body and final workers and matching pure auditors are explicitly unpacked
+beside the desktop package. Development, installed and portable smoke checks
+run both workers on owned negative controls and record their resource hashes.
+CI independently compares these hashes with checked-out source bytes for both
+installed and portable packages. A solid cannot become a successful hollow
+fixture merely because a worker started. The separate
+[Windows native runner](RESIN-NATIVE-RUNNER.md) enforces native commit limits;
+these raster auditors do not invoke it or attest a native run.
 
-## Native evidence and remaining final-output work
+## Native evidence and remaining production work
 
 The actual quality-0.75 cube passes the new source-bound wrapper on its unchanged
 512 x 512 x 200 reference pair, with 6,447,032 expected deep-cavity cells and no
@@ -207,22 +276,26 @@ brute force, direct interval aggregation, source pockets, diagonal gray bridges,
 individual plugs, missing cavity regions, outside additions, source/settings
 tampering, code updates, worker cancellation and CLI report revalidation.
 
-A separate real 10 mm tilted fixture with authored support points and pad passes
-all six native issue checks. Its model is elevated 7 mm (5 mm supports plus 2 mm
-pad), and all 541 native PNG planes across its two model references and final
-227-layer file match independent GOO decoding. **The strict source-reference
-audit remains held:** 57 outer gray values change by one and a separate source
-zero becomes gray one. A research enclosure diagnostic locates those changes
-inside the unchanged 0.149020 mm boundary band and preserves 1,028,609 eroded
-outer-wall cells; actual away-boundary negative controls fail. That diagnostic
-is not a new accepted audit policy or an exact-preservation pass.
+A real 10 mm tilted fixture with four authored contacts and a pad passes all six
+native issue checks. The explicit enclosure policy accepts its body boundary
+at the original uncertainty while the exact policy retains its hold. An
+arbitrary 7.037 mm model elevation (5.037 mm support elevation plus 2 mm pad)
+produces three stacks with the same 228 physical layer definitions. All 684
+native PNG planes match independent GOO decoding: 179,306,496 pixels, zero
+differences. The body reference audit and replay conform at an unchanged
+0.149021 mm total allowance, with 294,961 deep-cavity cells, no missing or
+ambiguous cavity, and independently clear requested drain cores.
+The same native fixture's complete final audit is **nonconforming** because pad
+material exceeds its prior 3 mm authorization; replay preserves that result.
+Full-wrapper positive/replay tests use an owned support-disabled fixture, while
+the pure final-grid tests also include a tilted body and authorized pad.
 
 The full final supported raster must remain unmasked during drain checks. An
 owned added exterior cap blocks the first channel while the second channel and
 global cavity remain open. Body-masked original and capped arrays are identical:
 masking supports away would erase the obstruction and falsely reuse the earlier
-channel pass. Final model elevation, support/pad material, intended boundary
-enclosure and unmasked per-drain checks still need a complete source-bound
-contract before the order workflow can accept hollow preparation. Trusted
-native invocation, all six final checks, physical qualification and live portal
-activation also remain separate requirements.
+channel pass. The supported-output auditor now binds these checks to the
+source, support authority and full final artifact. Trusted bounded native
+orchestration, production workflow adoption, all six final checks, physical
+qualification and live portal activation remain separate requirements. No
+audit report creates a printer permit or enables production hollowing.

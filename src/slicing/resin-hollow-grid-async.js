@@ -28,7 +28,9 @@ function resolveHollowGridWorkerPath({moduleDirectory=__dirname,resourcesPath=pr
 // validation stays in the worker so large grids never block the parent loop.
 // Keep this allocation estimate aligned with the pure auditor; tests bind it.
 function transferInput(input){
-  if(!plain(input)||Reflect.ownKeys(input).some(key=>!['solid','hollow','frame','wallThicknessMm','uncertaintyMm','drains','limits','signal'].includes(key)))throw fail('Supply only the declared raster grid audit fields.');
+  if(!plain(input)||Reflect.ownKeys(input).some(key=>!['solid','hollow','frame','wallThicknessMm','uncertaintyMm','drains','boundaryPolicy','exteriorSeedPolicy','limits','signal'].includes(key)))throw fail('Supply only the declared raster grid audit fields.');
+  const boundaryPolicy=input.boundaryPolicy===undefined?'exact-raster':input.boundaryPolicy,exteriorSeedPolicy=input.exteriorSeedPolicy===undefined?'source-exterior':input.exteriorSeedPolicy;
+  if(!['exact-raster','voxel-enclosure'].includes(boundaryPolicy)||!['source-exterior','processed-source-exterior'].includes(exteriorSeedPolicy))throw fail('Choose explicit supported raster boundary and drain exterior policies.');
   const signal=input.signal;
   if(signal!==undefined&&!(signal instanceof AbortSignal))throw fail('Use a native AbortSignal.');
   if(signal?.aborted)throw aborted();
@@ -51,7 +53,7 @@ function transferInput(input){
   const workerPath=resolveHollowGridWorkerPath();
   try{if(!fs.statSync(workerPath).isFile()||!fs.statSync(path.join(path.dirname(workerPath),'resin-hollow-grid.js')).isFile())throw new Error('Missing resource');}catch{throw fail('The managed grid worker resources are missing.','RESIN_HOLLOW_GRID_WORKER_UNAVAILABLE',500);}
   if(signal?.aborted)throw aborted();
-  return{signal,limits,workerPath,transferList:[...buffers],data:{solid,hollow,frame,wallThicknessMm,uncertaintyMm,drains,limits}};
+  return{signal,limits,workerPath,transferList:[...buffers],data:{solid,hollow,frame,wallThicknessMm,uncertaintyMm,drains,boundaryPolicy,exteriorSeedPolicy,limits}};
 }
 
 /**
@@ -78,7 +80,7 @@ async function auditResinHollowGridAsync(input){
     try{
       worker=new Worker(workerPath,{workerData:data,transferList,resourceLimits:{maxOldGenerationSizeMb:128},name:'quickprint-hollow-grid'});
       worker.once('message',message=>{
-        if(message?.ok===true&&message.result?.schemaVersion===1&&message.result.method==='bounded-reference-raster-grid-audit-v1'&&['conforming','nonconforming','inconclusive'].includes(message.result.disposition)&&message.result.geometricWallCertification===false&&message.result.physicalDrainageCertification===false){void finish(null,message.result);return;}
+        if(message?.ok===true&&message.result?.schemaVersion===1&&message.result.method==='bounded-reference-raster-grid-audit-v1'&&message.result.boundaryPolicy===data.boundaryPolicy&&message.result.exteriorSeedPolicy===data.exteriorSeedPolicy&&['conforming','nonconforming','inconclusive'].includes(message.result.disposition)&&message.result.geometricWallCertification===false&&message.result.physicalDrainageCertification===false){void finish(null,message.result);return;}
         if(message?.ok===false&&typeof message.error?.message==='string'&&message.error.message.length<=2000&&typeof message.error.code==='string'&&/^[A-Z0-9_]{1,100}$/.test(message.error.code)&&Number.isSafeInteger(message.error.status)&&message.error.status>=400&&message.error.status<=599)void finish(fail(message.error.message,message.error.code,message.error.status));
         else void finish(fail('The grid worker returned an invalid result.','RESIN_HOLLOW_GRID_WORKER_FAILED',500));
       });

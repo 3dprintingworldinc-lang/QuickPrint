@@ -83,7 +83,7 @@ async function scan(filePath,options,limits,initialize){
     preflight(0);const hooks=initialize?await initialize(base,{preflight,payloadBufferBytes,fixedOwnedBytes:FIXED_BYTES},work):{};
     const extraOwnedBytes=hooks.extraOwnedBytes||0;preflight(extraOwnedBytes);const payload=Buffer.alloc(payloadBufferBytes);
     const onRun=hooks.onRun||options.onRun,onLayer=hooks.onLayer||options.onLayer,positions=[];
-    let previousZ=0,nonemptyLayerCount=0,totalExposedPixels=0,totalRuns=0,rowRuns=0,foregroundIntensity=0,maxPayload=0,minExposureSeconds=Infinity,maxExposureSeconds=0,minX=Infinity,minY=Infinity,maxX=0,maxY=0;
+    let previousZ=0,nonemptyLayerCount=0,totalExposedPixels=0,totalRuns=0,rowRuns=0,foregroundIntensity=0,maxPayload=0,minExposureSeconds=Infinity,maxExposureSeconds=0,minX=Infinity,minY=Infinity,maxX=0,maxY=0,firstOccupied=null,lastOccupied=null;
     for(let layer=0;layer<base.layerCount;layer++){
       work.check();await read(definition,DEFINITION,'layer definition');const fields=layerDefinition(definition,layer,base,previousZ,limits);previousZ=fields.zMm;positions.push(fields.zMm);minExposureSeconds=Math.min(minExposureSeconds,fields.exposure);maxExposureSeconds=Math.max(maxExposureSeconds,fields.exposure);definitions.update(definition.subarray(0,66));
       if(onLayer){work.step();const owned=Buffer.alloc(66);definition.copy(owned,0,0,66);invoke(onLayer,{index:layer,zMm:fields.zMm,definition:owned});}
@@ -108,7 +108,7 @@ async function scan(filePath,options,limits,initialize){
         pixels+=count;if(work.needsYield())await work.yield();
       }
       if(pixels!==base.pixelsPerLayer||payload[checksumAt]!==((checksum^255)&255))throw fail('GOO image checksum or decoded pixel count is invalid.');
-      if(exposed)nonemptyLayerCount++;totalExposedPixels+=exposed;
+      if(exposed){nonemptyLayerCount++;const occupied={index:layer,positionMm:fields.zMm};firstOccupied??=occupied;lastOccupied=occupied;}totalExposedPixels+=exposed;
     }
     await read(tail,FOOTER.length,'footer');if(!tail.subarray(0,FOOTER.length).equals(FOOTER)||position!==fileBytes)throw fail('GOO footer or trailing-byte count is invalid.');
     const eof=await handle.read(tail,0,1,position);if(eof.bytesRead)throw fail('GOO grew after its declared end.','RESIN_HOLLOW_RASTER_CHANGED',409);
@@ -116,7 +116,7 @@ async function scan(filePath,options,limits,initialize){
     if(afterPath.isSymbolicLink()||!afterPath.isFile()||!stable(initial,afterPath)||!stable(initial,await handle.stat({bigint:true}))||await fs.realpath(filePath)!==resolved)throw fail('GOO identity, size or timestamps changed during scanning.','RESIN_HOLLOW_RASTER_CHANGED',409);
     work.check();const sha256=digest.digest('hex');
     const metadata={...base,totalHeightMm:previousZ,minExposureSeconds,maxExposureSeconds,nonemptyLayerCount,totalExposedPixels,totalRuns,sha256,validatedLayerData:true,printerCompatible:false,qualification:'Structural validation does not establish resin calibration, image orientation, support quality, firmware compatibility, or physical print success.'};
-    return{metadata,boundsPx:totalExposedPixels?{x:minX,y:minY,width:maxX-minX,height:maxY-minY}:null,layerPositionsMm:positions,definitionsSha256:definitions.digest('hex'),sha256,stats:{...work.stats(),fileBytes,bytesRead:position,encodedRuns:totalRuns,rowRuns,totalForegroundIntensity:foregroundIntensity,maxLayerPayloadBytes:maxPayload,payloadBufferBytes,gridBytes:extraOwnedBytes,ownedWorkingBytes:FIXED_BYTES+payloadBufferBytes+extraOwnedBytes,workingByteAccounting:'fixed byte buffers + one reused encoded payload buffer + grid typed arrays; JavaScript metadata/runtime and callback-retained allocations excluded',fullFileAllocated:false,fullPixelPlaneAllocated:false,callbackRetainedAllocationsExcluded:true}};
+    return{metadata,boundsPx:totalExposedPixels?{x:minX,y:minY,width:maxX-minX,height:maxY-minY}:null,occupiedLayerRange:firstOccupied?{firstIndex:firstOccupied.index,lastIndex:lastOccupied.index,firstPositionMm:firstOccupied.positionMm,lastPositionMm:lastOccupied.positionMm}:null,layerPositionsMm:positions,definitionsSha256:definitions.digest('hex'),sha256,stats:{...work.stats(),fileBytes,bytesRead:position,encodedRuns:totalRuns,rowRuns,totalForegroundIntensity:foregroundIntensity,maxLayerPayloadBytes:maxPayload,payloadBufferBytes,gridBytes:extraOwnedBytes,ownedWorkingBytes:FIXED_BYTES+payloadBufferBytes+extraOwnedBytes,workingByteAccounting:'fixed byte buffers + one reused encoded payload buffer + grid typed arrays; JavaScript metadata/runtime and callback-retained allocations excluded',fullFileAllocated:false,fullPixelPlaneAllocated:false,callbackRetainedAllocationsExcluded:true}};
   }finally{await handle.close();}
 }
 
@@ -132,22 +132,26 @@ function gridPolicy(options){
 }
 
 async function buildResinHollowGrid(filePath,options={}){
-  const limits=configuration(options,['expectedSha256','crop','reduction','limits','signal']),{crop,reduction}=gridPolicy(options);let grid;
+  const limits=configuration(options,['expectedSha256','crop','reduction','alignment','limits','signal']),{crop,reduction}=gridPolicy(options);let grid;
+  if(options.alignment!==undefined&&(!exact(options.alignment,['layerOffset','totalLayers'])||!Number.isSafeInteger(options.alignment.layerOffset)||options.alignment.layerOffset<0||!Number.isSafeInteger(options.alignment.totalLayers)||options.alignment.totalLayers<1||options.alignment.totalLayers>limits.maxLayers))throw fail('Layer alignment requires an explicit nonnegative integer offset and bounded total layer count.','RESIN_HOLLOW_RASTER_OPTIONS');
+  const requestedAlignment=options.alignment===undefined?null:{...options.alignment};
   const result=await scan(filePath,{signal:options.signal},limits,async(metadata,memory,work)=>{
-    const interiorDimensions={x:Math.ceil(crop.width/reduction.x),y:Math.ceil(crop.height/reduction.y),z:Math.ceil(metadata.layerCount/reduction.z)},dimensions=Object.fromEntries(Object.entries(interiorDimensions).map(([key,value])=>[key,value+2]));
+    const alignment=requestedAlignment||{layerOffset:0,totalLayers:metadata.layerCount};
+    if(alignment.layerOffset+metadata.layerCount>alignment.totalLayers)throw fail('The complete native layer stack must fit its declared aligned frame.','RESIN_HOLLOW_RASTER_OPTIONS');
+    const interiorDimensions={x:Math.ceil(crop.width/reduction.x),y:Math.ceil(crop.height/reduction.y),z:Math.ceil(alignment.totalLayers/reduction.z)},dimensions=Object.fromEntries(Object.entries(interiorDimensions).map(([key,value])=>[key,value+2]));
     const cells=dimensions.x*dimensions.y*dimensions.z;if(!Number.isSafeInteger(cells)||cells>limits.maxCells)throw fail('Interval grid exceeds its cell bound.','RESIN_HOLLOW_RASTER_LIMIT',413);
     const gridBytes=cells*2;memory.preflight(gridBytes);const lower=new Uint8Array(cells),upper=new Uint8Array(cells),nx=dimensions.x,ny=dimensions.y;
     for(let z=0;z<interiorDimensions.z;z++)for(let y=0;y<interiorDimensions.y;y++)for(let x=0;x<interiorDimensions.x;x++){
       work.step();const startX=crop.x+x*reduction.x,startY=crop.y+y*reduction.y;
-      if(startX>=0&&startY>=0&&startX+reduction.x<=metadata.resolutionX&&startY+reduction.y<=metadata.resolutionY&&(x+1)*reduction.x<=crop.width&&(y+1)*reduction.y<=crop.height&&(z+1)*reduction.z<=metadata.layerCount)lower[((z+1)*ny+y+1)*nx+x+1]=255;
+      if(startX>=0&&startY>=0&&startX+reduction.x<=metadata.resolutionX&&startY+reduction.y<=metadata.resolutionY&&(x+1)*reduction.x<=crop.width&&(y+1)*reduction.y<=crop.height&&z*reduction.z>=alignment.layerOffset&&(z+1)*reduction.z<=alignment.layerOffset+metadata.layerCount)lower[((z+1)*ny+y+1)*nx+x+1]=255;
       if(work.needsYield())await work.yield();
     }
-    grid={lower,upper,frame:{crop,reduction,dimensions,interiorDimensions,halo:1,indexOrder:'x-fastest-y-z',pixelIndexOrigin:{x:crop.x-reduction.x,y:crop.y-reduction.y,z:-reduction.z},sourceDimensions:{x:metadata.resolutionX,y:metadata.resolutionY,z:metadata.layerCount}},foregroundOutsideCropPixels:0,foregroundOutsideCropIntensity:0};
+    grid={lower,upper,frame:{crop,reduction,dimensions,interiorDimensions,halo:1,indexOrder:'x-fastest-y-z',pixelIndexOrigin:{x:crop.x-reduction.x,y:crop.y-reduction.y,z:-reduction.z},sourceDimensions:{x:metadata.resolutionX,y:metadata.resolutionY,z:metadata.layerCount},layerAlignment:alignment},foregroundOutsideCropPixels:0,foregroundOutsideCropIntensity:0};
     return{extraOwnedBytes:gridBytes,onRun({layer,row,start,end,color}){
       const withinY=row>=crop.y&&row<crop.y+crop.height,a=Math.max(start,crop.x),b=Math.min(end,crop.x+crop.width),overlap=withinY?Math.max(0,b-a):0;
       if(color){const outside=end-start-overlap;grid.foregroundOutsideCropPixels+=outside;grid.foregroundOutsideCropIntensity+=outside*color;}
       if(!withinY||b<=a)return;
-      const y=Math.floor((row-crop.y)/reduction.y)+1,z=Math.floor(layer/reduction.z)+1,first=Math.floor((a-crop.x)/reduction.x),last=Math.floor((b-1-crop.x)/reduction.x);
+      const y=Math.floor((row-crop.y)/reduction.y)+1,z=Math.floor((layer+alignment.layerOffset)/reduction.z)+1,first=Math.floor((a-crop.x)/reduction.x),last=Math.floor((b-1-crop.x)/reduction.x);
       const begin=(z*ny+y)*nx+first+1,endIndex=(z*ny+y)*nx+last+2;
       // Extremal colors only affect one bound. Bulk typed-array writes avoid
       // revisiting every coarse cell in each dominant black/white source row.

@@ -30,11 +30,19 @@ test('owned subviews transfer the whole backing store and all aliases as documen
   const result=await auditResinHollowGridAsync(input);assert.deepEqual(result,expected);assert.equal(backing.byteLength,0);assert.equal(alias.byteLength,0);assert.equal(view.byteLength,0);
 });
 
+test('explicit boundary and processed-exterior policies are preserved through the worker without fallback',async()=>{
+  const input=fixture();input.boundaryPolicy='voxel-enclosure';input.exteriorSeedPolicy='processed-source-exterior';
+  const n=input.solid.lower.length;input.solid={lower:input.solid.lower.slice(),upper:input.solid.upper.slice()};input.hollow={lower:input.hollow.lower.slice(),upper:input.hollow.upper.slice()};
+  const at=14*441+4*21+2;input.solid.lower[at]=input.solid.upper[at]=128;input.hollow.lower[at]=input.hollow.upper[at]=129;
+  const expected=auditResinHollowGrid(input),result=await auditResinHollowGridAsync(input);
+  assert.equal(n,21**3);assert.deepEqual(result,expected);assert.equal(result.disposition,'conforming');assert.equal(result.boundaryPolicy,'voxel-enclosure');assert.equal(result.exteriorSeedPolicy,'processed-source-exterior');assert.equal(result.boundaryEnclosure.counts.changedOuterBandWithinBoundaryBand,1);assert.ok(arrays(input).every(a=>a.byteLength===0));
+});
+
 test('shape, nonshared ownership, limits and memory failures reject before detaching any input',async()=>{
   for(const mutate of[
     i=>{i.frame.nx=1.5;},i=>{i.frame.direction.z=-1;},i=>{i.solid.lower=new Uint8Array(1);},
     i=>{i.solid.lower=new Uint8Array(new SharedArrayBuffer(i.solid.lower.length));},i=>{i.drains[0].direction.z=.9;},i=>{i.drains[1].id=i.drains[0].id;},
-    i=>{i.limits={maxWorkingBytes:1000};},i=>{i.limits={maxVoxels:100};},i=>{i.limits={constructor:1};},i=>{i.unexpected=true;},
+    i=>{i.limits={maxWorkingBytes:1000};},i=>{i.limits={maxVoxels:100};},i=>{i.limits={constructor:1};},i=>{i.unexpected=true;},i=>{i.boundaryPolicy='automatic';},i=>{i.boundaryPolicy=null;},i=>{i.exteriorSeedPolicy='final';},i=>{i.exteriorSeedPolicy=null;},
   ]){const input=fixture();mutate(input);const buffers=arrays(input).map(a=>a.buffer),sizes=buffers.map(b=>b.byteLength);await assert.rejects(auditResinHollowGridAsync(input));assert.deepEqual(buffers.map(b=>b.byteLength),sizes);}
   const input=fixture(),expected=auditResinHollowGrid(input);input.limits={maxWorkingBytes:expected.resources.conservativeVisiblePeakBytes-1};await assert.rejects(auditResinHollowGridAsync(input),{code:'RESIN_HOLLOW_GRID_MEMORY'});assert.ok(arrays(input).every(a=>a.byteLength>0));
   const marked=fixture();workerThreads.markAsUntransferable(marked.solid.lower.buffer);await assert.rejects(auditResinHollowGridAsync(marked),{code:'RESIN_HOLLOW_GRID_TRANSFER'});assert.ok(arrays(marked).every(a=>a.byteLength>0));
@@ -53,7 +61,7 @@ test('already cancelled input stays owned by the caller and a parent timeout clo
 });
 
 test('an external timer cancels a large active audit promptly while the parent heartbeat keeps running',async()=>{
-  const input=fixture(),n=131**3,controller=new AbortController();input.frame={...input.frame,nx:131,ny:131,nz:131};input.solid={lower:new Uint8Array(n),upper:new Uint8Array(n)};input.hollow={lower:new Uint8Array(n),upper:new Uint8Array(n)};input.signal=controller.signal;
+  const input=fixture(),n=131**3,controller=new AbortController();input.frame={...input.frame,nx:131,ny:131,nz:131};input.solid={lower:new Uint8Array(n),upper:new Uint8Array(n)};input.hollow={lower:new Uint8Array(n),upper:new Uint8Array(n)};input.signal=controller.signal;input.boundaryPolicy='voxel-enclosure';input.exteriorSeedPolicy='processed-source-exterior';
   let beats=0;const heartbeat=setInterval(()=>{beats++;},5),cancel=setTimeout(()=>controller.abort(),100),started=performance.now();
   try{await assert.rejects(auditResinHollowGridAsync(input),{code:'RESIN_HOLLOW_GRID_ABORTED',status:499});assert.ok(performance.now()-started<1500);assert.ok(beats>=2,'CPU work must not block parent timers');assert.equal(getEventListeners(controller.signal,'abort').length,0);}finally{clearInterval(heartbeat);clearTimeout(cancel);}
 });
@@ -67,10 +75,10 @@ test('source and app.asar paths resolve the managed worker adjacent to the match
 
 test('unexpected exit, worker error and malformed message all await termination and remove lifecycle listeners',async()=>{
   const filename=require.resolve('../src/slicing/resin-hollow-grid-async'),saved=require.cache[filename],OriginalWorker=workerThreads.Worker;
-  for(const mode of['exit','error','message','cyclic-message']){
+  for(const mode of['exit','error','message','cyclic-message','wrong-policy']){
     let instance;
     class FakeWorker extends EventEmitter{
-      constructor(workerPath,options){super();instance=this;this.options=options;this.terminated=0;queueMicrotask(()=>{if(mode==='cyclic-message'){const result={schemaVersion:1,method:'bounded-reference-raster-grid-audit-v1',disposition:'conforming',geometricWallCertification:false,physicalDrainageCertification:false};result.cycle=result;this.emit('message',{ok:true,result});}else this.emit(mode,mode==='message'?{ok:true,result:{}}:mode==='error'?new Error('fixture worker failed'):0);});}
+      constructor(workerPath,options){super();instance=this;this.options=options;this.terminated=0;queueMicrotask(()=>{if(mode==='cyclic-message'||mode==='wrong-policy'){const result={schemaVersion:1,method:'bounded-reference-raster-grid-audit-v1',disposition:'conforming',boundaryPolicy:mode==='wrong-policy'?'voxel-enclosure':'exact-raster',exteriorSeedPolicy:'source-exterior',geometricWallCertification:false,physicalDrainageCertification:false};if(mode==='cyclic-message')result.cycle=result;this.emit('message',{ok:true,result});}else this.emit(mode,mode==='message'?{ok:true,result:{}}:mode==='error'?new Error('fixture worker failed'):0);});}
       async terminate(){this.terminated++;return 0;}
     }
     let injected;

@@ -2,6 +2,14 @@
 
 // A bounded audit of encoded raster intervals. It is not a CAD kernel, a cured
 // resin model, or a geometric/physical wall or drainage certificate.
+// Boundary policy is explicit: exact-raster preserves interval equality in the
+// outer band; voxel-enclosure uses only the supplied uncertainty and full-grid
+// source material/black sample-center distance witnesses. It never retries with
+// a wider band. Processed-source exterior seeds must reach the frame halo while
+// remaining outside the source and within actual processed void.
+// Voxel enclosure also retains the strict definite thin-wall loss guard: even
+// binary surface erosion within the boundary band may be held. This is not a
+// continuous-surface Hausdorff bound or a geometric wall certificate.
 const { performance } = require('node:perf_hooks');
 
 const LIMITS = Object.freeze({ maxVoxels: 20000000, maxAxisLength: 65536, maxDrains: 64,
@@ -44,7 +52,11 @@ function workBudget(limits,signal) {
   };
 }
 function validate(input) {
-  if (!plain(input) || Reflect.ownKeys(input).some(key => !['solid','hollow','frame','wallThicknessMm','uncertaintyMm','drains','limits','signal'].includes(key))) throw fail('Supply only the declared raster grid audit fields.');
+  if (!plain(input) || Reflect.ownKeys(input).some(key => !['solid','hollow','frame','wallThicknessMm','uncertaintyMm','drains','boundaryPolicy','exteriorSeedPolicy','limits','signal'].includes(key))) throw fail('Supply only the declared raster grid audit fields.');
+  const boundaryPolicy=input.boundaryPolicy===undefined?'exact-raster':input.boundaryPolicy;
+  if (!['exact-raster','voxel-enclosure'].includes(boundaryPolicy)) throw fail('Choose an explicit supported raster boundary policy.');
+  const exteriorSeedPolicy=input.exteriorSeedPolicy===undefined?'source-exterior':input.exteriorSeedPolicy;
+  if (!['source-exterior','processed-source-exterior'].includes(exteriorSeedPolicy)) throw fail('Choose an explicit supported drain exterior seed policy.');
   const limits = readLimits(input.limits), work = workBudget(limits,input.signal); work.check();
   exact(input.frame,['nx','ny','nz','pitchMm','originMm','direction'],'Grid frame');
   const frame = { nx:input.frame.nx,ny:input.frame.ny,nz:input.frame.nz,
@@ -85,15 +97,17 @@ function validate(input) {
     if ((x===0 || y===0 || z===0 || x===frame.nx-1 || y===frame.ny-1 || z===frame.nz-1) && solidUpper[i] !== 0) throw fail('The solid reference requires one entirely empty exterior halo.','RESIN_HOLLOW_GRID_HALO');
   }
   work.check();
-  return { frame,plane,count,longest,wall,uncertainty,drains,limits,work,solid:{ lower:solidLower,upper:solidUpper },hollow:{ lower:hollowLower,upper:hollowUpper },memory:{ inputViewBytes,additionalArrayBytes,conservativeVisiblePeakBytes:inputViewBytes+additionalArrayBytes } };
+  return { frame,plane,count,longest,wall,uncertainty,drains,boundaryPolicy,exteriorSeedPolicy,limits,work,solid:{ lower:solidLower,upper:solidUpper },hollow:{ lower:hollowLower,upper:hollowUpper },memory:{ inputViewBytes,additionalArrayBytes,conservativeVisiblePeakBytes:inputViewBytes+additionalArrayBytes } };
 }
-function distanceField(interval,lower,config,scratch) {
-  const { frame,plane,count,work } = config, distance = new Float64Array(count),{ values,sites,cuts } = scratch;
-  for (let i=0;i<count;i++) { work.step(); distance[i]=(lower?interval.lower[i]===255:interval.upper[i]>0)?Infinity:0; }
+function distanceField(interval,lower,config,scratch,target,materialSites=false) {
+  const { frame,plane,count,work } = config, distance = target??new Float64Array(count),{ values,sites,cuts } = scratch;
+  for (let i=0;i<count;i++) { work.step(); const material=lower?interval.lower[i]===255:interval.upper[i]>0; distance[i]=(materialSites?!material:material)?Infinity:0; }
   const line = (base,stride,length,pitch) => {
     for (let q=0;q<length;q++) { work.step(); values[q]=distance[base+q*stride]; }
     let first=0; while (first<length && !Number.isFinite(values[first])) { work.step(); first++; }
-    if (first===length) throw fail('The source distance field has no exterior site.','RESIN_HOLLOW_GRID_HALO');
+    // A line without a site remains infinite until the later axes encounter a
+    // finite site. An entirely empty source has infinite material distance.
+    if (first===length) return;
     let k=0; sites[0]=first; cuts[0]=-Infinity; cuts[1]=Infinity; const weight=pitch*pitch;
     for (let q=first+1;q<length;q++) {
       work.step(); if (!Number.isFinite(values[q])) continue;
@@ -143,13 +157,13 @@ function eachBoundary(config,visit) {
   for (let z=0;z<frame.nz;z++) for (let x=0;x<frame.nx;x++) { work.step(2); visit(z*plane+x); visit(z*plane+(frame.ny-1)*frame.nx+x); }
   for (let y=0;y<frame.ny;y++) for (let x=0;x<frame.nx;x++) { work.step(2); visit(y*frame.nx+x); visit((frame.nz-1)*plane+y*frame.nx+x); }
 }
-function flood(interval,possible,config,visited,queue,{ tool,roi,sourceExterior }={}) {
+function flood(interval,possible,config,visited,queue,{ tool,roi,sourceExterior,allowed }={}) {
   const { frame,plane,work,uncertainty }=config;
   // Reset only the candidate region for per-drain work; cells outside the
   // cylinder are never read as visited/seeded for that restricted traversal.
   if (roi) eachRoi(roi,config,i=>{ visited[i]=0; }); else { work.step(config.count); visited.fill(0); }
   let head=0,tail=0,seeds=0;
-  const accepts=i=>(possible?interval.lower[i]<255:interval.upper[i]===0) && (!tool || cylinder(tool,coordinates(i,config),uncertainty,!possible));
+  const accepts=i=>(!allowed || allowed[i]) && (possible?interval.lower[i]<255:interval.upper[i]===0) && (!tool || cylinder(tool,coordinates(i,config),uncertainty,!possible));
   const seed=i=>{ if (!visited[i] && (!sourceExterior || sourceExterior[i]) && accepts(i)) { visited[i]=1; queue[tail++]=i; seeds++; } };
   if (roi) eachRoi(roi,config,seed); else eachBoundary(config,seed);
   const add=(i,x,y,z)=>{
@@ -170,29 +184,77 @@ function flood(interval,possible,config,visited,queue,{ tool,roi,sourceExterior 
   return { seeds,visitedCells:tail };
 }
 function auditResinHollowGrid(input) {
-  const config=validate(input),{ solid,hollow,frame,plane,count,longest,wall,uncertainty,limits,work,drains }=config;
+  const config=validate(input),{ solid,hollow,frame,plane,count,longest,wall,uncertainty,limits,work,drains,boundaryPolicy,exteriorSeedPolicy }=config;
   const scratch={ values:new Float64Array(longest),sites:new Int32Array(longest),cuts:new Float64Array(longest+1) };
-  const distanceLower=distanceField(solid,true,config,scratch),distanceUpper=distanceField(solid,false,config,scratch);
+  const distanceLower=distanceField(solid,true,config,scratch),distanceUpper=new Float64Array(count);
   const expected=new Uint8Array(count),owner=new Uint8Array(count),sourceExteriorLower=new Uint8Array(count),sourceExteriorUpper=new Uint8Array(count),visited=new Uint8Array(count),queue=new Uint32Array(count);
+  if (boundaryPolicy==='voxel-enclosure') {
+    // Reuse one distance field and the not-yet-populated cavity mask. The
+    // complete material-nearness witness is saved before the same Float64
+    // buffer is replaced with distance to source black samples.
+    distanceField(solid,false,config,scratch,distanceUpper,true);
+    for (let i=0;i<count;i++) { work.step(); expected[i]=distanceUpper[i]<=uncertainty**2?1:0; }
+  }
+  distanceField(solid,false,config,scratch,distanceUpper);
   const rois=drains.map(tool=>toolRoi(tool,config));
   for (let drain=0;drain<drains.length;drain++) eachRoi(rois[drain],config,i=>{
     if (cylinder(drains[drain],coordinates(i,config),uncertainty,false)) owner[i]=owner[i]===0?drain+1:owner[i]===drain+1?owner[i]:255;
   });
   const sourceLowerReach=flood(solid,false,config,sourceExteriorLower,queue),sourceUpperReach=flood(solid,true,config,sourceExteriorUpper,queue);
+  let processedSourceLowerReach=null,processedSourceUpperReach=null;
+  if (exteriorSeedPolicy==='processed-source-exterior') {
+    // Reach the actual frame halo without ever passing through source material.
+    // An opening through another drain/cavity cannot seed an exterior pocket
+    // behind a cap over this drill. The source masks can then be reused in-place.
+    processedSourceLowerReach=flood(hollow,false,config,visited,queue,{allowed:sourceExteriorLower});
+    work.step(count); sourceExteriorLower.set(visited);
+    processedSourceUpperReach=flood(hollow,true,config,visited,queue,{allowed:sourceExteriorUpper});
+    work.step(count); sourceExteriorUpper.set(visited);
+  }
   const counts={ expectedDeepCavity:0,addedOutsideSource:0,changedOuterBandOutsideDrains:0,definitelyRetainedExpectedCavity:0,ambiguousExpectedCavity:0,definitelyThinWallOutsideDrains:0,removedSamplesAwayFromDrains:0,
     cavityUnreachableLower:0,cavityUnreachableUpper:0 };
   const witnesses=Object.fromEntries(['addedOutsideSource','changedOuterBandOutsideDrains','definitelyRetainedExpectedCavity','ambiguousExpectedCavity','definitelyThinWallOutsideDrains','cavityUnreachableUpper'].map(key=>[key,[]]));
+  const enclosure={upperMaterialOutsideSourceDilation:0,protectedOuterWallCells:0,protectedOuterWallLoss:0,changedOuterBandOutsideBoundaryBand:0,changedOuterBandWithinBoundaryBand:0,sourceUpperOuterWallSamples:0,sourceUpperOuterWallBeyondHollowDilation:0};
+  const enclosureWitnesses=Object.fromEntries(['upperMaterialOutsideSourceDilation','protectedOuterWallLoss','changedOuterBandOutsideBoundaryBand','sourceUpperOuterWallBeyondHollowDilation'].map(key=>[key,[]]));
   const witness=(key,i)=>{ if (witnesses[key].length<limits.maxWitnesses) witnesses[key].push({ index:i,cell:{x:i%frame.nx,y:Math.floor(i/frame.nx)%frame.ny,z:Math.floor(i/plane)} }); };
+  const enclosureWitness=(key,i)=>{ if (enclosureWitnesses[key].length<limits.maxWitnesses) enclosureWitnesses[key].push({index:i,cell:{x:i%frame.nx,y:Math.floor(i/frame.nx)%frame.ny,z:Math.floor(i/plane)}}); };
   const expectedThreshold=(wall+uncertainty)**2,outerThreshold=uncertainty<wall?(wall-uncertainty)**2:0;
   let minimumLower=Infinity,minimumUpper=Infinity;
   for (let i=0;i<count;i++) {
     work.step();
+    const nearSourceMaterial=expected[i]===1;
+    expected[i]=0;
+    if (boundaryPolicy==='voxel-enclosure') {
+      if (hollow.upper[i]>0 && !nearSourceMaterial) { enclosure.upperMaterialOutsideSourceDilation++; enclosureWitness('upperMaterialOutsideSourceDilation',i); }
+      if (!owner[i] && solid.lower[i]===255 && distanceLower[i]>uncertainty**2 && distanceUpper[i]<outerThreshold) {
+        enclosure.protectedOuterWallCells++;
+        if (hollow.lower[i]!==255) { enclosure.protectedOuterWallLoss++; enclosureWitness('protectedOuterWallLoss',i); }
+      }
+      if (!owner[i] && distanceUpper[i]<outerThreshold && (solid.lower[i]!==hollow.lower[i] || solid.upper[i]!==hollow.upper[i])) {
+        if (nearSourceMaterial && distanceUpper[i]<=uncertainty**2) enclosure.changedOuterBandWithinBoundaryBand++;
+        else { enclosure.changedOuterBandOutsideBoundaryBand++; enclosureWitness('changedOuterBandOutsideBoundaryBand',i); }
+      }
+    }
     if (distanceLower[i]>expectedThreshold) { expected[i]=1; counts.expectedDeepCavity++; if (hollow.lower[i]===255) { counts.definitelyRetainedExpectedCavity++; witness('definitelyRetainedExpectedCavity',i); } else if (hollow.upper[i]>0) { counts.ambiguousExpectedCavity++; witness('ambiguousExpectedCavity',i); } }
     if (solid.upper[i]===0 && hollow.upper[i]>0) { counts.addedOutsideSource++; witness('addedOutsideSource',i); }
     if (!owner[i] && distanceUpper[i]<outerThreshold && (solid.lower[i]!==hollow.lower[i] || solid.upper[i]!==hollow.upper[i])) { counts.changedOuterBandOutsideDrains++; witness('changedOuterBandOutsideDrains',i); }
     if (!owner[i] && solid.lower[i]===255 && hollow.upper[i]===0) {
       counts.removedSamplesAwayFromDrains++; minimumLower=Math.min(minimumLower,distanceLower[i]); minimumUpper=Math.min(minimumUpper,distanceUpper[i]);
       if (distanceUpper[i]<outerThreshold) { counts.definitelyThinWallOutsideDrains++; witness('definitelyThinWallOutsideDrains',i); }
+    }
+  }
+  if (boundaryPolicy==='voxel-enclosure') {
+    // Source-lower distances have already contributed the deep-cavity mask and
+    // wall minima. Reuse that complete Float64 field for the reverse enclosure
+    // witness, so gray/thin features without any eroded-white core cannot
+    // disappear farther than the same declared uncertainty from result material.
+    distanceField(hollow,false,config,scratch,distanceLower,true);
+    for (let i=0;i<count;i++) {
+      work.step();
+      if (!owner[i] && solid.upper[i]>0 && distanceUpper[i]<outerThreshold) {
+        enclosure.sourceUpperOuterWallSamples++;
+        if (distanceLower[i]>uncertainty**2) { enclosure.sourceUpperOuterWallBeyondHollowDilation++; enclosureWitness('sourceUpperOuterWallBeyondHollowDilation',i); }
+      }
     }
   }
   const hollowLowerReach=flood(hollow,false,config,visited,queue);
@@ -207,12 +269,18 @@ function auditResinHollowGrid(input) {
   const drainResults=[];
   for (let drain=0;drain<drains.length;drain++) {
     const tool=drains[drain],roi=rois[drain];
-    let lowerCandidates=0,possibleCandidates=0,lowerReached=0,possibleReached=0,removedWallCells=0,uniqueRemovedWallCells=0,ambiguousWallCells=0;
+    let lowerCandidates=0,possibleCandidates=0,lowerReached=0,possibleReached=0,removedWallCells=0,uniqueRemovedWallCells=0,ambiguousWallCells=0,retainedChannelCells=0,ambiguousChannelCells=0;
+    const channelWitnesses={retained:[],ambiguous:[]};
     eachRoi(roi,config,i=>{
       const point=coordinates(i,config);
       if (cylinder(tool,point,uncertainty,false)) possibleCandidates++;
       if (!cylinder(tool,point,uncertainty,true)) return;
       lowerCandidates++;
+      if (hollow.upper[i]>0) {
+        const key=hollow.lower[i]===255?'retained':'ambiguous';
+        if (key==='retained') retainedChannelCells++; else ambiguousChannelCells++;
+        if (channelWitnesses[key].length<limits.maxWitnesses) channelWitnesses[key].push({index:i,cell:{x:i%frame.nx,y:Math.floor(i/frame.nx)%frame.ny,z:Math.floor(i/plane)}});
+      }
       if (solid.lower[i]===255 && distanceUpper[i]<=expectedThreshold) {
         if (hollow.upper[i]===0) { removedWallCells++; if (owner[i]===drain+1) uniqueRemovedWallCells++; }
         else if (hollow.lower[i]<255) ambiguousWallCells++;
@@ -228,16 +296,20 @@ function auditResinHollowGrid(input) {
     const halfDiagonal=Math.hypot(frame.pitchMm.x,frame.pitchMm.y,frame.pitchMm.z)/2;
     const resolutionSupported=tool.radiusMm>uncertainty+halfDiagonal && tool.lengthMm>2*uncertainty+Math.max(frame.pitchMm.x,frame.pitchMm.y,frame.pitchMm.z) && lowerCandidates>0;
     const reasons=[]; let disposition;
-    if (lowerReached && uniqueRemovedWallCells>0) disposition='conforming';
+    if (retainedChannelCells) { disposition='nonconforming'; reasons.push('requested-channel-obstruction'); }
+    else if (ambiguousChannelCells) { disposition='inconclusive'; reasons.push('requested-channel-ambiguous'); }
+    else if (lowerReached && uniqueRemovedWallCells>0) disposition='conforming';
     else if (!counts.expectedDeepCavity || !resolutionSupported) { disposition='inconclusive'; reasons.push('channel-unresolved-at-declared-grid'); }
     else if (!lowerReached && possibleReached===0) { disposition='nonconforming'; reasons.push('no-possible-exterior-to-cavity-channel'); }
     else { disposition='inconclusive'; if (!lowerReached) reasons.push('only-possible-void-channel'); if (!uniqueRemovedWallCells) reasons.push(removedWallCells?'wall-removal-overlaps-another-drain':'no-distinct-definite-wall-removal'); }
     drainResults.push({ id:tool.id,disposition,reasons,fullyBlackExteriorToCavity:lowerReached>0,possibleExteriorToCavity:lowerReached>0||possibleReached>0,lowerCandidateCells:lowerCandidates,possibleCandidateCells:possibleCandidates,
       lowerInnerReached:lowerReached,possibleInnerReached:upper?possibleReached:null,definitelyRemovedWallCells:removedWallCells,distinctDefinitelyRemovedWallCells:uniqueRemovedWallCells,ambiguousWallCells,
-      lowerFlood:lower,upperFlood:upper });
+      retainedLowerCylinderCells:retainedChannelCells,ambiguousLowerCylinderCells:ambiguousChannelCells,lowerCylinderWitnesses:channelWitnesses,lowerFlood:lower,upperFlood:upper });
   }
   const reasons=[];
-  for (const key of ['addedOutsideSource','changedOuterBandOutsideDrains','definitelyRetainedExpectedCavity','definitelyThinWallOutsideDrains','cavityUnreachableUpper']) if (counts[key]) reasons.push(key);
+  const boundaryFailures=boundaryPolicy==='exact-raster'?['addedOutsideSource','changedOuterBandOutsideDrains']:[];
+  for (const key of [...boundaryFailures,'definitelyRetainedExpectedCavity','definitelyThinWallOutsideDrains','cavityUnreachableUpper']) if (counts[key]) reasons.push(key);
+  if (boundaryPolicy==='voxel-enclosure') for (const key of ['upperMaterialOutsideSourceDilation','protectedOuterWallLoss','changedOuterBandOutsideBoundaryBand','sourceUpperOuterWallBeyondHollowDilation']) if (enclosure[key]) reasons.push(key);
   if (drainResults.some(drain=>drain.disposition==='nonconforming')) reasons.push('drain-nonconforming');
   const definiteFailure=reasons.length>0;
   if (!counts.expectedDeepCavity) reasons.push('no-resolved-expected-cavity');
@@ -247,10 +319,11 @@ function auditResinHollowGrid(input) {
   if (drainResults.some(drain=>drain.disposition==='inconclusive')) reasons.push('drain-inconclusive');
   const disposition=definiteFailure?'nonconforming':reasons.length?'inconclusive':'conforming';
   const lowerDistance=Number.isFinite(minimumLower)?Math.sqrt(minimumLower):null,upperDistance=Number.isFinite(minimumUpper)?Math.sqrt(minimumUpper):null;
-  const result={schemaVersion:1,method:'bounded-reference-raster-grid-audit-v1',disposition,reasons,frame,wallThicknessMm:wall,uncertaintyMm:uncertainty,
+  const result={schemaVersion:1,method:'bounded-reference-raster-grid-audit-v1',disposition,reasons,frame,wallThicknessMm:wall,uncertaintyMm:uncertainty,boundaryPolicy,exteriorSeedPolicy,
+    boundaryEnclosure:boundaryPolicy==='voxel-enclosure'?{counts:enclosure,witnesses:enclosureWitnesses,distancePolicy:'full-grid anisotropic Euclidean sample-center distance; source upper material nonzero and source black upper zero; unchanged supplied uncertainty'}:null,
     occupancyPolicy:{materialLower:'all represented samples equal 255',materialUpper:'any represented sample is nonzero',voidLower:'all represented samples equal zero',voidUpper:'not all represented samples equal 255',lowerConnectivity:6,upperConnectivity:26},
     counts,witnesses,wallCenterDistanceMm:{lower:lowerDistance,upper:upperDistance},wallResolutionIntervalMm:{lower:lowerDistance===null?null:Math.max(0,lowerDistance-uncertainty),upper:upperDistance===null?null:upperDistance+uncertainty},
-    connectivity:{sourceExteriorLower:sourceLowerReach,sourceExteriorUpper:sourceUpperReach,hollowExteriorLower:hollowLowerReach,hollowExteriorUpper:hollowUpperReach},drains:drainResults,
+    connectivity:{sourceExteriorLower:sourceLowerReach,sourceExteriorUpper:sourceUpperReach,processedSourceExteriorLower:processedSourceLowerReach,processedSourceExteriorUpper:processedSourceUpperReach,hollowExteriorLower:hollowLowerReach,hollowExteriorUpper:hollowUpperReach},drains:drainResults,
     geometricWallCertification:false,physicalDrainageCertification:false,limits:{...limits},resources:{chargedOperations:work.operations,...config.memory,memoryPolicy:'four visible input arrays plus complete additional working arrays; oversized backing buffers also checked'}};
   work.check(); freeze(result); work.check(); return result;
 }
