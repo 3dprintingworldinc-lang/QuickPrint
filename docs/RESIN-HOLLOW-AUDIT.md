@@ -186,8 +186,9 @@ real-time mid-instruction interrupt.
 
 The worker and matching pure auditor are explicitly unpacked beside the
 desktop package. Development, installed and portable smoke checks run the real
-worker on an owned solid negative control and compare both resource hashes to
-their packaged copies. A solid cannot become a successful hollow fixture merely
+worker on an owned solid negative control and record both resource hashes.
+CI independently compares those hashes with the checked-out source bytes for
+both installed and portable packages. A solid cannot become a successful hollow fixture merely
 because the worker started.
 
 ## Native evidence and remaining final-output work

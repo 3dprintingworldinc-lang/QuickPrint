@@ -81,6 +81,20 @@ jobs:
             throw 'QuickPrint portable startup, credentials, CAD resources or hollow raster worker failed.'
           }
           Copy-Item $report 'dist/windows-portable-smoke-test.json'
+      - name: Verify packaged hollow worker source hashes
+        shell: pwsh
+        run: |
+          foreach ($reportPath in @('dist/windows-smoke-test.json', 'dist/windows-portable-smoke-test.json')) {
+            $report = Get-Content $reportPath -Raw | ConvertFrom-Json
+            foreach ($workerName in @('resin-hollow-grid-worker.js', 'resin-hollow-grid.js')) {
+              $actual = @($report.hollowGridWorker.files | Where-Object { $_.name -ceq $workerName })
+              if ($actual.Count -ne 1) { throw "Packaged worker report is missing a unique $workerName." }
+              $sourcePath = Join-Path 'src/slicing' $workerName
+              $sourceSha256 = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($actual[0].sha256 -cne $sourceSha256) { throw "Packaged worker differs from the checked-out source: $workerName." }
+              Write-Host "Verified $reportPath $workerName $sourceSha256"
+            }
+          }
       - name: Verify the installer can be uninstalled
         shell: pwsh
         run: |
