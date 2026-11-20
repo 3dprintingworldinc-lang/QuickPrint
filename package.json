@@ -25,7 +25,8 @@
     "imapflow": "^1.0.195",
     "mailparser": "^3.7.4",
     "mqtt": "^5.14.1",
-    "multer": "^2.0.2"
+    "multer": "^2.0.2",
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.0",
@@ -36,6 +37,16 @@
     "appId": "com.3dprintingworld.quickprint",
     "productName": "QuickPrint",
     "asar": true,
+    "asarUnpack": [
+      "src/slicing/resin-hollow-grid-worker.js",
+      "src/slicing/resin-hollow-grid.js",
+      "src/slicing/resin-hollow-final-grid-async.js",
+      "src/slicing/resin-hollow-final-grid-worker.js",
+      "src/slicing/resin-hollow-final-grid.js",
+      "src/slicing/windows-native-job.js",
+      "src/slicing/windows-native-job.ps1",
+      "src/slicing/windows-native-job.cs"
+    ],
     "npmRebuild": false,
     "directories": {
       "output": "dist",
@@ -45,7 +56,8 @@
       "src/**/*",
       "assets/quickprint.png",
       "package.json",
-      "!**/*.test.js"
+      "!**/*.test.js",
+      "!**/__pycache__/**"
     ],
     "extraResources": [
       {

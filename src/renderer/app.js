@@ -54,12 +54,14 @@
   let integrationData = null;
   let settingsDirty = false;
   let lastPage = null;
+  const resinGeometryCache = new Map();
+  const resinHollowReviews = new Map();
   const activeStates = new Set(['preparing', 'dispatching', 'printing', 'paused']);
   const attentionStates = new Set(['needs_attention', 'failed']);
   const statusNames = { review: 'Needs review', preparing: 'Preparing', ready: 'Ready to print', dispatching: 'Starting print', printing: 'Printing', paused: 'Paused', needs_attention: 'Needs attention', completed: 'Completed', cancelled: 'Cancelled', failed: 'Failed', idle: 'Available', offline: 'Offline', error: 'Connection issue', unknown: 'Not checked' };
-  const typeNames = { octoprint: 'OctoPrint', moonraker: 'Klipper / Moonraker', bambu: 'Bambu Lab', duet: 'Duet / RepRapFirmware' };
+  const typeNames = { octoprint: 'OctoPrint', moonraker: 'Klipper / Moonraker', bambu: 'Bambu Lab', duet: 'Duet / RepRapFirmware', sdcp: 'ELEGOO Resin / SDCP v3' };
   const sourceLabel = source => sourceNames[source] || sourceNames[String(source || '').split(':')[0]] || source || 'Manual upload';
-  const sourceNames = { manual: 'Manual upload', upload: 'Manual upload', web: 'Website', website: 'Website', api: 'Website API', folder: 'Watched folder', email: 'Email' };
+  const sourceNames = { manual: 'Manual upload', upload: 'Manual upload', web: 'Website', website: 'Website', api: 'Website API', folder: 'Watched folder', email: 'Email', layr: 'PrintByLayr' };
   const badge = status => `<span class="badge ${esc(status)}"><span class="status-dot" style="background:currentColor;width:4px;height:4px"></span>${esc(statusNames[status] || status || 'Unknown')}</span>`;
   const readable = value => typeof value === 'string' ? value : (value?.name || value?.email || '—');
   const quantity = job => Number(job.quantity) || 1;
@@ -240,8 +242,8 @@
 
   function renderInputs() {
     return `${heading('Let the work come to you.', 'Different ways in. One reliable queue for your files and customer orders.')}
-      <div class="input-cards"><article class="input-card"><div class="input-card-icon">${icon('globe')}</div><h2>Website orders</h2><p>Send customer files, quantities, and order details straight to QuickPrint through your intake API.</p><button class="button" data-action="integration">${icon('network')} ${state.settings.intake?.enabled ? 'View integration' : 'Set up intake API'}</button></article><article class="input-card"><div class="input-card-icon">${icon('folder')}</div><h2>A folder on your PC</h2><p>Drop a model or sliced file into a watched folder. QuickPrint will pick it up when the file is ready.</p><button class="button" data-action="add-folder">${icon('plus')} Connect a folder</button></article><article class="input-card"><div class="input-card-icon">${icon('mail')}</div><h2>Your makerspace inbox</h2><p>Import supported attachments from a dedicated mailbox, with the sender and subject kept alongside.</p><button class="button" data-action="add-email">${icon('plus')} Connect a mailbox</button></article></div>
-      <section class="panel"><div class="panel-header"><div><h2>Connected inputs</h2><p class="panel-subtitle">Your folders and mailboxes, working in the background</p></div><span class="mini-label">${state.connectors.filter(connector => connector.enabled).length} enabled</span></div>${state.connectors.length ? state.connectors.map(connector => { const runtime = runtimeConnector(connector.id); return `<div class="connector-row"><span class="icon">${icon(connector.type === 'email' ? 'mail' : 'folder')}</span><div class="connector-main"><strong>${esc(connector.name)}</strong><p>${esc(connector.type === 'email' ? `${connector.username || ''} · ${connector.mailbox || 'INBOX'}` : connector.path)}</p><p${runtime.error ? ' class="danger-text"' : ''}>${esc(runtime.error || (runtime.lastCheckedAt ? `Checked ${relativeTime(runtime.lastCheckedAt)}${runtime.importedCount ? ` · ${runtime.importedCount} imported` : ''}` : 'Waiting for first check'))}</p></div><span class="badge ${runtime.error ? 'error' : connector.enabled ? 'ready' : ''}">${runtime.error ? 'Needs attention' : connector.enabled ? 'Enabled' : 'Disabled'}</span><div class="connector-actions"><button class="icon-button" data-action="poll-connector" data-id="${attr(connector.id)}" aria-label="Check ${attr(connector.name)} now" title="Check now">${icon('refresh')}</button><button class="icon-button" data-action="edit-connector" data-id="${attr(connector.id)}" aria-label="Edit ${attr(connector.name)}">${icon('edit')}</button><button class="icon-button danger" data-action="remove-connector" data-id="${attr(connector.id)}" aria-label="Remove ${attr(connector.name)}">${icon('trash')}</button></div></div>`; }).join('') : empty('inputs', 'Your files can find their own way.', 'Connect a folder or mailbox above to bring incoming files into your queue automatically.', '', true)}</section>
+      <div class="input-cards"><article class="input-card"><div class="input-card-icon">${icon('cube')}</div><h2>PrintByLayr resin orders</h2><p>Import paid preparation tickets, approved requirements and model files from your order portal.</p><button class="button" data-action="add-layr">${icon('globe')} Connect PrintByLayr</button></article><article class="input-card"><div class="input-card-icon">${icon('globe')}</div><h2>Website orders</h2><p>Send customer files, quantities, and order details straight to QuickPrint through your intake API.</p><button class="button" data-action="integration">${icon('network')} ${state.settings.intake?.enabled ? 'View integration' : 'Set up intake API'}</button></article><article class="input-card"><div class="input-card-icon">${icon('folder')}</div><h2>A folder on your PC</h2><p>Drop a model or sliced file into a watched folder. QuickPrint will pick it up when the file is ready.</p><button class="button" data-action="add-folder">${icon('plus')} Connect a folder</button></article><article class="input-card"><div class="input-card-icon">${icon('mail')}</div><h2>Your makerspace inbox</h2><p>Import supported attachments from a dedicated mailbox, with the sender and subject kept alongside.</p><button class="button" data-action="add-email">${icon('plus')} Connect a mailbox</button></article></div>
+      <section class="panel"><div class="panel-header"><div><h2>Connected inputs</h2><p class="panel-subtitle">Your portal, folders and mailboxes, working in the background</p></div><span class="mini-label">${state.connectors.filter(connector => connector.enabled).length} enabled</span></div>${state.connectors.length ? state.connectors.map(connector => { const runtime = runtimeConnector(connector.id); return `<div class="connector-row"><span class="icon">${icon(connector.type === 'layr' ? 'globe' : connector.type === 'email' ? 'mail' : 'folder')}</span><div class="connector-main"><strong>${esc(connector.name)}</strong><p>${esc(connector.type === 'layr' ? connector.portalUrl : connector.type === 'email' ? `${connector.username || ''} · ${connector.mailbox || 'INBOX'}` : connector.path)}</p><p${runtime.error ? ' class="danger-text"' : ''}>${esc(runtime.error || (runtime.lastCheckedAt ? `Checked ${relativeTime(runtime.lastCheckedAt)}${runtime.importedCount ? ` · ${runtime.importedCount} imported` : ''}` : 'Waiting for first check'))}</p></div><span class="badge ${runtime.error ? 'error' : connector.enabled ? 'ready' : ''}">${runtime.error ? 'Needs attention' : connector.enabled ? 'Enabled' : 'Disabled'}</span><div class="connector-actions"><button class="icon-button" data-action="poll-connector" data-id="${attr(connector.id)}" aria-label="Check ${attr(connector.name)} now" title="Check now">${icon('refresh')}</button><button class="icon-button" data-action="edit-connector" data-id="${attr(connector.id)}" aria-label="Edit ${attr(connector.name)}">${icon('edit')}</button><button class="icon-button danger" data-action="remove-connector" data-id="${attr(connector.id)}" aria-label="Remove ${attr(connector.name)}">${icon('trash')}</button></div></div>`; }).join('') : empty('inputs', 'Your files can find their own way.', 'Connect a folder or mailbox above to bring incoming files into your queue automatically.', '', true)}</section>
       <div class="capabilities-note">${icon('shield')}<div><strong>Intake brings files in. You decide what prints.</strong><p>New files always enter review. QuickPrint never starts a physical print just because a file arrived. Keep this PC running for background intake, and choose a dedicated folder or mailbox to keep submissions organized.</p></div></div>`;
   }
 
@@ -255,12 +257,44 @@
     return kind === 'prusa' ? 'One or more exported PrusaSlicer INI profiles, one absolute path per line.' : 'Exactly three exported JSON profiles in this order: machine, process, then filament. One absolute path per line.';
   }
 
+  function resinProfileSlot(slot) {
+    return `<div class="resin-profile-slot mt-16" data-slot-id="${attr(slot.id)}"><div class="form-grid">${field(`slot-name-${slot.id}`, 'Slot name', slot.name || '', { required: true, placeholder: 'Grey standard · 50 µm' })}${field(`slot-path-${slot.id}`, 'Slot profile JSON', slot.profilePath || '', { required: true, placeholder: 'Absolute path to this resin’s profile JSON' })}</div><div class="button-row mt-16"><button type="button" class="button small" data-action="customize-resin-slot" data-id="${attr(slot.id)}">Customize profile</button><button type="button" class="button small" data-action="remove-resin-slot">Remove slot</button></div><div class="divider mt-16"></div></div>`;
+  }
+
+  function resinEngineSettings(engine = {}) {
+    return `<section class="panel settings-section"><div class="panel-header"><div><h2>Resin model preparation</h2><p class="panel-subtitle">Customize named resin profiles and select a slot for each ticket.</p></div></div><div class="panel-content"><div class="form-grid">${field('resinPrusaExecutable', 'PrusaSlicer console executable', engine.prusaExecutable || '', { full: true, placeholder: 'Absolute path to prusa-slicer-console.exe' })}${field('resinUvtoolsExecutable', 'UVtools command executable', engine.uvtoolsExecutable || '', { full: true, placeholder: 'Absolute path to UVtoolsCmd.exe' })}${field('resinFreecadExecutable', 'FreeCAD command executable', engine.freecadExecutable || '', { full: true, placeholder: 'Absolute path to FreeCADCmd.exe', hint: 'Optional for STEP/STP. Use the complete FreeCAD installation.' })}${field('resinCadAuditPath', 'CAD transfer audit runtime', engine.cadAuditPath || '', { full: true, placeholder: 'Absolute path to the prepared CAD audit site-packages directory', hint: 'Required to check for incomplete CAD imports before meshing.' })}<div class="full"><button type="button" class="button small" data-action="setup-cad-runtime">Set up CAD transfer audit</button><p class="field-hint">Downloads the verified CAD reader into QuickPrint’s private tools directory (48 MB download; about 173 MB installed).</p></div>${field('resinCadLinearDeflectionMm', 'CAD mesh accuracy (mm)', engine.cadLinearDeflectionMm ?? 0.005, { type: 'number', extra: 'min="0.0001" max="0.1" step="any"' })}${field('resinCadAngularDeflectionRad', 'CAD angular tolerance (radians)', engine.cadAngularDeflectionRad ?? 0.1, { type: 'number', extra: 'min="0.01" max="0.5" step="any"' })}${field('resinTimeoutSeconds', 'Maximum time per resin operation (seconds)', Math.round((engine.timeoutMs || 900000) / 1000), { type: 'number', extra: 'min="1" max="3600" step="1"' })}</div><label class="checkbox-field mt-16"><input type="checkbox" name="resinDispatchEnabled" ${engine.dispatchEnabled === true ? 'checked' : ''}><span>Enable qualified resin dispatch<small>Use only after the studio qualifies the exact printer, resin and profile. Every run requires a new readiness confirmation and current portal authorization.</small></span></label><h3 class="mt-16">Resin profile slots</h3><p class="field-hint">Give each resin and printer setup its own profile JSON. Customize that profile’s material, exposure, movement, supports and orientation candidates. Each file and its standalone SLA preset are hashed when sliced.</p><div id="resin-profile-slots">${(engine.slots || []).map(resinProfileSlot).join('')}</div><button type="button" class="button mt-16" data-action="add-resin-slot">${icon('plus')} Add resin slot</button><details class="mt-16" ${!engine.slots?.length ? 'open' : ''}><summary>Legacy single profile</summary>${field('resinProfilePath', 'Resin engine profile JSON', engine.profilePath || '', { full: true, placeholder: 'Absolute path to your reviewed profile JSON', hint: 'Used only when no named slots are configured.' })}</details><p class="field-hint mt-16">Save these settings before slicing a ticket. Generated GOO files require printer and resin qualification before production.</p></div></section>`;
+  }
+
+  const resinPropertyFields = [
+    ['ExposureTime', 'Normal exposure (seconds)'], ['BottomExposureTime', 'Bottom exposure (seconds)'],
+    ['BottomLayerCount', 'Bottom layers'], ['TransitionLayerCount', 'Transition layers'],
+    ['BottomLiftHeight', 'Bottom lift distance (mm)'], ['LiftHeight', 'Lift distance (mm)'],
+    ['BottomLiftSpeed', 'Bottom lift speed (mm/min)'], ['LiftSpeed', 'Lift speed (mm/min)'],
+    ['BottomRetractSpeed', 'Bottom retract speed (mm/min)'], ['RetractSpeed', 'Retract speed (mm/min)'],
+    ['BottomLiftHeight2', 'Bottom second lift distance (mm)'], ['LiftHeight2', 'Second lift distance (mm)'],
+    ['BottomLiftSpeed2', 'Bottom second lift speed (mm/min)'], ['LiftSpeed2', 'Second lift speed (mm/min)'],
+    ['BottomRetractHeight2', 'Bottom second retract distance (mm)'], ['RetractHeight2', 'Second retract distance (mm)'],
+    ['BottomRetractSpeed2', 'Bottom second retract speed (mm/min)'], ['RetractSpeed2', 'Second retract speed (mm/min)'],
+    ['WaitTimeBeforeCure', 'Wait before exposure (seconds)'], ['BottomWaitTimeBeforeCure', 'Bottom wait before exposure (seconds)'],
+    ['WaitTimeAfterCure', 'Wait after exposure (seconds)'], ['BottomWaitTimeAfterCure', 'Bottom wait after exposure (seconds)'],
+    ['WaitTimeAfterLift', 'Wait after lift (seconds)'], ['BottomWaitTimeAfterLift', 'Bottom wait after lift (seconds)'],
+    ['LightPWM', 'Normal light PWM'], ['BottomLightPWM', 'Bottom light PWM'],
+  ];
+
+  async function resinProfileModal(id) {
+    if (settingsDirty) throw new Error('Save or discard your Settings changes before customizing a profile.');
+    const { slot, profile, profileSha256 } = await api(`/api/resin/profiles/${idPath(id)}`);
+    const required = new Set(['ExposureTime', 'BottomExposureTime', 'BottomLayerCount', 'BottomLiftHeight', 'LiftHeight', 'BottomLiftSpeed', 'LiftSpeed', 'RetractSpeed', 'LightPWM', 'BottomLightPWM']);
+    openModal(`Customize ${slot.name}`, `${profile.printerModel} · ${profile.expected.resolutionX} × ${profile.expected.resolutionY} pixels`, `<form id="resin-profile-form" data-id="${attr(id)}" data-profile-sha256="${attr(profileSha256)}"><div class="form-grid">${field('resinMaterial', 'Resin / material profile', profile.material, { required: true, full: true, extra: 'maxlength="200"' })}<div class="field full"><label for="resin-bound-printer">Bound local printer</label><select id="resin-bound-printer" name="resinPrinterId"><option value="">Keep profile binding: ${esc(profile.printerId)}</option>${state.printers.filter(printer => printer.type === 'sdcp').map(printer => `<option value="${attr(printer.id)}" ${printer.id === profile.printerId ? 'selected' : ''}>${esc(printer.name)}</option>`).join('')}</select><p class="field-hint">Select the physical printer for this profile. Geometry stays with the profile and requires studio qualification.</p></div>${field('resinLayerHeight', 'Layer height (mm)', profile.expected.layerHeightMm, { type: 'number', required: true, extra: 'min="0.001" max="2" step="any"' })}${resinPropertyFields.map(([key, label]) => field(`resinProperty-${key}`, label, profile.uvtoolsProperties[key] ?? '', { type: 'number', required: required.has(key), extra: `min="0" max="${key.includes('PWM') ? 255 : 100000}" step="${key.includes('Count') || key.includes('PWM') ? 1 : 'any'}"` })).join('')}<label class="checkbox-field"><input type="checkbox" name="resinSupports" ${profile.supportsEnabled ? 'checked' : ''}><span>Generate supports</span></label><label class="checkbox-field"><input type="checkbox" name="resinPad" ${profile.padEnabled ? 'checked' : ''}><span>Generate support pad</span></label>${field('resinOrientations', 'Orientation candidates (X, Y, Z degrees)', profile.orientationCandidates.map(rotation => `${rotation.x}, ${rotation.y}, ${rotation.z}`).join('\n'), { textarea: true, full: true, required: true, rows: 4, hint: 'One to four rotations, one candidate per line. The first issue-free result is selected.' })}</div><p class="field-hint mt-16">Saving creates a new profile copy for this slot. Your original files and other slots are preserved. Calibrate each printer and resin combination before production.</p></form>`, footerSubmit('resin-profile-form', 'Save profile copy'));
+  }
+
   function renderSettings() {
     const settings = state.settings;
     const slicer = settings.slicer || {};
     settingsDirty = false;
     return `${heading('Make QuickPrint your own.', 'Set your workspace defaults and connect the tools that prepare your prints.')}
       <div class="settings-layout"><form id="settings-form"><div id="settings-error" class="inline-notice error form-error" role="alert"></div><section class="panel settings-section"><div class="panel-header"><div><h2>Your workspace</h2><p class="panel-subtitle">The name and rhythm of your print floor</p></div></div><div class="panel-content"><div class="form-grid">${field('siteName', 'Workspace name', settings.siteName || 'QuickPrint', { required: true, placeholder: 'Riverside Makerspace' })}${field('pollSeconds', 'Printer status refresh (seconds)', Math.round((settings.pollIntervalMs || 10000) / 1000), { type: 'number', required: true, extra: 'min="2" max="3600" step="1"', hint: 'How often QuickPrint checks configured printers.' })}</div></div></section>
+      ${resinEngineSettings(settings.resinEngine)}
       <section class="panel settings-section"><div class="panel-header"><div><h2>File preparation</h2><p class="panel-subtitle">Use an installed slicer to turn models into printer-ready files</p></div></div><div class="panel-content"><div class="form-grid"><div class="field"><label for="slicer-kind">Slicer</label><select id="slicer-kind" name="slicerKind"><option value="orca" ${slicer.kind === 'orca' || !slicer.kind ? 'selected' : ''}>OrcaSlicer</option><option value="bambu" ${slicer.kind === 'bambu' ? 'selected' : ''}>Bambu Studio</option><option value="prusa" ${slicer.kind === 'prusa' ? 'selected' : ''}>PrusaSlicer</option></select></div><div class="field"><label for="slicer-executable">Executable path</label><div class="field-row"><input id="slicer-executable" name="slicerExecutable" value="${attr(slicer.executable || '')}" placeholder="C:\\Program Files\\OrcaSlicer\\orca-slicer.exe"><button type="button" class="button" data-action="browse-slicer" aria-label="Browse for slicer executable">${icon('folder')}</button></div><p class="field-hint">Select the installed slicer executable on this PC.</p></div>${field('profilePaths', 'Slicing profile paths', (slicer.profilePaths || []).join('\n'), { textarea: true, full: true, rows: 4, placeholder: 'C:\\QuickPrint\\profiles\\machine.json\nC:\\QuickPrint\\profiles\\process.json\nC:\\QuickPrint\\profiles\\filament.json', hint: `<span id="profile-hint">${profileHint(slicer.kind || 'orca')}</span>` })}<div class="full"><button type="button" class="button compact" data-action="browse-profiles">${icon('folder')} Choose profile files</button></div><details class="advanced"><summary>Advanced slicing arguments</summary><div class="form-grid">${field('extraArgs', 'Additional arguments', (slicer.extraArgs || []).join('\n'), { textarea: true, full: true, hint: 'One argument per line. Arguments are passed directly to the executable without a shell. Output and input paths are managed by QuickPrint.' })}</div></details></div><div class="inline-notice no-margin">${icon('info')}<div>Already sliced files do not need an installed slicer. Use STL, 3MF, or OBJ models; STEP / STP needs a STEP-capable slicer. Other native CAD formats need export first. Use profiles that match the printer, nozzle, and material.</div></div></div></section><div class="form-actions"><button type="button" class="button" data-action="reset-settings">Discard changes</button><button type="submit" class="button primary">${icon('check')} Save settings</button></div></form>
       <aside class="settings-aside"><h3>Your workshop stays yours.</h3><p>Jobs, imported files, printer settings, and connector checkpoints live in your local QuickPrint data folder. Keep a backup of this folder when moving computers.</p><button class="button wide" data-action="open-data">${icon('folder')} Open workspace data folder</button><button class="button wide mt-16" data-action="export-backup">${icon('download')} Export workspace backup</button><p class="field-hint">Stop active jobs before exporting. To restore, quit QuickPrint and follow the backup instructions in the user guide. Credentials stay tied to their original machine/user; re-enter them after moving PCs.</p><div class="divider" style="margin:22px 0"></div><h3>Connecting a website?</h3><p>Enable the intake API in Inputs to receive orders. It uses a separate access token and never exposes desktop administration.</p><a class="button wide" href="#inputs">Go to Inputs ${icon('arrow')}</a><div class="divider" style="margin:22px 0"></div><h3>Printer profiles matter.</h3><p class="no-margin">A prepared file is tied to its printer and profile. If you change printers, prepare the job again before starting a print.</p></aside></div>`;
   }
@@ -270,7 +304,11 @@
     $('#modal-root').innerHTML = `<div class="modal-backdrop"><section class="modal ${large ? 'large' : ''}" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-subtitle"><header class="modal-header"><div><h2 id="modal-title">${title}</h2><p id="modal-subtitle">${subtitle}</p></div><button class="icon-button" data-action="close-modal" aria-label="Close dialog">${icon('close')}</button></header><div class="modal-body"><div id="modal-error" class="inline-notice error form-error" role="alert"></div>${body}</div>${footer ? `<footer class="modal-footer">${footer}</footer>` : ''}</section></div>`;
     document.body.style.overflow = 'hidden';
     modalBusy = false;
-    requestAnimationFrame(() => ($('#modal-root input:not([type=hidden])') || $('#modal-root select') || $('#modal-root button'))?.focus());
+    const dialog = $('#modal-root .modal');
+    requestAnimationFrame(() => {
+      if (!dialog.isConnected || dialog.contains(document.activeElement)) return;
+      ($('input:not([type=hidden])', dialog) || $('select', dialog) || $('button', dialog))?.focus();
+    });
   }
 
   function closeModal() {
@@ -314,6 +352,7 @@
   }
 
   function printerAuth(type, printer = {}) {
+    if (type === 'sdcp') return `${field('mainboardId', 'SDCP mainboard ID', printer.mainboardId || '', { required: true, full: true, hint: 'The 16 hexadecimal characters in this printer’s discovery record.' })}${field('brandId', 'SDCP discovery Id', printer.brandId || '', { required: true, full: true, hint: 'Use the discovery response Id associated with the same printer. File compatibility and exposure qualification are separate from connection status.' })}`;
     if (type === 'bambu') return `${field('serial', 'Printer serial number', printer.serial || '', { required: true, placeholder: 'From the printer’s device information' })}${field('accessCode', 'LAN access code', '', { type: 'password', required: !printer.hasAccessCode && !printer.id, extra: 'autocomplete="new-password"', placeholder: printer.hasAccessCode ? 'Saved — leave blank to keep' : 'From the printer’s LAN settings' })}<details class="advanced" open><summary>Bambu certificate trust</summary><div class="form-grid">${field('tlsFingerprint', 'Trusted SHA-256 certificate fingerprint', printer.tlsFingerprint || '', { full: true, placeholder: '64 hexadecimal characters; colons are accepted', hint: 'Verify the fingerprint of the printer’s certificate through a trusted channel. QuickPrint does not bypass TLS verification.' })}${field('caCertificate', 'Or provide the trusted CA certificate (PEM)', printer.caCertificate || '', { textarea: true, full: true, placeholder: '-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----', rows: 3, hint: 'A trusted certificate or fingerprint is required for the encrypted LAN connection.' })}</div></details>`;
     const trust = `<details class="advanced"><summary>HTTPS certificate trust (optional)</summary><div class="form-grid">${field('caCertificate', 'Trusted CA certificate (PEM)', printer.caCertificate || '', { textarea: true, full: true, placeholder: '-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----', hint: 'For an HTTPS endpoint with a private certificate authority. Normal publicly trusted certificates need no extra configuration.' })}${field('tlsFingerprint', 'Or a verified SHA-256 certificate fingerprint', printer.tlsFingerprint || '', { full: true, placeholder: '64 hexadecimal characters; colons are accepted', hint: 'Verify the fingerprint independently before trusting it. Certificate verification is never silently disabled.' })}</div></details>`;
     if (type === 'duet') return field('password', 'Duet password', '', { type: 'password', full: true, extra: 'autocomplete="new-password"', placeholder: printer.hasPassword ? 'Saved — leave blank to keep' : 'If required by your Duet controller', hint: 'Use the password configured on the printer’s RepRapFirmware HTTP server.' }) + trust;
@@ -349,10 +388,22 @@
   function connectorModal(type, id) {
     const connector = connectorById(id) || {};
     type = connector.type || type;
+    if (type === 'layr') return layrModal(id);
     const defaults = connector.defaults || {};
     const folderFields = `<div class="field full"><label for="connector-path">Folder path <span aria-hidden="true">*</span></label><div class="field-row"><input id="connector-path" name="path" required value="${attr(connector.path || '')}" placeholder="C:\\QuickPrint\\Incoming"><button type="button" class="button" data-action="browse-folder" aria-label="Choose watched folder">${icon('folder')}</button></div><p class="field-hint">Use an absolute path on this PC or a network location this user can access. Files directly inside this folder are watched.</p></div>${field('settleSeconds', 'Wait for file to settle (seconds)', (connector.settleMs || 2000) / 1000, { type: 'number', extra: 'min="1" max="300" step="1"', hint: 'Wait for the file size and timestamp to stop changing before importing.' })}`;
     const emailFields = `${field('host', 'IMAP host', connector.host || '', { required: true, placeholder: 'imap.example.com' })}${field('port', 'IMAP port', connector.port || 993, { type: 'number', required: true, extra: 'min="1" max="65535" step="1"' })}${field('username', 'Mailbox username', connector.username || '', { required: true, placeholder: 'prints@yourmakerspace.com', extra: 'autocomplete="username"' })}${field('password', 'App password', '', { type: 'password', required: !connector.id, extra: 'autocomplete="new-password"', placeholder: connector.id ? 'Saved — leave blank to keep' : 'An IMAP-enabled app password', hint: 'Use a provider-supported app password. OAuth-only mailboxes need an external intake bridge.' })}${field('mailbox', 'Mailbox / folder', connector.mailbox || 'INBOX', { required: true, hint: 'Existing supported attachments in this folder are imported on the first check.' })}${field('pollSeconds', 'Check interval (seconds)', (connector.pollIntervalMs || 60000) / 1000, { type: 'number', required: true, extra: 'min="15" max="86400" step="1"' })}<div class="inline-notice full no-margin" style="grid-column:1/-1">${icon('shield')}<span>IMAP uses TLS with certificate verification. QuickPrint reads attachments; it does not send email. Choose a dedicated mailbox or folder for print submissions.</span></div>`;
     openModal(connector.id ? 'Edit input connection' : type === 'folder' ? 'A simple place to drop your files.' : 'Give your inbox a print queue.', type === 'folder' ? 'New supported files appear in review once the copy finishes.' : 'Bring supported CAD and print attachments into your workspace.', `<form id="connector-form" data-id="${attr(connector.id || '')}" data-type="${type}"><div class="form-grid">${field('name', 'Connection name', connector.name || '', { full: true, required: true, placeholder: type === 'folder' ? 'Designers’ incoming files' : 'Makerspace submissions' })}${type === 'folder' ? folderFields : emailFields}<details class="advanced"><summary>Default job details</summary><div class="form-grid">${field('quantity', 'Copies per file', defaults.quantity || 1, { type: 'number', extra: 'min="1" max="10000" step="1"' })}${field('customer', 'Default customer / project', defaults.customer || '')}${field('notes', 'Default print requirements', defaults.notes || '', { textarea: true, full: true })}</div></details><label class="checkbox-field full" style="grid-column:1/-1"><input type="checkbox" name="enabled" ${connector.enabled !== false ? 'checked' : ''}><span>Enable this connection<small>Keep QuickPrint running on this PC to import files in the background.</small></span></label></div></form>`, footerSubmit('connector-form', connector.id ? 'Save connection' : 'Connect input'));
+  }
+
+  function layrModal(id) {
+    const connector = connectorById(id) || {};
+    if (connector.apiMode === 'production') return layrProductionModal(id);
+    openModal('Connect PrintByLayr', 'Import paid resin orders with their approved production requirements.', `<form id="layr-form" data-id="${attr(connector.id || '')}"><div class="form-grid">${field('portalUrl', 'Order portal address', connector.portalUrl || 'https://printbylayr.com', { required: true, type: 'url', full: true, extra: connector.id ? 'readonly' : '' })}<p class="field-hint full">Sign in to your studio in your browser, then return here. The portal currently grants studio access; QuickPrint uses the connection to read preparation tickets and download models.</p><p class="field-hint full">This portal connection checks the newest 100 orders and accepts models up to 100 MiB. Review older or larger orders in the studio.</p><p class="field-hint full">Requested part counts and resin requirements stay with each ticket. Tickets arrive for review; resin slicing and printer dispatch require a qualified resin integration.</p></div></form>`, `<button class="button" data-action="add-layr-production">Use machine API</button>` + footerSubmit('layr-form', connector.id ? 'Reconnect portal' : 'Sign in to portal', 'globe'));
+  }
+
+  function layrProductionModal(id) {
+    const connector = connectorById(id) || {};
+    openModal('Connect the production API', 'Use a separately scoped machine connection for the order queue.', `<form id="layr-production-form" data-id="${attr(connector.id || '')}"><div class="form-grid">${field('portalUrl', 'Order portal address', connector.portalUrl || 'https://printbylayr.com', { required: true, type: 'url', full: true, extra: connector.id ? 'readonly' : '' })}${field('token', 'Production machine token', '', { required: connector.apiMode !== 'production' || !connector.hasToken, type: 'password', full: true, extra: 'autocomplete="new-password"', hint: connector.apiMode === 'production' && connector.hasToken ? 'Leave blank to keep the saved token.' : 'Use the token configured for the portal’s production API.' })}<p class="field-hint full">This requires the production API update on your portal. It reads paid preparation tickets across the full queue and records preparation evidence using separate machine permissions.</p><label class="checkbox-field full"><input type="checkbox" name="autoSyncPreparation" ${connector.autoSyncPreparation !== false ? 'checked' : ''}><span>Send validated slice receipts automatically<small>Issue-free slices are recorded as preparation evidence. Studio qualification controls approval for printing.</small></span></label></div></form>`, footerSubmit('layr-production-form', connector.id ? 'Save production connection' : 'Connect machine API', 'network'));
   }
 
   async function integrationModal() {
@@ -367,23 +418,203 @@
     } catch (error) { toast(error.message, true); }
   }
 
+  function geometryFor(job) {
+    const cached = resinGeometryCache.get(job.id);
+    if (cached?.sourceSha256 === job.sha256 && Boolean(cached.repaired) === Boolean(job.resinRepair) && (!job.resinRepair || (cached.geometrySha256 === job.resinRepair.sha256 && cached.repairPreparation?.reportSha256 === job.resinRepair.proofFile?.sha256)) && (!/\.(step|stp)$/i.test(job.fileName) || (cached.geometrySha256 === job.resinCad?.sha256 && cached.cadPreparation?.reportSha256 === job.resinCad?.reportSha256))) return cached;
+    if (job.resinRepair) return null;
+    if (job.resinCad?.sourceSha256 === job.sha256 && job.resinCad.measurement?.sourceSha256 === job.resinCad.sha256) return { ...job.resinCad.measurement, sourceSha256: job.sha256, geometrySha256: job.resinCad.sha256, embeddedUnitsConverted: true };
+    return job.resinSlice?.sizingPlan?.sourceSha256 === job.sha256 ? job.resinSlice.sizingPlan : null;
+  }
+  const dimensionText = dimensions => ['x', 'y', 'z'].map(axis => Number(dimensions[axis].toPrecision(6))).join(' × ');
+  function resinSizingRequest(form) {
+    const value = name => $('[name="' + name + '"]', form)?.value;
+    return value('resinSizingMode') === 'scale' ? { mode: 'scale', factor: Number(value('resinScaleFactor')) } : value('resinSizingMode') === 'dimension' ? { mode: 'dimension', axis: value('resinDimensionAxis'), millimeters: Number(value('resinDimensionMm')) } : { mode: 'original' };
+  }
+  function hollowReviewEntry(job) {
+    let entry = resinHollowReviews.get(job.id);
+    const source = [job.sha256, job.resinCad?.sha256 || '', job.resinRepair?.sha256 || ''].join(':');
+    if (!entry) {
+      entry = { review: job.resinSlice?.operatorReview?.hollow || null, enabled: false, revision: 0, validated: null, pending: false, error: '', source };
+      resinHollowReviews.set(job.id, entry);
+    } else if (entry.source !== source) {
+      entry.source = source; entry.revision++; entry.validated = null; entry.pending = false;
+    }
+    return entry;
+  }
+  function resinHollowKey(form) {
+    const job = jobById(form.dataset.id), engine = state.settings.resinEngine || {}, slotId = $('[name="profileSlotId"]', form)?.value || '';
+    return JSON.stringify([job.sha256, job.resinCad?.sha256 || '', job.resinRepair?.sha256 || '', form.dataset.geometrySha || '', resinSizingRequest(form), slotId, slotId ? engine.slots?.find(slot => slot.id === slotId)?.profilePath || '' : engine.profilePath || '']);
+  }
+  function parseHollowReview(value) {
+    const object = (item, required, optional = []) => {
+      if (!item || typeof item !== 'object' || Array.isArray(item) || required.some(key => !Object.hasOwn(item, key)) || Object.keys(item).some(key => ![...required, ...optional].includes(key))) throw new Error('The recipe has missing or unsupported fields. Import a canonical hollow review JSON file.');
+    };
+    if (value && typeof value === 'object' && Object.keys(value).length === 1 && Object.hasOwn(value, 'hollow')) value = value.hollow;
+    object(value, ['geometrySha256', 'profileSha256', 'recipe', 'supportRequest', 'resolutionRequest', 'boundaryPolicy']);
+    if (![value.geometrySha256, value.profileSha256].every(hash => typeof hash === 'string' && /^[a-f0-9]{64}$/.test(hash))) throw new Error('The recipe must contain its original geometry and profile SHA-256 hashes.');
+    object(value.recipe, ['orientation', 'wallThicknessMm', 'quality', 'closingDistanceMm', 'drains']);
+    const vector = item => object(item, ['x', 'y', 'z']);
+    vector(value.recipe.orientation);
+    if (!Array.isArray(value.recipe.drains) || value.recipe.drains.length > 64) throw new Error('The recipe must contain a bounded drain list.');
+    value.recipe.drains.forEach(drain => { object(drain, ['id', 'startMm', 'direction', 'radiusMm', 'lengthMm']); vector(drain.startMm); vector(drain.direction); });
+    object(value.supportRequest, ['mode', 'clearanceMm', 'points', 'regions']);
+    if (!Array.isArray(value.supportRequest.points) || !Array.isArray(value.supportRequest.regions) || value.supportRequest.points.length + value.supportRequest.regions.length > 512) throw new Error('The recipe must contain bounded support contact and region lists.');
+    value.supportRequest.points.forEach(point => { object(point, ['id', 'sourceFaceIndex', 'positionMm', 'headRadiusMm', 'allowedRadiusMm']); vector(point.positionMm); });
+    value.supportRequest.regions.forEach(region => { object(region, ['id', 'minMm', 'maxMm']); vector(region.minMm); vector(region.maxMm); });
+    object(value.resolutionRequest, ['maximumUncertaintyMm'], ['minimumPitchMm', 'reduction', 'maxCells', 'maxWorkingBytes']);
+    if (value.resolutionRequest.minimumPitchMm) vector(value.resolutionRequest.minimumPitchMm);
+    if (value.resolutionRequest.reduction) vector(value.resolutionRequest.reduction);
+    return value;
+  }
+  function resinHollowSummary(review) {
+    if (!review) return '<p class="field-hint">Import a reviewed recipe bound to this sized source and resin profile.</p>';
+    const vector = value => ['x', 'y', 'z'].map(axis => esc(value?.[axis])).join(', '), recipe = review.recipe, support = review.supportRequest, resolution = review.resolutionRequest;
+    return `<dl class="details-grid"><div><dt>Wall / quality / closing</dt><dd>${esc(recipe.wallThicknessMm)} mm / ${esc(recipe.quality)} / ${esc(recipe.closingDistanceMm)} mm</dd></div><div><dt>Orientation X, Y, Z</dt><dd>${vector(recipe.orientation)}°</dd></div><div><dt>Supports</dt><dd>${esc(support.mode)} · ${support.points.length} contact(s) · ${support.regions.length} prior region(s) · clearance ${esc(support.clearanceMm)} mm</dd></div><div><dt>Boundary policy</dt><dd>${esc(review.boundaryPolicy)}</dd></div><div><dt>Prior resolution policy</dt><dd>Maximum uncertainty ${esc(resolution.maximumUncertaintyMm)} mm${resolution.minimumPitchMm ? ` · minimum pitch ${vector(resolution.minimumPitchMm)} mm` : ''}${resolution.reduction ? ` · reduction ${vector(resolution.reduction)}` : ''}${resolution.maxCells !== undefined ? ` · ${esc(resolution.maxCells)} cells maximum` : ''}${resolution.maxWorkingBytes !== undefined ? ` · ${esc(resolution.maxWorkingBytes)} working bytes maximum` : ''}</dd></div><div><dt>Bound hashes</dt><dd>Geometry ${esc(review.geometrySha256.slice(0, 12))}… · profile ${esc(review.profileSha256.slice(0, 12))}…</dd></div></dl><p class="field-hint">Drain positions and directions are in the sized source’s millimetre coordinate frame.</p>${recipe.drains.map(drain => `<p class="field-hint text-break"><strong>${esc(drain.id)}</strong> · start (${vector(drain.startMm)}) mm · direction (${vector(drain.direction)}) · radius ${esc(drain.radiusMm)} mm · length ${esc(drain.lengthMm)} mm</p>`).join('')}`;
+  }
+  function resinHollowFields(job) {
+    const entry = hollowReviewEntry(job);
+    return `<details class="mt-16" id="resin-hollow-fields"><summary>Optional hollow preparation</summary><p class="field-hint">Digital hollow verification occurs during preparation. Printer, resin and physical qualification remain required.</p><label class="checkbox-field mt-16"><input type="checkbox" name="resinHollowEnabled" ${entry.enabled ? 'checked' : ''}><span>Use this reviewed hollow recipe for preparation</span></label><div class="field mt-16"><label for="resin-hollow-file">Reviewed hollow recipe JSON (maximum 256 KiB)</label><input type="file" id="resin-hollow-file" accept=".json,application/json" style="max-width:100%"><p class="field-hint">Import a canonical hollow review or a JSON object containing only its hollow field. Existing hashes are checked against the selected size and profile.</p></div><div id="resin-hollow-summary">${resinHollowSummary(entry.review)}</div><p id="resin-hollow-status" class="field-hint" role="status"></p><p id="resin-hollow-error" class="field-hint error" role="alert"></p><div class="button-row mt-16"><button type="button" class="button small" data-action="validate-resin-hollow" data-id="${attr(job.id)}">Validate recipe</button><button type="button" class="button small" data-action="download-resin-geometry-source" data-id="${attr(job.id)}">Download sized source STL</button></div><label class="checkbox-field mt-16"><input type="checkbox" name="confirmedHollowPreparation" disabled><span>I reviewed the validated hollow dimensions, drain directions, support policy and resolution limits for this exact size and resin profile.</span></label></details>`;
+  }
+  function updateResinHollowState(form, { invalidate = false } = {}) {
+    if (!form?.isConnected || !$('#resin-hollow-fields', form)) return;
+    const entry = hollowReviewEntry(jobById(form.dataset.id)), key = resinHollowKey(form), confirmation = $('[name="confirmedHollowPreparation"]', form);
+    if (invalidate || (entry.validated && entry.validated.key !== key)) {
+      entry.revision++; entry.validated = null; entry.pending = false; confirmation.checked = false;
+    }
+    const valid = entry.validated?.key === key;
+    if (!valid || !entry.enabled) confirmation.checked = false;
+    confirmation.disabled = !entry.enabled || !valid || modalBusy; confirmation.required = entry.enabled && valid;
+    $('#resin-hollow-status', form).textContent = entry.pending ? 'Checking the recipe against the current sized source and profile…' : valid ? 'Recipe validated for the current size and resin profile. Review and confirm before slicing.' : entry.review ? 'Recipe requires validation for the current size and resin profile.' : 'No hollow recipe imported.';
+    $('#resin-hollow-error', form).textContent = entry.error;
+    $('[data-action="validate-resin-hollow"]', form).disabled = modalBusy || entry.pending || !entry.enabled || !entry.review;
+    $('button[type="submit"]', form).disabled = modalBusy || form.dataset.resinConfigured !== 'true' || (entry.enabled && !valid);
+  }
+  async function importResinHollowFile(input) {
+    const form = input.closest('form'), entry = hollowReviewEntry(jobById(form.dataset.id)), revision = ++entry.revision, file = input.files?.[0];
+    entry.validated = null; entry.pending = false; entry.review = null; entry.error = ''; $('[name="confirmedHollowPreparation"]', form).checked = false;
+    updateResinHollowState(form);
+    try {
+      if (!file) return;
+      if (file.size > 256 * 1024) throw new Error('The hollow recipe exceeds the 256 KiB limit.');
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(await file.arrayBuffer());
+      const review = parseHollowReview(JSON.parse(text));
+      if (entry.revision !== revision || !form.isConnected) return;
+      entry.review = review;
+    } catch (error) { if (entry.revision === revision) entry.error = error instanceof SyntaxError ? 'The hollow recipe is not valid JSON.' : error.message; }
+    finally { if (entry.revision === revision && form.isConnected) { $('#resin-hollow-summary', form).innerHTML = resinHollowSummary(entry.review); updateResinHollowState(form); } }
+  }
+  async function validateResinHollow(form) {
+    const entry = hollowReviewEntry(jobById(form.dataset.id));
+    if (modalBusy || !entry.enabled || !entry.review) return;
+    const key = resinHollowKey(form), revision = ++entry.revision, hollow = structuredClone(entry.review), slotId = $('[name="profileSlotId"]', form)?.value;
+    entry.validated = null; entry.pending = true; entry.error = ''; $('[name="confirmedHollowPreparation"]', form).checked = false; updateResinHollowState(form);
+    try {
+      const result = await api(`/api/jobs/${idPath(form.dataset.id)}/resin/hollow/review`, { method: 'POST', body: { hollow, sizing: resinSizingRequest(form), ...(slotId ? { profileSlotId: slotId } : {}) } });
+      if (!form.isConnected || revision !== entry.revision || key !== resinHollowKey(form)) return;
+      const canonical = parseHollowReview(result.hollow);
+      if (canonical.geometrySha256 !== hollow.geometrySha256 || canonical.profileSha256 !== hollow.profileSha256 || result.geometry?.geometrySha256 !== hollow.geometrySha256 || result.profileSha256 !== hollow.profileSha256) throw new Error('The recipe hashes changed. Import an updated reviewed recipe; this recipe was not rebound.');
+      entry.validated = { key, hollow: canonical }; entry.review = canonical;
+      $('#resin-hollow-summary', form).innerHTML = resinHollowSummary(canonical);
+    } catch (error) { if (revision === entry.revision) entry.error = error.message; }
+    finally { if (revision === entry.revision) { entry.pending = false; updateResinHollowState(form); } }
+  }
+  function resinRepairPanel(job) {
+    if (!/\.(stl|obj)$/i.test(job.fileName)) return '';
+    const repair = job.resinRepair, summary = repair?.summary, operations = summary?.operations;
+    const held = ['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState), available = ['review', 'cancelled'].includes(job.status) && !job.currentRunId && !held;
+    return `<section class="mt-16"><h4>Exact mesh repair</h4><p class="field-hint">Review exact duplicate triangles and face direction before sizing. The original model and ticket remain recorded.</p>${operations ? `<dl class="details-grid"><div><dt>Exact duplicate faces removed</dt><dd>${esc(operations.removedExactDuplicateFaces)}</dd></div><div><dt>Unique faces reoriented</dt><dd>${esc(operations.reorientedUniqueFaces)}</dd></div><div><dt>Normalized model bounds</dt><dd>Unchanged · ${esc(dimensionText(Object.fromEntries(['x', 'y', 'z'].map(axis => [axis, summary.boundsMm.max[axis] - summary.boundsMm.min[axis]]))))} mm</dd></div><div><dt>Qualification</dt><dd>Requires printer and resin qualification</dd></div></dl><button type="button" class="button small" data-action="download-resin-repair" data-id="${attr(job.id)}">${icon('download')} Download unqualified repaired STL</button>` : ''}<div class="button-row mt-16"><button type="button" class="button small" data-action="review-resin-repair" data-id="${attr(job.id)}" ${available ? '' : 'disabled'}>Review exact mesh repair</button></div>${held ? '<p class="field-hint">Reopen approved preparation before changing the model.</p>' : ''}</section>`;
+  }
+  function resinSizingFields(job) {
+    const cad = /\.(step|stp)$/i.test(job.fileName), repaired = Boolean(job.resinRepair), configured = state.settings.resinEngine?.freecadExecutable && state.settings.resinEngine?.cadAuditPath;
+    if (cad && !configured) return '<div id="resin-sizing-fields" class="mt-16"><p class="field-hint">To prepare this STEP model, configure FreeCAD and the CAD transfer audit runtime in Settings.</p></div>';
+    if (cad && !geometryFor(job)) return `<div id="resin-sizing-fields" class="mt-16"><h4>STEP geometry</h4><p class="field-hint">STEP contains its own units. CAD dimensions are converted to millimetres; the ticket’s declared ${esc(job.order.units)} units remain recorded without another scale conversion.</p><label class="checkbox-field mt-16"><input type="checkbox" name="confirmedEmbeddedUnits" required><span>I reviewed that this STEP model uses embedded CAD units and will be measured in millimetres.</span></label><button type="button" class="button mt-16" data-action="prepare-resin-cad" data-id="${attr(job.id)}">Prepare STEP geometry</button></div>`;
+    const geometry = geometryFor(job), sizing = job.resinSlice?.sizingPlan?.requestedSizing || { mode: 'original' }, original = sizing.mode === 'original';
+    const repairHint = repaired ? `<p class="field-hint">The repaired model is normalized to millimetres. Ticket units ${esc(job.order.units)} remain recorded separately. Measure this derivative before reviewing its size.</p>` : '';
+    return `<div id="resin-sizing-fields" class="mt-16"><h4>Model size</h4>${repairHint}${cad ? `<p class="field-hint">CAD units have been converted to millimetres. ${esc(job.resinCad?.cad?.solidCount || 0)} source solid(s) retained; ticket units ${esc(job.order.units)} are recorded separately.</p><button type="button" class="button small" data-action="prepare-resin-cad" data-id="${attr(job.id)}">Regenerate STEP geometry</button>` : ''}<p class="field-hint">${geometry ? `Measured source: ${esc(dimensionText(geometry.sourceDimensionsMm))} mm (X × Y × Z).` : 'Measure the model before choosing a numeric scale or target dimension.'}</p><button type="button" class="button small" data-action="measure-resin-geometry" data-id="${attr(job.id)}">Measure model</button><div class="field mt-16"><label for="resin-sizing-mode">Sizing method</label><select id="resin-sizing-mode" name="resinSizingMode"><option value="original" ${original ? 'selected' : ''}>Current model size</option><option value="scale" ${sizing.mode === 'scale' ? 'selected' : ''} ${geometry ? '' : 'disabled'}>Uniform scale factor</option><option value="dimension" ${sizing.mode === 'dimension' ? 'selected' : ''} ${geometry ? '' : 'disabled'}>Set one source-axis dimension</option></select></div><div id="resin-scale-fields" ${sizing.mode === 'scale' ? '' : 'hidden'}>${field('resinScaleFactor', 'Uniform scale factor', sizing.factor ?? 1, { type: 'number', extra: `min="0.0001" max="10000" step="any" ${sizing.mode === 'scale' ? 'required' : 'disabled'}` })}</div><div id="resin-dimension-fields" class="form-grid mt-16" ${sizing.mode === 'dimension' ? '' : 'hidden'}><div class="field"><label for="resin-dimension-axis">Source axis</label><select id="resin-dimension-axis" name="resinDimensionAxis" ${sizing.mode === 'dimension' ? '' : 'disabled'}>${['x', 'y', 'z'].map(axis => `<option value="${axis}" ${sizing.axis === axis ? 'selected' : ''}>${axis.toUpperCase()}</option>`).join('')}</select></div>${field('resinDimensionMm', 'Target source dimension (mm)', sizing.millimeters ?? geometry?.sourceDimensionsMm?.x ?? 1, { type: 'number', extra: `min="0.000001" max="10000" step="any" ${sizing.mode === 'dimension' ? 'required' : 'disabled'}` })}</div><p id="resin-sizing-preview" class="field-hint mt-16">${geometry ? `Expected model: ${esc(dimensionText(sizing.mode === 'original' ? geometry.sourceDimensionsMm : job.resinSlice?.sizingPlan?.dimensionsMm || geometry.sourceDimensionsMm))} mm before orientation and supports.` : 'Declared units will be converted to millimetres.'}</p><label id="resin-original-confirm" class="checkbox-field mt-16" ${original ? '' : 'hidden'}><input type="checkbox" name="confirmedOriginalSize" ${original ? 'required' : 'disabled'}><span>${cad ? 'I reviewed the CAD size in millimetres and its embedded units.' : repaired ? 'I reviewed the repaired model size in millimetres and its exact mesh edits.' : `I reviewed the declared ${esc(job.order.units)} units and current model size.`} Requested sizing is already embodied in this model.</span></label><label id="resin-sizing-confirm" class="checkbox-field mt-16" ${original ? 'hidden' : ''}><input type="checkbox" name="confirmedSizing" ${original ? 'disabled' : 'required'}><span>I reviewed the measured source size and chosen uniform transform against the order requirements. Source axes are measured before print orientation; proportions stay unchanged.</span></label></div>`;
+  }
+  function updateResinSizing(form, { modeChanged = false, clearConfirmation = false } = {}) {
+    if (modeChanged || clearConfirmation) updateResinHollowState(form, { invalidate: true });
+    const mode = $('[name="resinSizingMode"]', form)?.value || 'original', job = jobById(form.dataset.id), geometry = geometryFor(job);
+    for (const [id, enabled] of [['resin-scale-fields', mode === 'scale'], ['resin-dimension-fields', mode === 'dimension'], ['resin-original-confirm', mode === 'original'], ['resin-sizing-confirm', mode !== 'original']]) {
+      const section = document.getElementById(id); section.hidden = !enabled;
+      $$('input,select', section).forEach(input => { input.disabled = !enabled; input.required = enabled; if (clearConfirmation && input.type === 'checkbox') input.checked = false; });
+    }
+    if (modeChanged) $$('input[type="checkbox"]', $('#resin-sizing-fields')).forEach(input => { input.checked = false; });
+    const preview = $('#resin-sizing-preview');
+    if (!geometry) { preview.textContent = 'Measure the model to review its size.'; return; }
+    const factor = mode === 'scale' ? Number($('[name="resinScaleFactor"]', form).value) : mode === 'dimension' ? Number($('[name="resinDimensionMm"]', form).value) / geometry.sourceDimensionsMm[$('[name="resinDimensionAxis"]', form).value] : 1;
+    const dimensions = Object.fromEntries(['x', 'y', 'z'].map(axis => [axis, geometry.sourceDimensionsMm[axis] * factor]));
+    preview.textContent = Number.isFinite(factor) && factor >= 0.0001 && factor <= 10000 && Object.values(dimensions).every(value => value > 0 && value <= 10000) ? `Expected model: ${dimensionText(dimensions)} mm before orientation and supports.` : 'Choose a positive uniform size within the supported limits.';
+  }
+
+  function resinPlateFields(job) {
+    const remaining = job.resinProduction?.remainingParts ?? job.order.requestedQuantity;
+    if (remaining < 1) return '<p class="field-hint mt-16">The current target has no remaining print units.</p>';
+    const saved = job.resinSlice?.operatorReview?.plate;
+    const copies = Math.max(1, Math.min(remaining, saved?.copies || job.resinSlice?.modelCopiesPerRun || 1));
+    return `<details class="mt-16" ${copies > 1 ? 'open' : ''}><summary>Plate copies and spacing</summary>${field('resinPlateCopies', 'Maximum copies on this plate', copies, { type: 'number', required: true, extra: `min="1" max="${Math.min(500, remaining)}" step="1"`, hint: 'Each source instance represents one order unit. Native support and pad footprints can reduce the number that fits.' })}<div id="resin-plate-spacing" class="form-grid mt-16" ${copies > 1 ? '' : 'hidden'}>${field('resinPlateGapMm', 'Gap between support footprints (mm)', saved?.gapMm ?? 1, { type: 'number', extra: `min="0" max="10000" step="any" ${copies > 1 ? 'required' : 'disabled'}` })}${field('resinPlateMarginMm', 'Plate edge margin (mm)', saved?.marginMm ?? 2, { type: 'number', extra: `min="1" max="10000" step="any" ${copies > 1 ? 'required' : 'disabled'}` })}</div></details>`;
+  }
+
+  function resinJobPanel(job) {
+    const slice = job.resinSlice;
+    const engine = state.settings.resinEngine || {};
+    const slots = engine.slots || [];
+    const selectedSlotId = slots.some(slot => slot.id === slice?.operatorReview?.profileSlotId) ? slice.operatorReview.profileSlotId : slots.length === 1 ? slots[0].id : '';
+    const slotPicker = slots.length ? `<div class="field"><label for="resin-slot-select">Resin profile slot</label><select id="resin-slot-select" name="profileSlotId" required><option value="" ${selectedSlotId ? '' : 'selected'}>Choose the resin and printer profile</option>${slots.map(slot => `<option value="${attr(slot.id)}" ${slot.id === selectedSlotId ? 'selected' : ''}>${esc(slot.name)}</option>`).join('')}</select></div>` : `<p class="field-hint">Selected profile: ${esc(engine.profilePath || 'Configure a resin profile in Settings.')}</p>`;
+    const approvalHold = ['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState);
+    const configured = engine.prusaExecutable && engine.uvtoolsExecutable && (slots.length || engine.profilePath) && !approvalHold && (job.resinProduction?.remainingParts ?? job.order.requestedQuantity) > 0 && ((/\.(stl|obj)$/i.test(job.fileName) && (!job.resinRepair || geometryFor(job))) || (/\.(step|stp)$/i.test(job.fileName) && geometryFor(job)));
+    const project = Object.entries(job.order?.project || {}).map(([key, value]) => `<div><dt>${esc(key.replace(/([a-z])([A-Z])/g, '$1 $2'))}</dt><dd style="white-space:pre-wrap">${esc(typeof value === 'object' ? JSON.stringify(value) : value)}</dd></div>`).join('');
+    const form = ['review', 'cancelled'].includes(job.status) ? `<form id="resin-slice-form" data-id="${attr(job.id)}" data-geometry-sha="${attr(geometryFor(job)?.geometrySha256 || '')}" data-resin-configured="${configured ? 'true' : 'false'}">${slotPicker}${approvalHold ? '<p class="field-hint mt-16">Preparation is approved or awaiting confirmation. Reopen it through the production review before replacing this slice.</p>' : ''}<label class="checkbox-field mt-16"><input type="checkbox" name="confirmedRequirements" required><span>I reviewed all ticket requirements and confirmed that the selected printer, resin, exposure, and support profile meet them. Unresolved requirements must be clarified before slicing.</span></label>${resinSizingFields(job)}${resinPlateFields(job)}${resinHollowFields(job)}<div class="button-row mt-16" data-resin-submit-row><button type="submit" class="button primary" ${configured ? '' : 'disabled'}>${icon('cube')} Slice resin model</button></div></form>` : job.status === 'preparing' ? `<p>Resin preparation is running.</p><button class="button" data-action="cancel-local" data-id="${attr(job.id)}">Cancel resin preparation</button>` : '';
+    return `<div class="job-action-panel"><h3>Resin production ticket ${esc(job.order?.reference)}</h3><p>${esc(job.order?.requestedQuantity)} parts requested · model units ${esc(job.order?.units)} · ${esc(job.order?.production?.qualityTier)} quality</p><p>${esc(job.order?.production?.colour)} resin · ${esc(job.order?.production?.properties)} · supports: ${esc(job.order?.production?.supports)}</p><dl class="details-grid">${project}</dl><p>QuickPrint checks configured orientation candidates and captures a GOO file for inspection. It does not interpret size or support instructions from free text. Captured slices require printer and material qualification before production.</p>${resinRepairPanel(job)}${form}${slice ? `<div class="divider mt-16"></div><p><strong>${slice.analysis?.passed ? 'Slice captured for qualification' : 'Print issues require review'}</strong> · ${esc(slice.inspection?.layerCount)} layers · ${esc(slice.analysis?.count)} reported issues · ${esc(slice.modelCopiesPerRun || 1)} verified source instance(s) per plate</p>${slice.platePreparation && slice.platePreparation.layout.copiesPlaced < slice.platePreparation.requested.copies ? `<p class="field-hint">${esc(slice.platePreparation.layout.copiesPlaced)} of up to ${esc(slice.platePreparation.requested.copies)} requested copies fit this plate. Remaining order units require another confirmed run.</p>` : ''}<p class="field-hint">${esc(slice.printerModel)} · ${esc(slice.material)} · finished ${esc(dateTime(slice.finishedAt))}</p>${slice.analysis?.issues?.length ? `<ul>${slice.analysis.issues.map(issue => `<li>${esc(issue)}</li>`).join('')}</ul>` : ''}<button class="button" data-action="download-resin-slice" data-id="${attr(job.id)}">${icon('download')} Download captured GOO</button>` : ''}<details class="mt-16"><summary>SatelLite preparation probe</summary><p>Repair and evaluation CLI output is still experimental.</p><button class="button" data-action="resin-preprocess" data-id="${attr(job.id)}" ${job.status === 'review' ? '' : 'disabled'}>Probe SatelLite evaluation</button>${job.resinPreparation ? `<p class="field-hint">Last preprocessing: ${esc(job.resinPreparation.status)}</p>` : ''}</details></div>`;
+  }
+
+  function resinSyncPanel(job) {
+    const matching = state.connectors.some(input => input.type === 'layr' && input.apiMode === 'production' && input.enabled !== false && input.portalUrl === job.order?.portalUrl);
+    const entries = (state.productionOutbox || []).filter(entry => entry.id === job.order?.portalJobId && entry.portalUrl === job.order?.portalUrl).slice(-3);
+    if (!matching && !entries.length) return '';
+    return `<section class="job-action-panel"><h3>Portal preparation evidence</h3><p>Validated slice receipts preserve the model, engine, profile and file hashes in the order portal. Printer qualification is controlled by the studio.</p>${entries.map(entry => `<div><p class="field-hint">${esc(entry.action)} · ${esc(entry.state)}${entry.error ? ` · ${esc(entry.error)}` : ''}${entry.confirmation ? ` · portal version ${esc(entry.confirmation.version)}${typeof entry.confirmation.qualified === 'boolean' ? entry.confirmation.qualified ? ' · qualified binding' : ' · qualification pending' : ''}` : ''}${entry.resolution ? ` · ${esc(entry.resolution.reason)}` : ''}</p>${['conflict', 'rejected'].includes(entry.state) || (entry.state === 'paused' && entry.attempts === 0) ? `<button class="button small" data-action="dismiss-layr-evidence" data-id="${attr(entry.operationId)}" data-job-id="${attr(job.id)}">Dismiss held evidence</button>` : ''}</div>`).join('')}${matching ? `<button class="button" data-action="review-resin-target" data-id="${attr(job.id)}">Review current target</button>` : ''}${matching && job.resinSlice?.analysis?.passed ? `<p class="field-hint">${esc(job.resinProduction?.printedParts || 0)} of ${esc(job.resinProduction?.requestedParts ?? job.order.requestedQuantity)} ${job.resinProduction?.target?.kind === 'replacement' ? 'replacement' : 'production'} units printed; quality inspection is separate.</p><button class="button" data-action="review-resin-production" data-id="${attr(job.id)}">Review production qualification</button>` : ''}${matching && job.status === 'review' && job.resinSlice?.analysis?.passed ? `<button class="button" data-action="sync-resin-slice" data-id="${attr(job.id)}">${icon('upload')} Queue slice receipt</button>` : ''}</section>`;
+  }
+
+  async function resinProductionModal(id) {
+    const result = await api(`/api/jobs/${idPath(id)}/resin/production`);
+    const job = jobById(id);
+    const runBlocked = result.hasActiveRun === true || Boolean(job.currentRunId);
+    const parts = result.partsPerRun || 1, fitsRemainder = parts <= result.remainingParts;
+    const approve = result.qualified && result.portalStatus === 'preparing' && !runBlocked && fitsRemainder;
+    const start = result.qualified && result.portalStatus === 'queued' && result.planReviewed && result.remainingParts > 0 && !runBlocked && fitsRemainder;
+    openModal('Review resin production', 'Each source instance represents one order unit; verified plate counts remain separate from quality acceptance.', `<dl class="details-grid"><div><dt>Printer</dt><dd>${esc(result.printerModel || 'Not bound')}</dd></div><div><dt>Resin / profile</dt><dd>${esc(result.material || 'Not bound')}</dd></div><div><dt>Current qualification</dt><dd>${result.qualified ? 'Qualified by the studio' : 'Requires studio qualification'}</dd></div><div><dt>Portal stage</dt><dd>${esc(result.portalStatus || 'Preparation receipt pending')}</dd></div><div><dt>Current target</dt><dd>${esc(result.target?.kind === 'replacement' ? `QC replacement ${result.target.cycle}` : 'Original order')} · ${esc(result.requestedParts ?? job.order.requestedQuantity)} units</dd></div><div><dt>Verified plate</dt><dd>${esc(parts)} order unit(s)</dd></div><div><dt>Production units</dt><dd>${esc(result.printedParts ?? 0)} printed · ${esc(result.remainingParts ?? job.order.requestedQuantity)} remaining</dd></div></dl>${runBlocked ? '<p class="field-hint mt-16">Resolve the local active or uncertain run before approving, reopening or starting preparation.</p>' : ''}${!fitsRemainder && result.remainingParts > 0 ? `<p class="field-hint mt-16">Prepare a smaller plate for the ${esc(result.remainingParts)} remaining order units before approval.</p>` : ''}${result.reason ? `<p class="field-hint mt-16">${esc(result.reason)}</p>` : ''}${result.binding ? `<details class="mt-16"><summary>Studio qualification binding</summary><p class="field-hint">Use this exact binding after physical calibration. Changing a profile, device or firmware requires another qualification review.</p><pre class="code-box">${esc(JSON.stringify(result.binding, null, 2))}</pre></details>` : ''}${approve ? `<form id="resin-approve-form" data-id="${attr(id)}" data-receipt-id="${attr(result.receiptId)}"><label class="checkbox-field mt-16"><input type="checkbox" name="confirmedWholeModel" required><span>I verified that the whole submitted model represents one requested production unit. Disconnected components and supports do not establish the order quantity.</span></label><p class="field-hint">Approving queues this qualified slice in the order portal. Each physical run still needs its own readiness confirmation.</p></form>` : ''}${start && !result.dispatchEnabled ? '<p class="field-hint mt-16">Enable qualified resin dispatch in Settings after calibration before starting a run.</p>' : ''}${result.portalStatus === 'post_processing' ? '<p class="field-hint mt-16">The requested print units are recorded. Washing, curing and quality inspection remain to be completed.</p>' : ''}`, `<button class="button" data-action="close-modal">Close</button>${approve ? `<button type="submit" form="resin-approve-form" class="button primary">${parts === 1 ? 'Approve one-unit run plan' : `Approve plate of ${parts} units`}</button>` : ''}${start ? `<button class="button primary" data-action="dispatch-resin" data-id="${attr(id)}" data-receipt-id="${attr(result.receiptId)}" data-parts="${parts}" ${result.dispatchEnabled ? '' : 'disabled'}>${parts === 1 ? 'Start one resin unit' : `Start plate of ${parts} units`}</button>` : ''}${result.portalStatus === 'queued' && result.planReviewed && !runBlocked ? `<button class="button" data-action="withdraw-resin-preparation" data-id="${attr(id)}" data-receipt-id="${attr(result.receiptId)}">Reopen preparation</button>` : ''}`);
+  }
+
+  async function resinTargetModal(id) {
+    const result = await api(`/api/jobs/${idPath(id)}/resin/production/target`);
+    openModal('Review current production target', 'The studio defines replacement quantities after quality inspection.', `<dl class="details-grid"><div><dt>Original order</dt><dd>${esc(result.originalRequestedParts)} units</dd></div><div><dt>Current target</dt><dd>${esc(result.target.kind === 'replacement' ? `QC replacement ${result.target.cycle}` : 'Original order')} · ${esc(result.target.requiredParts)} units</dd></div><div><dt>Portal stage</dt><dd>${esc(result.portalStatus)}</dd></div></dl>${result.hasActiveRun ? '<p class="field-hint mt-16">Resolve the active or uncertain local run before changing its preparation.</p>' : result.canAdopt ? `<form id="resin-target-form" data-id="${attr(id)}" data-target-id="${attr(result.target.id)}"><label class="checkbox-field mt-16"><input type="checkbox" name="confirmedTarget" required><span>I reviewed this studio-authorized replacement target. ${result.target.requiredParts > 0 ? 'I will review the model size and resin profile before preparing it.' : 'It authorizes finishing work with no additional printing.'}</span></label><p class="field-hint">Previous runs and printed counts are preserved. Preparation approval and physical readiness must be reviewed again.</p></form>` : '<p class="field-hint mt-16">There is no new replacement target awaiting local preparation.</p>'}`, `<button class="button" data-action="close-modal">Close</button>${result.canAdopt ? `<button type="submit" form="resin-target-form" class="button primary">${result.target.requiredParts > 0 ? 'Prepare replacement target' : 'Record finishing-only target'}</button>` : ''}${result.canWithdraw ? `<button class="button" data-action="withdraw-resin-preparation" data-id="${attr(id)}" data-receipt-id="${attr(result.receiptId)}">Reopen preparation</button>` : ''}`);
+  }
+
+  function reconcileResinModal(job) {
+    const planned = job.runs.find(run => run.id === job.currentRunId)?.plannedParts || 1;
+    openModal('Record this resin run', 'Count physically printed order units. This does not accept quality, washing or curing.', `<form id="resin-reconcile-form" data-id="${attr(job.id)}" data-run-id="${attr(job.currentRunId)}"><div class="form-grid"><div class="field full"><label for="resin-run-outcome">Run outcome</label><select id="resin-run-outcome" name="outcome"><option value="completed">Printer completed this run</option><option value="failed">Run failed</option><option value="cancelled">Run cancelled</option><option value="not_started">Verified no physical start occurred</option></select></div>${field('printedParts', planned === 1 ? 'Printed order units from this run (0 or 1)' : `Printed order units from this run (0 to ${planned})`, 0, { type: 'number', required: true, extra: `min="0" max="${planned}" step="1"`, hint: 'Positive counts require identified completion telemetry and cannot exceed this plate. Zero records an unsuccessful run without quantity credit.' })}${field('notes', 'Operator notes', '', { textarea: true, full: true })}<label class="checkbox-field full"><input type="checkbox" required><span>I checked the stopped printer and verified this run’s result and unit count.</span></label></div></form>`, footerSubmit('resin-reconcile-form', 'Record resin run'));
+  }
+
   function jobModal(id) {
     const job = jobById(id);
     if (!job) return toast('This job is no longer available.', true);
     const printer = printerById(job.printerId);
-    const canPrepare = ['review', 'ready', 'failed', 'cancelled'].includes(job.status);
+    const resin = job.technology === 'resin';
+    const canPrepare = !resin && ['review', 'ready', 'failed', 'cancelled'].includes(job.status);
     const showResolve = job.status === 'needs_attention' && Boolean(job.currentRunId);
     const options = state.printers.map(item => `<option value="${attr(item.id)}" ${item.id === job.printerId ? 'selected' : ''}>${esc(item.name)} · ${esc(typeNames[item.type] || item.type)}</option>`).join('');
     const history = [...(job.history || [])].slice(-8).reverse();
     const notes = job.notes ? `<div class="section-label">PRINT REQUIREMENTS</div><p class="body-copy text-break" style="white-space:pre-wrap">${esc(job.notes)}</p>` : '';
-    openModal('Job details', `Created ${esc(dateTime(job.createdAt))} · ${esc(job.id)}`, `<div class="job-heading"><div class="file-cell"><span class="file-icon">${esc(extension(job.fileName))}</span><div><div class="file-name">${esc(job.name || job.fileName)}</div><div class="file-sub">${esc(job.fileName)}</div></div></div>${badge(job.status)}</div><div class="details-grid"><div><div class="detail-key">Customer / project</div><div class="detail-value">${esc(readable(job.customer))}</div></div><div><div class="detail-key">Arrived from</div><div class="detail-value">${esc(sourceLabel(job.source))}</div></div><div><div class="detail-key">Printer</div><div class="detail-value">${esc(printer?.name || 'Not assigned yet')}</div></div><div><div class="detail-key">Requested copies</div><div class="detail-value">${quantity(job)}</div></div><div><div class="detail-key">Accepted copies</div><div class="detail-value">${accepted(job)} / ${quantity(job)}</div></div><div><div class="detail-key">Remaining copies</div><div class="detail-value">${Math.max(0, quantity(job) - accepted(job))}</div></div></div>${job.error ? `<div class="inline-notice error">${icon('alert')}<span>${esc(typeof job.error === 'string' ? job.error : job.error.message || 'This job needs attention.')}</span></div>` : ''}${notes}
+    openModal('Job details', `Created ${esc(dateTime(job.createdAt))} · ${esc(job.id)}`, `<div class="job-heading"><div class="file-cell"><span class="file-icon">${esc(extension(job.fileName))}</span><div><div class="file-name">${esc(job.name || job.fileName)}</div><div class="file-sub">${esc(job.fileName)}</div></div></div>${badge(job.status)}</div><div class="details-grid"><div><div class="detail-key">Customer / project</div><div class="detail-value">${esc(readable(job.customer))}</div></div><div><div class="detail-key">Arrived from</div><div class="detail-value">${esc(sourceLabel(job.source))}</div></div><div><div class="detail-key">Printer</div><div class="detail-value">${esc(printer?.name || 'Not assigned yet')}</div></div><div><div class="detail-key">${resin ? 'Requested parts' : 'Requested copies'}</div><div class="detail-value">${resin ? job.order?.requestedQuantity : quantity(job)}</div></div><div><div class="detail-key">${resin ? 'Production status' : 'Accepted copies'}</div><div class="detail-value">${resin ? `${esc(job.resinProduction?.printedParts || 0)} / ${esc(job.resinProduction?.requestedParts ?? job.order?.requestedQuantity)} units printed · ${esc(statusNames[job.status] || job.status)}` : `${accepted(job)} / ${quantity(job)}`}</div></div><div><div class="detail-key">${resin ? 'Ticket version' : 'Remaining copies'}</div><div class="detail-value">${resin ? job.order?.portalVersion : Math.max(0, quantity(job) - accepted(job))}</div></div></div>${job.error ? `<div class="inline-notice error">${icon('alert')}<span>${esc(typeof job.error === 'string' ? job.error : job.error.message || 'This job needs attention.')}</span></div>` : ''}${notes}
+      ${resin ? resinJobPanel(job) + resinSyncPanel(job) : ''}
       ${canPrepare ? `<div class="job-action-panel"><h3>${job.artifact ? 'Prepared file' : 'Prepare for a printer'}</h3><p>${job.artifact ? `This job has a prepared artifact${printer ? ` for ${esc(printer.name)}` : ''}. Changing the printer requires preparing it again.` : 'QuickPrint checks or slices this file for the selected printer. Preparation does not start the printer.'}</p>${state.printers.length ? `<form id="prepare-form" data-id="${attr(job.id)}"><div class="field-row"><div class="field"><label for="job-printer">Target printer</label><select id="job-printer" name="printerId" required><option value="">Select a printer</option>${options}</select></div><button type="submit" class="button ${job.status === 'ready' ? '' : 'primary'}">${icon('cube')} ${job.artifact ? 'Prepare again' : 'Prepare file'}</button></div></form>` : '<button class="button compact" data-action="add-printer">Connect a printer first</button>'}${job.status === 'ready' && printer ? `<div class="divider" style="margin:17px 0"></div><div class="button-row"><button class="button primary" data-action="dispatch" data-id="${attr(job.id)}" data-printer-id="${attr(job.printerId)}" ${supports(printer, 'start') && supports(printer, 'upload') ? '' : 'disabled title="This adapter does not support uploading and starting prints"'}>${icon('play')} Start one copy</button><span class="field-hint">You’ll confirm the printer is ready before it starts.</span></div>` : ''}</div>` : ''}
       ${['printing', 'paused'].includes(job.status) ? `<div class="job-action-panel"><h3>Print controls</h3><p>Controls are sent to ${esc(printer?.name || 'the assigned printer')}. Available actions depend on its adapter.</p><div class="button-row"><button class="button" data-action="control-job" data-id="${attr(job.id)}" data-control="${job.status === 'paused' ? 'resume' : 'pause'}" ${supports(printer, job.status === 'paused' ? 'resume' : 'pause') ? '' : 'disabled title="This adapter does not support this action"'}>${icon(job.status === 'paused' ? 'play' : 'pause')}${job.status === 'paused' ? 'Resume' : 'Pause'}</button><button class="button" data-action="control-job" data-id="${attr(job.id)}" data-control="cancel" ${supports(printer, 'cancel') ? '' : 'disabled title="This adapter does not support cancellation"'}>${icon('stop')} Cancel print</button></div></div>` : ''}
-      ${job.status === 'preparing' ? `<div class="job-action-panel"><h3>Preparing your file</h3><p>The slicer is preparing this file for ${esc(printer?.name || 'the selected printer')}. Large models may take several minutes.</p><button class="button compact" data-action="cancel-local" data-id="${attr(job.id)}">${icon('stop')} Cancel preparation</button></div>` : ''}
+      ${job.status === 'preparing' && !resin ? `<div class="job-action-panel"><h3>Preparing your file</h3><p>The slicer is preparing this file for ${esc(printer?.name || 'the selected printer')}. Large models may take several minutes.</p><button class="button compact" data-action="cancel-local" data-id="${attr(job.id)}">${icon('stop')} Cancel preparation</button></div>` : ''}
       ${job.status === 'dispatching' ? `<div class="inline-notice warning">${icon('clock')}<span>The print command is being resolved. Do not start another copy until you verify what the printer actually did.</span></div>` : ''}
       ${showResolve ? `<div class="job-action-panel"><h3>Verify this print run</h3><p>Check the physical printer and part before recording the outcome. If a start was interrupted or ambiguous, confirm whether the printer started. Never mark an active print as not started.</p><button class="button compact" data-action="reconcile" data-id="${attr(job.id)}">${icon('check')} Record run outcome</button></div>` : ''}
       ${job.status === 'completed' ? `<div class="inline-notice no-margin">${icon('check')}<span>All requested copies have been accepted. This job is complete.</span></div>` : ''}
       ${history.length ? `<div class="section-label">JOB HISTORY</div><div class="history">${history.map(item => `<div class="history-item"><p>${esc(item.message || item.note || item.event || statusNames[item.status] || item.status || item.type || 'Job updated')}</p><time>${esc(dateTime(item.at || item.createdAt || item.timestamp))}</time></div>`).join('')}</div>` : ''}`, ` ${['review', 'ready'].includes(job.status) ? `<button class="button" data-action="cancel-local" data-id="${attr(job.id)}">Cancel job</button>` : ''}<button class="button" data-action="refresh-job" data-id="${attr(job.id)}">${icon('refresh')} Refresh status</button><button class="button" data-action="download" data-id="${attr(job.id)}">${icon('download')} Original file</button><button class="button" data-action="close-modal">Close</button>`, true);
+    updateResinHollowState($('#resin-slice-form'));
   }
 
   function confirmModal(title, description, actionLabel, onConfirm, { danger = false, checkbox = '', onCancel = null } = {}) {
@@ -405,6 +636,7 @@
   function reconcileModal(id) {
     const job = jobById(id);
     if (!job) return;
+    if (job.technology === 'resin') return reconcileResinModal(job);
     openModal('Record what actually happened.', 'This resolves one print run. Accepted copies count toward the job’s total.', `<form id="reconcile-form" data-id="${attr(id)}" data-run-id="${attr(job.currentRunId)}"><div class="inline-notice warning">${icon('info')}<span>Verify the printer is stopped and inspect the part. This records the outcome; it does not send a stop command.</span></div><div class="form-grid"><div class="field full"><label for="run-outcome">Run outcome</label><select id="run-outcome" name="outcome"><option value="completed">Print finished — record accepted part</option><option value="failed">Print failed — no accepted part</option><option value="not_started">Confirmed the print never started</option><option value="cancelled">Print was cancelled</option></select></div>${field('acceptedQuantity', 'Accepted from this run (0 or 1)', 1, { type: 'number', extra: 'min="0" max="1" step="1"', required: true, hint: `Already accepted: ${accepted(job)} of ${quantity(job)} requested copies.` })}${field('notes', 'Operator notes', '', { textarea: true, full: true, placeholder: 'Part quality, cause of failure, or how you verified the printer state.' })}<label class="checkbox-field full" style="grid-column:1/-1"><input type="checkbox" required><span>I checked the printer and verified this outcome.</span></label></div></form>`, footerSubmit('reconcile-form', 'Record outcome'));
   }
 
@@ -433,7 +665,7 @@
         const config = { name: value('name'), type: value('type'), host: value('host'), model: value('model') };
         if (id) config.id = id;
         if (value('port')) config.port = number('port');
-        ['apiKey', 'password', 'serial', 'accessCode', 'caCertificate', 'tlsFingerprint'].forEach(key => { if (value(key)) config[key] = value(key); });
+        ['apiKey', 'password', 'serial', 'accessCode', 'mainboardId', 'brandId', 'caCertificate', 'tlsFingerprint'].forEach(key => { if (value(key)) config[key] = value(key); });
         config.slicer = data.has('customSlicer') ? {
           kind: value('printerSlicerKind'), executable: value('printerSlicerExecutable'),
           profilePaths: value('printerProfilePaths').split(/\r?\n/).map(line => line.trim()).filter(Boolean),
@@ -441,6 +673,17 @@
         } : null;
         await api('/api/printers', { method: 'POST', body: config });
         modalBusy = false; closeModal(); toast(id ? 'Printer settings saved.' : 'Printer added. Test the connection before preparing a job.'); await refresh();
+      } else if (form.id === 'layr-production-form') {
+        const config = { type: 'layr', apiMode: 'production', name: 'PrintByLayr production', portalUrl: value('portalUrl'), enabled: true, autoSyncPreparation: data.has('autoSyncPreparation'), pollIntervalMs: 60000 };
+        if (id) config.id = id;
+        if (value('token')) config.token = value('token');
+        await api('/api/connectors', { method: 'POST', body: config });
+        modalBusy = false; closeModal(); await refresh(); toast('Production input saved. Check its connection status below.');
+      } else if (form.id === 'layr-form') {
+        const result = await api('/api/integrations/layr/connect', { method: 'POST', body: { portalUrl: value('portalUrl'), ...(id ? { id } : {}) } });
+        if (window.quickprint?.openLayrAuthorization) await window.quickprint.openLayrAuthorization(result.authorizationUrl);
+        else window.open(result.authorizationUrl, '_blank', 'noopener,noreferrer');
+        modalBusy = false; closeModal(); toast('Complete sign-in in your browser, then return to QuickPrint.');
       } else if (form.id === 'connector-form') {
         const type = form.dataset.type;
         const config = { type, name: value('name'), enabled: data.has('enabled'), defaults: { quantity: number('quantity') || 1, customer: value('customer'), notes: value('notes') } };
@@ -453,12 +696,45 @@
         await api('/api/connectors', { method: 'POST', body: config });
         modalBusy = false; closeModal(); toast('Input connection saved.'); await refresh();
       } else if (form.id === 'settings-form') {
+        const slots = $$('.resin-profile-slot', form).map(row => ({ id: row.dataset.slotId, name: $('input[name^="slot-name-"]', row).value, profilePath: $('input[name^="slot-path-"]', row).value }));
         const lines = key => value(key).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
-        await api('/api/settings', { method: 'PUT', body: { siteName: value('siteName'), pollIntervalMs: number('pollSeconds') * 1000, slicer: { kind: value('slicerKind'), executable: value('slicerExecutable'), profilePaths: lines('profilePaths'), extraArgs: lines('extraArgs') } } });
+        await api('/api/settings', { method: 'PUT', body: { siteName: value('siteName'), pollIntervalMs: number('pollSeconds') * 1000, slicer: { kind: value('slicerKind'), executable: value('slicerExecutable'), profilePaths: lines('profilePaths'), extraArgs: lines('extraArgs') }, resinEngine: { prusaExecutable: value('resinPrusaExecutable'), uvtoolsExecutable: value('resinUvtoolsExecutable'), freecadExecutable: value('resinFreecadExecutable'), cadAuditPath: value('resinCadAuditPath'), cadLinearDeflectionMm: number('resinCadLinearDeflectionMm'), cadAngularDeflectionRad: number('resinCadAngularDeflectionRad'), profilePath: value('resinProfilePath'), slots, dispatchEnabled: data.has('resinDispatchEnabled'), timeoutMs: number('resinTimeoutSeconds') * 1000 } } });
         settingsDirty = false; lastPage = null; await refresh(); toast('Workspace settings saved.');
+      } else if (form.id === 'resin-profile-form') {
+        const orientationCandidates = value('resinOrientations').trim().split(/\r?\n/).map(line => {
+          const values = line.split(',').map(part => part.trim());
+          if (values.length !== 3 || values.some(part => !part || !Number.isFinite(Number(part)))) throw new Error('Enter each orientation as three numbers separated by commas.');
+          return { x: Number(values[0]), y: Number(values[1]), z: Number(values[2]) };
+        });
+        const uvtoolsProperties = Object.fromEntries(resinPropertyFields.filter(([key]) => value(`resinProperty-${key}`) !== '').map(([key]) => [key, number(`resinProperty-${key}`)]));
+        await api(`/api/resin/profiles/${idPath(id)}`, { method: 'PUT', body: { expectedProfileSha256: form.dataset.profileSha256, ...(value('resinPrinterId') ? { printerId: value('resinPrinterId') } : {}), material: value('resinMaterial'), layerHeightMm: number('resinLayerHeight'), uvtoolsProperties, supportsEnabled: data.has('resinSupports'), padEnabled: data.has('resinPad'), orientationCandidates } });
+        modalBusy = false; closeModal(); settingsDirty = false; lastPage = null; await refresh(); toast('Custom resin profile saved to this slot.');
+      } else if (form.id === 'resin-target-form') {
+        await api(`/api/jobs/${idPath(id)}/resin/production/target`, { method: 'POST', body: { confirmedTarget: form.elements.confirmedTarget.checked, targetId: form.dataset.targetId } });
+        await refresh(); jobModal(id); toast('Replacement target reviewed. Prepare its model and profile before approval.');
+      } else if (form.id === 'resin-approve-form') {
+        const result = await api(`/api/jobs/${idPath(id)}/resin/production/approve`, { method: 'POST', body: { receiptId: form.dataset.receiptId, confirmedWholeModel: data.has('confirmedWholeModel') } });
+        await refresh(); await resinProductionModal(id); toast(result.state === 'confirmed' ? 'Qualified preparation plan approved in the portal.' : `Preparation approval is ${result.state}; review its evidence status.`, result.state !== 'confirmed');
+      } else if (form.id === 'resin-withdraw-form') {
+        const result = await api(`/api/jobs/${idPath(id)}/resin/production/withdraw`, { method: 'POST', body: { receiptId: form.dataset.receiptId, reason: value('reason') } });
+        await refresh(); jobModal(id); toast(result.state === 'confirmed' ? 'Queued preparation withdrawn. Review and slice the revised model or profile.' : `Preparation withdrawal is ${result.state}. Its hold stays in place until the portal confirms.`, result.state !== 'confirmed');
+      } else if (form.id === 'resin-reconcile-form') {
+        const result = await api(`/api/jobs/${idPath(id)}/resin/production/reconcile`, { method: 'POST', body: { runId: form.dataset.runId, outcome: value('outcome'), printedParts: number('printedParts'), notes: value('notes') } });
+        await refresh(); jobModal(id); toast(result.syncError || 'Resin production result recorded; quality acceptance remains pending.', Boolean(result.syncError));
+      } else if (form.id === 'dismiss-layr-evidence-form') {
+        await api(`/api/integrations/layr/outbox/${idPath(id)}/dismiss`, { method: 'POST', body: { reason: value('reason') } });
+        await refresh(); jobModal(form.dataset.jobId); toast('Held evidence dismissed locally. Its history is preserved.');
       } else if (form.id === 'integration-form') {
         await api('/api/settings', { method: 'PUT', body: { intake: { enabled: data.has('enabled'), port: number('port') } } });
         await refresh(); toast('Intake settings saved.'); await integrationModal();
+      } else if (form.id === 'resin-slice-form') {
+        const hollowEntry = hollowReviewEntry(jobById(id)), hollowEnabled = data.has('resinHollowEnabled');
+        if (hollowEnabled && (!hollowEntry.enabled || hollowEntry.validated?.key !== resinHollowKey(form) || !data.has('confirmedHollowPreparation'))) throw new Error('Validate and explicitly confirm the hollow recipe for the current size and resin profile before slicing.');
+        const button = $('button[type="submit"]', form);
+        if (button) button.innerHTML = '<span class="spinner"></span> Slicing resin…';
+        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'button'; cancel.dataset.action = 'cancel-local'; cancel.dataset.id = id; cancel.dataset.preparingCancel = 'true'; cancel.textContent = 'Cancel resin preparation'; $('[data-resin-submit-row]', form).append(cancel);
+        const result = await api(`/api/jobs/${idPath(id)}/resin/slice`, { method: 'POST', body: { ...(hollowEnabled ? { hollow: hollowEntry.validated.hollow, confirmedHollowPreparation: data.has('confirmedHollowPreparation') } : {}), ...(number('resinPlateCopies') > 1 ? { plate: { copies: number('resinPlateCopies'), gapMm: number('resinPlateGapMm'), marginMm: number('resinPlateMarginMm') } } : {}), ...((jobById(id).resinRepair || /\.(step|stp)$/i.test(jobById(id).fileName)) ? { expectedGeometrySha256: form.dataset.geometrySha } : {}), confirmedRequirements: data.has('confirmedRequirements'), confirmedOriginalSize: data.has('confirmedOriginalSize'), confirmedSizing: data.has('confirmedSizing'), sizing: resinSizingRequest(form), ...(value('profileSlotId') ? { profileSlotId: value('profileSlotId') } : {}) } });
+        await refresh(); jobModal(id); toast(result.resinSlice?.analysis?.passed ? 'Resin slice captured for qualification.' : 'Resin slice has print issues that need review.', !result.resinSlice?.analysis?.passed);
       } else if (form.id === 'prepare-form') {
         const button = $('button[type="submit"]', form);
         if (button) button.innerHTML = '<span class="spinner"></span> Preparing…';
@@ -472,11 +748,12 @@
         await refresh(); jobModal(id); toast('Run outcome recorded.');
       }
     } catch (error) {
-      if (form.id === 'prepare-form' && error.code === 'PREPARATION_CANCELLED') { await refresh(); jobModal(id); return; }
+      if (['prepare-form', 'resin-slice-form'].includes(form.id) && error.code === 'PREPARATION_CANCELLED') { await refresh(); jobModal(id); return; }
       if (form.id === 'settings-form') { $('#settings-error').textContent = error.message; $('#settings-error').scrollIntoView({ block: 'nearest' }); }
       else modalError(error);
       if (form.id === 'prepare-form') { const button = $('button[type="submit"]', form); if (button) button.innerHTML = `${icon('cube')} Prepare file`; await refresh({ silent: true }); }
-    } finally { $('[data-preparing-cancel]', form)?.remove(); setBusy(false, form); }
+      if (form.id === 'resin-slice-form') { const button = $('button[type="submit"]', form); if (button) button.innerHTML = `${icon('cube')} Slice resin model`; await refresh({ silent: true }); }
+    } finally { $('[data-preparing-cancel]', form)?.remove(); setBusy(false, form); if (form.id === 'resin-slice-form') updateResinHollowState(form); }
   }
 
   async function browse(kind, targetId) {
@@ -521,6 +798,15 @@
       if (action === 'add-printer') return printerModal();
       if (action === 'edit-printer') return printerModal(id);
       if (action === 'job') return jobModal(id);
+      if (action === 'validate-resin-hollow') return await validateResinHollow(button.closest('form'));
+      if (action === 'download-resin-geometry-source') {
+        if (modalBusy) return;
+        button.disabled = true;
+        const response = await fetch(`/api/jobs/${idPath(id)}/resin/geometry/source`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ sizing: resinSizingRequest(button.closest('form')) }) });
+        if (!response.ok) { let message = 'The sized source could not be downloaded.'; try { const error = await response.json(); message = error.message || error.error || message; } catch {} throw new Error(message); }
+        const href = URL.createObjectURL(await response.blob()), link = document.createElement('a');
+        link.href = href; link.download = 'reviewed-sized-source.stl'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); return;
+      }
       if (action === 'refresh-job') { const job = jobById(id); button.disabled = true; if (job?.printerId) await api(`/api/printers/${idPath(job.printerId)}/test`, { method: 'POST' }); await refresh(); return jobModal(id); }
       if (action === 'go-inputs') { location.hash = '#inputs'; return; }
       if (action === 'filter') { jobFilter = button.dataset.filter; renderPage(); return; }
@@ -538,6 +824,67 @@
       }
       if (action === 'add-folder') return connectorModal('folder');
       if (action === 'add-email') return connectorModal('email');
+      if (action === 'add-layr') return layrModal();
+      if (action === 'add-layr-production') return layrProductionModal(id);
+      if (action === 'sync-resin-slice') {
+        button.disabled = true;
+        const entry = await api(`/api/jobs/${idPath(id)}/resin/sync`, { method: 'POST', body: {} });
+        await refresh(); jobModal(id); toast(entry.state === 'confirmed' ? 'Preparation evidence is already confirmed by the portal.' : entry.state === 'pending' ? 'Preparation evidence queued for the portal.' : `Preparation evidence is ${entry.state}. Review its portal status.`, !['confirmed', 'pending'].includes(entry.state)); return;
+      }
+      if (action === 'review-resin-production') return resinProductionModal(id);
+      if (action === 'review-resin-target') return resinTargetModal(id);
+      if (action === 'setup-cad-runtime') {
+        button.disabled = true; button.textContent = 'Setting up CAD transfer audit…';
+        try {
+          const result = await api('/api/resin/cad/runtime', { method: 'POST', body: {} });
+          await refresh(); const input = $('[name="resinCadAuditPath"]'); if (input) input.value = result.cadAuditPath;
+          toast('CAD transfer audit ready. Save any other settings before preparing STEP geometry.');
+        } finally { const current = $('[data-action="setup-cad-runtime"]'); if (current) { current.disabled = false; current.textContent = 'Set up CAD transfer audit'; } }
+        return;
+      }
+      if (action === 'prepare-resin-cad') {
+        const job = jobById(id), confirmation = $('[name="confirmedEmbeddedUnits"]');
+        if (!job.resinCad && (!confirmation || !confirmation.reportValidity())) return;
+        button.disabled = true;
+        await api(`/api/jobs/${idPath(id)}/resin/cad`, { method: 'POST', body: { confirmedEmbeddedUnits: true } });
+        const geometry = await api(`/api/jobs/${idPath(id)}/resin/geometry`);
+        resinGeometryCache.set(id, geometry); await refresh(); jobModal(id); toast('STEP geometry verified. Review its measured size and resin profile before slicing.'); return;
+      }
+      if (action === 'review-resin-repair') {
+        const job = jobById(id);
+        return confirmModal('Repair exact mesh issues?', `QuickPrint first converts the ticket’s ${job.order.units} units to millimetres and sets a common origin. It then removes coordinate-identical duplicate triangles and corrects face winding. That repair preserves normalized vertex coordinates and model bounds. It does not fill holes, weld nearby vertices, or resolve intersecting shells and cavities. Review the captured edits and remeasure before sizing or slicing.`, 'Repair exact mesh issues', async () => {
+          resinGeometryCache.delete(id);
+          try { await api(`/api/jobs/${idPath(id)}/resin/repair`, { method: 'POST', body: { confirmedExactRepair: true } }); }
+          catch (error) { await refresh({ silent: true }); throw error; }
+          await refresh(); jobModal(id); toast('Exact mesh repair captured. Measure and review its size before slicing.');
+        }, { checkbox: 'I reviewed the exact repair limits and will review the repaired geometry before slicing.', onCancel: () => jobModal(id) });
+      }
+      if (action === 'measure-resin-geometry') {
+        button.disabled = true;
+        const geometry = await api(`/api/jobs/${idPath(id)}/resin/geometry`);
+        resinGeometryCache.set(id, geometry);
+        if (jobById(id).resinRepair) { jobModal(id); return; }
+        $('#resin-sizing-fields').outerHTML = resinSizingFields(jobById(id));
+        $('#resin-slice-form').dataset.geometrySha = geometry.geometrySha256 || '';
+        updateResinSizing($('#resin-slice-form'));
+        updateResinHollowState($('#resin-slice-form'), { invalidate: true });
+        return;
+      }
+      if (action === 'withdraw-resin-preparation') return openModal('Reopen resin preparation', 'Withdraw this queued preparation so the model or profile can be revised. Printed counts and run history are preserved.', `<form id="resin-withdraw-form" data-id="${attr(id)}" data-receipt-id="${attr(button.dataset.receiptId)}">${field('reason', 'Reason for reopening preparation', '', { textarea: true, required: true, full: true, extra: 'maxlength="2000"' })}<p class="field-hint">The portal must confirm withdrawal before this file can be replaced. This sends no printer command and does not cancel the paid order.</p></form>`, footerSubmit('resin-withdraw-form', 'Withdraw preparation'));
+      if (action === 'dispatch-resin') {
+        const parts = Number(button.dataset.parts) || 1, receiptId = button.dataset.receiptId;
+        const label = parts === 1 ? 'Start one resin unit' : `Start plate of ${parts} units`;
+        return confirmModal(`${label}?`, `QuickPrint will recheck the portal qualification, exact printer and this approved ${parts}-unit plate, upload its bound file and request one physical start.`, label, async () => {
+          const result = await api(`/api/jobs/${idPath(id)}/resin/production/dispatch`, { method: 'POST', body: { confirmedReady: true, receiptId, plannedParts: parts } });
+          await refresh(); jobModal(id); toast(result.syncError || `Start acknowledged for ${parts} order unit(s); remaining units need another confirmed run.`, Boolean(result.syncError));
+        }, { checkbox: parts === 1 ? 'The correct resin is loaded, the build plate is clear and the machine is ready for this one-unit run.' : `The correct resin is loaded, the build plate is clear and the machine is ready for this plate of ${parts} order units.` });
+      }
+      if (action === 'dismiss-layr-evidence') return openModal('Dismiss held evidence', 'Record why this rejected or unsent operation should no longer block this order.', `<form id="dismiss-layr-evidence-form" data-id="${attr(id)}" data-job-id="${attr(button.dataset.jobId)}">${field('reason', 'Reason for dismissing this evidence', '', { textarea: true, required: true, full: true, extra: 'maxlength="500"' })}<p class="field-hint">This changes the local evidence queue and preserves its history. No portal status or printer command is sent. Uncertain writes must be reconciled before they can be dismissed.</p></form>`, footerSubmit('dismiss-layr-evidence-form', 'Dismiss evidence'));
+      if (action === 'resin-preprocess') {
+        button.disabled = true;
+        await api(`/api/jobs/${idPath(id)}/resin/preprocess`, { method: 'POST', body: { evaluate: true } });
+        await refresh(); jobModal(id); toast('SatelLite preprocessing finished.'); return;
+      }
       if (action === 'edit-connector') return connectorModal(null, id);
       if (action === 'remove-connector') return confirmModal('Remove this connection?', 'Future files will no longer be imported from this input. Jobs already in your queue will be kept.', 'Remove connection', async () => { await api(`/api/connectors/${idPath(id)}`, { method: 'DELETE' }); modalBusy = false; closeModal(); await refresh(); toast('Input connection removed.'); }, { danger: true });
       if (action === 'poll-connector') { button.disabled = true; await api(`/api/connectors/${idPath(id)}/poll`, { method: 'POST' }); await refresh(); toast('Input checked for new files.'); return; }
@@ -562,7 +909,27 @@
         else toast('Use the Windows desktop app to open its data folder. Browser mode uses the server’s configured data directory.');
         return;
       }
+      if (action === 'add-resin-slot') {
+        const rows = $('#resin-profile-slots');
+        if (rows.children.length >= 32) throw new Error('Configure at most 32 resin slots.');
+        rows.insertAdjacentHTML('beforeend', resinProfileSlot({ id: crypto.randomUUID(), name: '', profilePath: '' }));
+        settingsDirty = true; $('input', rows.lastElementChild).focus(); return;
+      }
+      if (action === 'customize-resin-slot') return resinProfileModal(id);
+      if (action === 'remove-resin-slot') { button.closest('.resin-profile-slot').remove(); settingsDirty = true; return; }
       if (action === 'reset-settings') { settingsDirty = false; renderPage(); toast('Unsaved settings discarded.'); return; }
+      if (action === 'download-resin-slice') {
+        button.disabled = true;
+        const response = await fetch(`/api/jobs/${idPath(id)}/resin/slice/download`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!response.ok) { let message = 'The captured resin file could not be downloaded.'; try { message = (await response.json()).message || message; } catch {} throw new Error(message); }
+        const href = URL.createObjectURL(await response.blob()); const link = document.createElement('a'); link.href = href; link.download = 'prepared-unqualified.goo'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); return;
+      }
+      if (action === 'download-resin-repair') {
+        button.disabled = true;
+        const response = await fetch(`/api/jobs/${idPath(id)}/resin/repair/download`, { headers: { Authorization: `Bearer ${token}` } });
+        if (!response.ok) { let message = 'The repaired model could not be downloaded.'; try { message = (await response.json()).message || message; } catch {} throw new Error(message); }
+        const href = URL.createObjectURL(await response.blob()); const link = document.createElement('a'); link.href = href; link.download = 'repaired-unqualified.stl'; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(href), 60000); return;
+      }
       if (action === 'download') return await downloadOriginal(id);
       if (action === 'export-backup') { button.disabled = true; await exportBackup(); toast('Workspace backup downloaded.'); return; }
       if (action === 'dispatch') {
@@ -582,7 +949,7 @@
       }
       if (action === 'reconcile') return reconcileModal(id);
     } catch (error) { if ($('#modal-root').hasChildNodes()) modalError(error); else toast(error.message, true); }
-    finally { if (button.isConnected) button.disabled = false; }
+    finally { if (button.isConnected) button.disabled = false; if (['validate-resin-hollow', 'download-resin-geometry-source'].includes(action)) updateResinHollowState(button.closest('form')); }
   }
 
   function toast(message, error = false) {
@@ -597,8 +964,22 @@
   document.addEventListener('input', event => {
     if (event.target.id === 'job-search') { jobSearch = event.target.value; renderPage(); }
     if (event.target.closest('#settings-form')) settingsDirty = true;
+    if (['resinScaleFactor', 'resinDimensionMm'].includes(event.target.name)) updateResinSizing($('#resin-slice-form'), { clearConfirmation: true });
+    if (['resinPlateCopies', 'resinPlateGapMm', 'resinPlateMarginMm'].includes(event.target.name)) {
+      const form = $('#resin-slice-form'), spacing = $('#resin-plate-spacing');
+      const enabled = Number($('[name="resinPlateCopies"]', form)?.value) > 1;
+      spacing.hidden = !enabled; $$('input', spacing).forEach(input => { input.disabled = !enabled; input.required = enabled; });
+      $('[name="confirmedRequirements"]', form).checked = false;
+    }
   });
   document.addEventListener('change', event => {
+    if (event.target.id === 'resin-hollow-file') { importResinHollowFile(event.target).catch(modalError); }
+    if (event.target.name === 'resinHollowEnabled') {
+      const form = event.target.closest('form'), entry = hollowReviewEntry(jobById(form.dataset.id));
+      entry.enabled = event.target.checked; entry.error = ''; updateResinHollowState(form, { invalidate: true });
+    }
+    if (event.target.name === 'profileSlotId') updateResinHollowState(event.target.closest('form'), { invalidate: true });
+    if (['resinSizingMode', 'resinDimensionAxis'].includes(event.target.name)) updateResinSizing($('#resin-slice-form'), { modeChanged: event.target.name === 'resinSizingMode', clearConfirmation: true });
     if (event.target.id === 'upload-files') { uploadFiles = [...event.target.files]; renderSelectedFiles(); }
     if (event.target.id === 'printer-type') { $('#printer-auth').innerHTML = printerAuth(event.target.value, printerById($('#printer-form').dataset.id) || {}); $('#printer-hint').innerHTML = printerHint(event.target.value); $('#printer-model-field').innerHTML = printerModel(event.target.value, printerById($('#printer-form').dataset.id)?.model || ''); }
     if (event.target.id === 'slicer-kind') { $('#profile-hint').textContent = profileHint(event.target.value); settingsDirty = true; }

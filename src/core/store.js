@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
-const SECRET_FIELDS = new Set(['password', 'apiKey', 'accessCode', 'token']);
+const SECRET_FIELDS = new Set(['password', 'apiKey', 'accessCode', 'token', 'refreshToken']);
 
 function clone(value) {
   return structuredClone(value);

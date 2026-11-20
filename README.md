@@ -31,9 +31,85 @@ See [installation and operation](docs/INSTALLATION.md), [input integrations](doc
 
 Printer support depends on the available protocol and firmware. A printer being reachable on the LAN is not enough. The [connection requirements](docs/INSTALLATION.md#printer-connections) describe model, API, certificate and file-format restrictions. Protocol fixtures and application tests do not establish physical qualification of every listed printer or firmware.
 
-Quantities count repetitions of a file. If a prepared plate contains six parts and quantity is three, QuickPrint tracks three runs of that plate. It does not count or individually inspect the six parts. Each run needs a separate confirmed start; this version does not automatically run the remaining quantity.
+Generic job quantities count repetitions of a file. If a prepared plate contains six parts and quantity is three, QuickPrint tracks three runs of that plate. The separate qualified resin order flow binds an independently verified source-instance count to each plate and records printed order units after operator reconciliation. Each physical run needs a separate confirmed start; QuickPrint does not automatically start the remaining quantity.
 
 QuickPrint preserves PS AM Print's separation of intake, preparation, dispatch and production reconciliation. It implements these stages in a self-contained Node service. This is not a complete copy of PS AM's factory-specific deployment, automation or manufacturing policies. [Architecture and reuse](docs/ARCHITECTURE.md) describes the boundary and source provenance.
+
+## Resin automation work in this branch
+
+QuickPrint imports paid preparation tickets through the scoped, paginated
+PrintByLayr production API and preserves approved requirements, model hashes and
+requested part counts. A durable outbox records validated slice receipts with
+stable operation IDs and expected versions, supports automatic synchronization,
+and retains conflicts for review. The legacy OAuth/MCP read connection remains
+available with its newest-100-jobs limit.
+
+The callable **PrusaSlicer SLA -> SL1 -> UVtools GOO** pipeline evaluates explicit
+orientation candidates, validates every GOO layer and target parameter, and runs
+six print-issue checks. Up to 32 named profile slots support separate resin settings;
+customization saves validated profile/preset copies while preserving originals.
+STL/triangulated OBJ measurement supports explicit uniform factors or one
+source-axis target dimension, preserving original bytes and hashing the
+normalized input. STEP/STP can first pass independent native transfer auditing,
+per-solid FreeCAD tessellation and closed-mesh/CAD measurement checks. Embedded
+CAD units convert to millimetres once; originals and conversion evidence stay bound.
+Real local file preparation succeeded with PrusaSlicer 2.9.7 and UVtools 7.1.2.
+SatelLite's evaluation/repair/hollowing CLI remains an experimental output probe.
+Slicing now requires an independently audited closed, consistently wound source
+mesh before native processing. The optional [exact repair workflow](docs/RESIN-MESH-REPAIR.md)
+accounts for every source face, preserves the frozen original and binds the
+reviewed derivative through sizing, slicing and production evidence.
+The separate [hollow/drain request builder](docs/RESIN-HOLLOWING.md) binds explicit
+cylinders and native settings to the reviewed sized model and generates a
+deterministic headless 3MF request. A [bounded streaming reference audit](docs/RESIN-HOLLOW-AUDIT.md)
+now checks source-derived cavities, individual drain paths and complete supported
+output with exact native sampling elevation. A separate
+[Windows runner](docs/RESIN-NATIVE-RUNNER.md) bounds native process/tree committed
+memory. The [controlled hollow workflow](docs/RESIN-HOLLOW-WORKFLOW.md) connects
+explicit recipe review, guarded native preparation, body/final verification and
+optional hollow plates to the order manager and portal receipts. Physical
+qualification and live portal activation remain pending.
+
+Explicit multi-copy resin plates reserve the native single-copy support/pad
+footprint and replicate that reference's exact grayscale layer images on the
+printer pixel grid. Independent verification rebuilds the complete final GOO
+byte for byte, preserves its physical layer schedule and checks all six print
+issues on that actual derived file. The requested count is an upper bound;
+the captured result reports the number that actually fits. Old packed receipts
+must be prepared again with the current method. These file checks do not
+qualify physical output.
+Real local checks produced a supported three-copy plate and a 20-copy
+synthetic plate with supports/pad explicitly disabled, both with zero reported
+issues. The owned STEP cylinder also passed the CAD-to-20-copy service flow and
+proof revalidation after reload. No physical print was performed in those checks.
+
+Captured resin slices stay unqualified and cannot enter generic printer dispatch.
+The separate qualified resin flow requires current studio/device/profile
+authorization, local dispatch opt-in (off by default), and a new readiness
+confirmation for each approved plate run. Identified terminal telemetry and operator
+printed counts update the portal's remaining quantity without granting QC credit.
+When the remaining quantity is smaller than the approved plate, preparation
+reopens for a smaller plate, fresh receipt and approval; for example, 20 units
+can use confirmed runs of 6 + 6 + 6 + 2.
+Queued preparation can be withdrawn for revision without resetting counts.
+Studio QC can authorize a bounded replacement target with separate current and
+lifetime production totals; it cannot turn printed counts into QC acceptance.
+The actual Saturn 4 Ultra 16K SDCP adapter was verified for read-only status and
+attributes; uploads, starts and physical output remain unqualified. Production
+still requires the portal update/token, resolved sizing/support instructions,
+printer/resin/profile calibration, post-processing and QC. The portal changes
+are in [private draft PR #15](https://github.com/3dprintingworldinc-lang/printbylayr/pull/15)
+and have not been deployed.
+
+See [resin integration and remaining work](docs/RESIN-AUTOMATION.md), the
+[qualified production steps](docs/RESIN-PRODUCTION.md),
+[headless engine guide](docs/HEADLESS-RESIN-ENGINE.md),
+[verified multi-copy plates](docs/RESIN-PLATES.md),
+[controlled hollow preparation](docs/RESIN-HOLLOW-WORKFLOW.md),
+[model sizing](docs/RESIN-SIZING.md),
+[STEP geometry preparation](docs/RESIN-CAD.md),
+[SatelLite deconstruction](docs/SATELLITE-DECONSTRUCTION.md), and
+[SDCP integration](docs/SDCP-INTEGRATION.md).
 
 ## Develop and build
 

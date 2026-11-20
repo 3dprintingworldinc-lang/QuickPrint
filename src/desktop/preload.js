@@ -7,5 +7,6 @@ contextBridge.exposeInMainWorld('quickprint', Object.freeze({
   selectFolder: () => ipcRenderer.invoke('quickprint:select-folder'),
   selectFile: (options) => ipcRenderer.invoke('quickprint:select-file', options),
   openDataFolder: () => ipcRenderer.invoke('quickprint:open-data-folder'),
+  openLayrAuthorization: url => ipcRenderer.invoke('quickprint:open-layr-authorization', url),
   version: () => ipcRenderer.invoke('quickprint:version'),
 }));

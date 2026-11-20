@@ -10,6 +10,43 @@ const FILE_EXTENSIONS = new Set(['.stl', '.step', '.stp', '.obj', '.3mf', '.gcod
 const MAX_FILE_BYTES = 100 * 1024 * 1024;
 const ACTIVE = new Set(['dispatching', 'printing', 'paused']);
 const OUTCOMES = new Set(['completed', 'failed', 'cancelled', 'not_started']);
+const RESIN_ANALYSIS_CHECKS = ['--islands', '--resin-traps', '--suction-cups', '--touching-bounds', '--print-height', '--empty-layers'];
+const SHA256 = /^[a-f0-9]{64}$/;
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i;
+const fresh = (timestamp, maximum = 30000) => typeof timestamp === 'string' && Number.isFinite(Date.parse(timestamp)) && Date.now() - Date.parse(timestamp) <= maximum && Date.parse(timestamp) - Date.now() <= 5000;
+
+function resinTarget(job, ticket) {
+  const source = ticket?.production?.target;
+  const original = job.order.requestedQuantity;
+  if (source === undefined) return { id: job.order.portalJobId, kind: 'order', cycle: 0, requiredParts: original, authorizedAt: job.createdAt, qcOperationId: null };
+  if (!source || Object.keys(source).some(key => !['id', 'kind', 'cycle', 'requiredParts', 'authorizedAt', 'qcOperationId'].includes(key)) || !UUID.test(source.id || '') || !['order', 'replacement'].includes(source.kind) || !Number.isSafeInteger(source.cycle) || source.cycle < 0 ||
+      !Number.isSafeInteger(source.requiredParts) || source.requiredParts < 0 || source.requiredParts > original || !Number.isFinite(Date.parse(source.authorizedAt)) ||
+      (source.kind === 'order' && (source.id !== job.order.portalJobId || source.cycle !== 0 || source.requiredParts !== original || source.qcOperationId !== null)) ||
+      (source.kind === 'replacement' && (source.cycle < 1 || source.qcOperationId !== source.id))) throw error(409, 'The portal production target is invalid or exceeds the approved order.', 'RESIN_TARGET_INVALID');
+  return clone(source);
+}
+const targetFields = target => ({ targetId: target.id, targetKind: target.kind, targetCycle: target.cycle, targetParts: target.requiredParts });
+const sameTarget = (left, right) => ['id', 'kind', 'cycle', 'requiredParts', 'qcOperationId'].every(key => left[key] === right[key]) && Date.parse(left.authorizedAt) === Date.parse(right.authorizedAt);
+
+function resinImportSnapshot(order) {
+  const snapshot = order.productionSnapshot;
+  if (snapshot === undefined) return null;
+  const exact = (value, keys) => value && typeof value === 'object' && !Array.isArray(value) && [Object.prototype,null].includes(Object.getPrototypeOf(value)) && Reflect.ownKeys(value).length === keys.length && Reflect.ownKeys(value).every(key => keys.includes(key));
+  const target = snapshot?.target, progress = snapshot?.progress;
+  const authorized = typeof target?.authorizedAt === 'string' ? Date.parse(target.authorizedAt) : NaN;
+  if (!exact(snapshot,['portalJobId','portalVersion','ticketFingerprint','target','progress']) || snapshot.portalJobId !== order.portalJobId || snapshot.portalVersion !== order.portalVersion || snapshot.ticketFingerprint !== order.ticketFingerprint ||
+      !exact(target,['id','kind','cycle','requiredParts','authorizedAt','qcOperationId']) || !UUID.test(target.id || '') || target.id !== order.portalJobId || target.kind !== 'order' || target.cycle !== 0 || target.requiredParts !== order.requestedQuantity || target.qcOperationId !== null ||
+      typeof target.authorizedAt !== 'string' || target.authorizedAt.length > 40 || !Number.isFinite(authorized) || new Date(authorized).toISOString() !== target.authorizedAt ||
+      !exact(progress,['requestedParts','printedParts','remainingParts','completedRuns','failedRuns']) || progress.requestedParts !== order.requestedQuantity || !Number.isSafeInteger(progress.printedParts) || progress.printedParts < 0 || progress.printedParts > order.requestedQuantity || progress.remainingParts !== order.requestedQuantity - progress.printedParts ||
+      !Number.isSafeInteger(progress.completedRuns) || progress.completedRuns < 0 || !Number.isSafeInteger(progress.failedRuns) || progress.failedRuns < 0) throw error(400, 'The imported original-target production snapshot must match its ticket identity, version and quantities.', 'INVALID_PRODUCTION_SNAPSHOT');
+  return clone(snapshot);
+}
+
+function resinPlateRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) || Reflect.ownKeys(value).length !== 3 || Reflect.ownKeys(value).some(key => !['copies','gapMm','marginMm'].includes(key)) ||
+      !Number.isSafeInteger(value.copies) || value.copies < 1 || value.copies > 500 || typeof value.gapMm !== 'number' || !Number.isFinite(value.gapMm) || value.gapMm < 0 || value.gapMm > 10000 || typeof value.marginMm !== 'number' || !Number.isFinite(value.marginMm) || value.marginMm < 1 || value.marginMm > 10000) throw error(400, 'A plate needs 1–500 whole-source copies, a nonnegative gap and at least 1 mm bed margin.', 'RESIN_PLATE_REQUEST_INVALID');
+  return { copies: value.copies, gapMm: value.gapMm, marginMm: value.marginMm };
+}
 
 function text(value, maximum = 500) {
   return String(value ?? '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').trim().slice(0, maximum);
@@ -42,7 +79,7 @@ function digest(value) {
 function configurationFingerprint(printer) {
   return digest(JSON.stringify({
     id: printer.id, type: printer.type, host: printer.host, port: printer.port,
-    serial: printer.serial, model: printer.model, capabilities: printer.capabilities, slicer: printer.slicer,
+    serial: printer.serial, model: printer.model, mainboardId: printer.mainboardId, brandId: printer.brandId, capabilities: printer.capabilities, slicer: printer.slicer,
   }));
 }
 
@@ -64,19 +101,61 @@ function slicerConfiguration(config, previous = {}) {
   return next;
 }
 
+function resinEngineConfiguration(config, previous = {}) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw error(400, 'Resin engine settings must be an object.', 'RESIN_ENGINE_CONFIGURATION');
+  const next = { ...previous };
+  if (config.dispatchEnabled !== undefined) {
+    if (typeof config.dispatchEnabled !== 'boolean') throw error(400, 'Resin dispatch must be explicitly enabled or disabled.', 'RESIN_DISPATCH_CONFIGURATION');
+    next.dispatchEnabled = config.dispatchEnabled;
+  }
+  for (const key of ['prusaExecutable', 'uvtoolsExecutable', 'profilePath', 'freecadExecutable', 'cadAuditPath']) {
+    if (config[key] === undefined) continue;
+    if (typeof config[key] !== 'string' || /[\0\r\n]/.test(config[key]) || config[key].length > 4000 || (config[key].trim() && !path.isAbsolute(config[key].trim()))) throw error(400, 'Resin engine files must use absolute local paths.', 'RESIN_ENGINE_CONFIGURATION');
+    next[key] = config[key].trim();
+  }
+  for (const [key, fallback, minimum, maximum] of [['cadLinearDeflectionMm', 0.005, 0.0001, 0.1], ['cadAngularDeflectionRad', 0.1, 0.01, 0.5]]) {
+    const value = config[key] === undefined ? (next[key] ?? fallback) : config[key];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < minimum || value > maximum) throw error(400, 'CAD tessellation tolerances are outside the supported bounds.', 'RESIN_CAD_CONFIGURATION');
+    next[key] = value;
+  }
+  if (config.slots !== undefined) {
+    if (!Array.isArray(config.slots) || config.slots.length > 32) throw error(400, 'Configure at most 32 resin profile slots.', 'RESIN_PROFILE_SLOTS_INVALID');
+    const ids = new Set();
+    next.slots = config.slots.map(slot => {
+      if (!slot || typeof slot !== 'object' || Array.isArray(slot) || Object.keys(slot).some(key => !['id', 'name', 'profilePath'].includes(key)) ||
+          typeof slot.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(slot.id) || ids.has(slot.id) ||
+          typeof slot.name !== 'string' || !slot.name.trim() || slot.name.length > 100 || /[\u0000-\u001f\u007f]/.test(slot.name) ||
+          typeof slot.profilePath !== 'string' || !slot.profilePath.trim() || slot.profilePath.length > 4000 || /[\0\r\n]/.test(slot.profilePath) || !path.isAbsolute(slot.profilePath.trim())) throw error(400, 'Each resin slot needs a unique ID, name and absolute profile JSON path.', 'RESIN_PROFILE_SLOTS_INVALID');
+      ids.add(slot.id);
+      return { id: slot.id, name: slot.name.trim(), profilePath: slot.profilePath.trim() };
+    });
+  }
+  if (config.timeoutMs !== undefined) next.timeoutMs = integer(config.timeoutMs, 900000, 1000, 3600000);
+  return next;
+}
+
 class QuickPrintService extends EventEmitter {
-  constructor({ dataDir, adapters, slicer, seal, unseal } = {}) {
+  constructor({ dataDir, adapters, slicer, satellite, resinEngine, resinCad, resinRepair, cadRuntime, seal, unseal } = {}) {
     super();
     if (!dataDir) throw error(500, 'A QuickPrint data directory is required.');
     this.dataDir = path.resolve(dataDir);
     this.adapters = adapters;
     this.slicer = slicer;
+    this.satellite = satellite;
+    this.resinEngine = resinEngine;
+    this.resinCad = resinCad;
+    this.resinRepair = resinRepair;
+    this.cadRuntime = cadRuntime;
     this.store = new StateStore({ dataDir: this.dataDir, seal, unseal });
     this._transaction = Promise.resolve();
     this._locks = new Map();
     this._adapterCache = new Map();
     this._operations = new Set();
     this._preparations = new Map();
+    this._pendingPreparations = new Set();
+    this._resinPermitIssuers = new WeakMap();
+    this._resinDispatchPermits = new Map();
+    this._resinHollowVerifications = new Map();
     this._closing = false;
     this._ready = false;
   }
@@ -88,11 +167,14 @@ class QuickPrintService extends EventEmitter {
       settings: {
         siteName: 'QuickPrint',
         slicer: { executable: '', kind: 'orca', profilePaths: [], extraArgs: [] },
+        resinEngine: { prusaExecutable: '', uvtoolsExecutable: '', profilePath: '', freecadExecutable: '', cadAuditPath: '', cadLinearDeflectionMm: 0.005, cadAngularDeflectionRad: 0.1, slots: [], timeoutMs: 900000, dispatchEnabled: false },
         intake: { enabled: false, port: 9732, token: crypto.randomBytes(32).toString('base64url') },
         pollIntervalMs: 10000,
       },
     };
     try {
+      this.state.settings.resinEngine ||= {};
+      if (this.state.settings.resinEngine.dispatchEnabled !== true) this.state.settings.resinEngine.dispatchEnabled = false;
       for (const job of this.state.jobs) {
         job.runs ||= [];
         job.history ||= [];
@@ -101,10 +183,10 @@ class QuickPrintService extends EventEmitter {
           job.error = 'Preparation was interrupted before a validated artifact was saved.';
         } else if (ACTIVE.has(job.status)) {
           const run = this._currentRun(job);
-          if (job.status === 'dispatching' && run?.phase === 'uploading') {
+          if (job.status === 'dispatching' && (run?.phase === 'uploading' || (job.technology === 'resin' && run?.phase === 'uploaded'))) {
             run.phase = 'resolved'; run.outcome = 'not_started'; run.resolvedAt = this._now();
             job.currentRunId = null;
-            this._transition(job, 'ready', 'File upload was interrupted before any start command. A new confirmed dispatch is required.');
+            this._transition(job, job.technology === 'resin' ? 'review' : 'ready', 'File upload was interrupted before any start command. A new confirmed dispatch is required.');
           } else {
             if (run) run.phase = 'result_unknown';
             this._transition(job, 'needs_attention', 'QuickPrint restarted during a print operation. Reconcile the printer before another start.');
@@ -150,6 +232,17 @@ class QuickPrintService extends EventEmitter {
     job.acceptedQuantity = job.runs.reduce((sum, run) => sum + (run.acceptedQuantity || 0), 0);
     job.remainingQuantity = Math.max(0, job.quantity - job.acceptedQuantity);
     job.pendingAcceptanceQuantity = job.runs.filter((run) => run.outcome === 'completed' && !run.resolvedAt).length;
+    if (job.technology === 'resin') {
+      const production = job.resinProduction || {};
+      const target = production.target || resinTarget(job);
+      const completed = job.runs.filter(run => run.technology === 'resin' && run.resolvedAt && Number.isSafeInteger(run.printedParts));
+      const localPrintedParts = completed.reduce((sum, run) => sum + ((run.targetId || job.order.portalJobId) === target.id ? run.printedParts : 0), 0);
+      const lifetimeLocalPrintedParts = completed.reduce((sum, run) => sum + run.printedParts, 0);
+      const baselinePrintedParts = Number.isSafeInteger(production.baselinePrintedParts) ? production.baselinePrintedParts : 0;
+      const requestedParts = target.requiredParts;
+      const printedParts = baselinePrintedParts + localPrintedParts;
+      job.resinProduction = { ...production, target, originalRequestedParts: job.order.requestedQuantity, requestedParts, localPrintedParts, lifetimeLocalPrintedParts, printedParts, remainingParts: Math.max(0, requestedParts - printedParts) };
+    }
   }
 
   _transition(job, status, message, extra = {}) {
@@ -237,8 +330,24 @@ class QuickPrintService extends EventEmitter {
   getSettings({ secrets = false } = {}) { this._assertReady(); return secrets ? clone(this.state.settings) : publicValue(clone(this.state.settings)); }
   getConnectors({ secrets = false } = {}) { this._assertReady(); return secrets ? clone(this.state.connectors) : publicValue(clone(this.state.connectors)); }
 
-  async submit({ source = 'manual', sourceId, name, customer, quantity = 1, notes, files } = {}) {
+  async submit({ source = 'manual', sourceId, name, customer, quantity = 1, notes, files, order } = {}) {
     this._assertReady();
+    let productionSnapshot;
+    if (order !== undefined) {
+      if (!order || order.production?.printType !== 'resin' || !/^[a-f0-9]{64}$/.test(order.ticketFingerprint || '')
+        || !Number.isSafeInteger(order.requestedQuantity) || order.requestedQuantity < 1 || order.requestedQuantity > 500
+        || !['mm', 'in', 'm'].includes(order.units) || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(order.portalJobId || '')
+        || !Number.isSafeInteger(order.portalVersion) || order.portalVersion < 1
+        || !Array.isArray(files) || files.length !== 1 || Number(quantity) !== 1 || files[0].quantity && files[0].quantity !== 1) {
+        throw error(400, 'A Layr resin import requires a verified ticket, specifications and one model file. Requested parts are tracked separately from print runs.', 'INVALID_PRODUCTION_TICKET');
+      }
+      let portal;
+      try { portal = new URL(order.portalUrl); } catch { throw error(400, 'The production ticket needs its portal origin.', 'INVALID_PRODUCTION_TICKET'); }
+      if (portal.protocol !== 'https:' || portal.origin !== order.portalUrl || source !== `layr:${portal.origin}` || sourceId !== `${order.portalJobId}:${order.ticketFingerprint}`) throw error(400, 'The production ticket and submission identity must match.', 'INVALID_PRODUCTION_TICKET');
+      if (!Buffer.isBuffer(files[0].data) || !/\.(stl|obj|step|stp)$/i.test(files[0].name) || digest(files[0].data) !== order.modelSha256) throw error(400, 'The imported model must match its production ticket receipt.', 'MODEL_RECEIPT_MISMATCH');
+      productionSnapshot = resinImportSnapshot(order);
+      order = clone(order);
+    }
     if (typeof source !== 'string' || source.length > 200 || (sourceId !== undefined && (typeof sourceId !== 'string' || sourceId.length > 1000))) {
       throw error(400, 'Source identity must be a string: source up to 200 characters, sourceId up to 1000.', 'SOURCE_IDENTITY');
     }
@@ -274,8 +383,11 @@ class QuickPrintService extends EventEmitter {
               quantity: file.quantity, completedQuantity: 0, acceptedQuantity: 0, remainingQuantity: file.quantity,
               pendingAcceptanceQuantity: 0, status: 'review', createdAt: now, updatedAt: now,
               inputPath, sha256: digest(file.data), bytes: file.data.length, runs: [], currentRunId: null,
+              ...(order ? { order, technology: 'resin' } : {}),
+              ...(productionSnapshot ? { resinProduction: { target: clone(productionSnapshot.target), targetVerified: true, baselinePrintedParts: productionSnapshot.progress.printedParts } } : {}),
               history: [{ at: now, from: null, to: 'review', message: 'File received. Select a compatible printer and prepare it for review.' }],
             };
+            if (productionSnapshot) this._quantities(job);
             jobs.push(job);
           }
           this.state.jobs.push(...jobs);
@@ -300,7 +412,7 @@ class QuickPrintService extends EventEmitter {
         throw error(409, 'Resolve this printer’s active or uncertain run before editing its connection.', 'PRINTER_BUSY');
       }
       const printer = { ...(previous || {}), id };
-      for (const key of ['name', 'type', 'host', 'model', 'serial', 'caCertificate', 'tlsFingerprint']) {
+      for (const key of ['name', 'type', 'host', 'model', 'serial', 'mainboardId', 'brandId', 'caCertificate', 'tlsFingerprint']) {
         if (config[key] !== undefined) printer[key] = text(config[key], key === 'caCertificate' ? 65536 : 1000);
       }
       for (const key of ['apiKey', 'password', 'accessCode']) {
@@ -374,9 +486,10 @@ class QuickPrintService extends EventEmitter {
     try { await adapter?.close?.(); } catch { /* A disconnected adapter must not prevent shutdown. */ }
   }
 
-  _status(status) {
+  _status(status, requireFresh = false) {
     const states = new Set(['idle', 'printing', 'paused', 'offline', 'error', 'unknown']);
     if (!status || !states.has(status.state)) throw error(502, 'The printer returned an unrecognized status.', 'PRINTER_STATUS');
+    if (requireFresh && !fresh(status.observedAt)) throw error(409, 'The printer did not return fresh observed telemetry.', 'PRINTER_STATUS_STALE');
     const observedAt = Number.isFinite(Date.parse(status.observedAt)) ? new Date(status.observedAt).toISOString() : this._now();
     const normalized = { state: status.state, observedAt };
     if (Number.isFinite(Number(status.progress))) normalized.progress = Math.max(0, Math.min(100, Number(status.progress)));
@@ -393,7 +506,7 @@ class QuickPrintService extends EventEmitter {
       let status;
       try {
         const adapter = await this._adapter(this._printer(id));
-        status = this._status(await adapter.status());
+        status = this._status(await adapter.status(), this._printer(id).type === 'sdcp');
       } catch (failure) {
         status = { state: 'offline', observedAt: this._now(), message: this._safeMessage(failure.message || 'Printer connection failed.') };
       }
@@ -415,6 +528,8 @@ class QuickPrintService extends EventEmitter {
   }
 
   _matchesRun(status, run) {
+    const type = run.printerType || this.state.printers.find(printer => printer.id === run.printerId)?.type;
+    if (type === 'sdcp') return Boolean(status.remoteId && run.remoteId && status.remoteId === run.remoteId && status.currentFile && run.remotePath && basename(status.currentFile) === basename(run.remotePath));
     if (status.remoteId && run.remoteId) return status.remoteId === run.remoteId;
     if (!status.currentFile || !run.remotePath) return false;
     return basename(status.currentFile) === basename(run.remotePath);
@@ -425,6 +540,7 @@ class QuickPrintService extends EventEmitter {
       const run = this._currentRun(job);
       if (job.printerId !== printerId || !run || run.resolvedAt || run.outcome) continue;
       const matches = this._matchesRun(status, run);
+      if (matches && run.technology === 'resin' && fresh(status.observedAt) && status.outcome && ['idle', 'error'].includes(status.state)) run.terminalEvidence = { remoteId: status.remoteId, currentFile: status.currentFile, observedAt: status.observedAt, outcome: status.outcome };
       if (matches && ['printing', 'paused'].includes(status.state)) {
         run.observedPrintingAt = this._now();
         run.phase = 'observed';
@@ -432,7 +548,7 @@ class QuickPrintService extends EventEmitter {
         if (job.status !== next) this._transition(job, next, 'Printer telemetry confirms this run.');
         job.progress = status.progress;
         delete job.error;
-      } else if (matches && status.outcome) {
+      } else if (matches && status.outcome && (run.technology !== 'resin' || run.terminalEvidence)) {
         run.outcome = status.outcome;
         run.phase = 'awaiting_review';
         run.finishedAt = this._now();
@@ -453,9 +569,1055 @@ class QuickPrintService extends EventEmitter {
     }
   }
 
+  async _queueResinPreparation(id, keys, operation) {
+    this._assertReady();
+    const job = this._job(id);
+    if (this._preparations.has(id) || ACTIVE.has(job.status) || this._currentRun(job)) throw error(409, 'This job already has an active or queued preparation.', 'JOB_BUSY');
+    const controller = new AbortController();
+    this._preparations.set(id, controller);
+    this._pendingPreparations.add(id);
+    try {
+      return await this._withLocks(keys, () => {
+        controller.signal.throwIfAborted();
+        this._pendingPreparations.delete(id);
+        return operation(controller);
+      });
+    } finally {
+      if (this._preparations.get(id) === controller) {
+        this._preparations.delete(id);
+        this._pendingPreparations.delete(id);
+      }
+    }
+  }
+
+  async preprocessResinJob(id, { evaluate = true, fix, hollowThicknessMm } = {}) {
+    return this._queueResinPreparation(id, [`job:${id}`, 'satellite:preprocess', 'resin:engine'], async controller => {
+      const job = this._job(id);
+      if (job.technology !== 'resin') throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+      if (job.status !== 'review' || this._currentRun(job)) throw error(409, 'This ticket must be in review before probing preprocessing.', 'JOB_BUSY');
+      if (job.order.units !== 'mm') throw error(409, 'Convert and validate model units before SatelLite preprocessing. This probe accepts millimetres.', 'RESIN_UNIT_CONVERSION_REQUIRED');
+      try {
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          delete current.resinPreparation;
+          delete current.error;
+          this._transition(current, 'preparing', 'Probing SatelLite model preprocessing; no print file will be generated.');
+        });
+        const source = await fs.readFile(job.inputPath);
+        if (digest(source) !== job.sha256) throw error(409, 'The original model changed. Import it again.', 'ORIGINAL_CHANGED');
+        const implementation = this.satellite || require('../slicing/satellite');
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-preprocessing');
+        controller.signal.throwIfAborted();
+        const result = await implementation.preprocess({ inputPath: job.inputPath, outputDir, evaluate, fix, hollowThicknessMm, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (!result || !Array.isArray(result.files) || !result.files.length || result.files.length > 100 || !result.files.some(file => ['model', 'report'].includes(file?.kind))) throw error(502, 'SatelLite returned no captured model or report.', 'SATELLITE_NO_OUTPUT');
+        if (result.sourceSha256 !== job.sha256 || digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'Preprocessing source integrity could not be verified.', 'ORIGINAL_CHANGED');
+        for (const file of result.files) {
+          const relative = typeof file?.filePath === 'string' ? path.relative(outputDir, file.filePath) : '..';
+          if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw error(502, 'SatelLite output is outside its work directory.', 'INVALID_SATELLITE_OUTPUT');
+          const stat = await fs.lstat(file.filePath);
+          if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== file.bytes || stat.size > MAX_FILE_BYTES || digest(await fs.readFile(file.filePath)) !== file.sha256) throw error(502, 'SatelLite captured output integrity could not be verified.', 'INVALID_SATELLITE_OUTPUT');
+        }
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinPreparation = { ...result, status: 'captured_unqualified', printReady: false, finishedAt: this._now() };
+          delete current.error;
+          this._transition(current, 'review', 'Captured SatelLite output for inspection. Resin slicing and printer qualification remain pending.');
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id);
+          delete current.resinPreparation;
+          current.error = this._safeMessage(cause?.message || 'SatelLite preprocessing failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async prepareResinCadJob(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => key !== 'confirmedEmbeddedUnits') || request.confirmedEmbeddedUnits !== true) throw error(400, 'Confirm that STEP intrinsic units are converted to millimetres; ticket units will not be applied again.', 'RESIN_CAD_REVIEW_REQUIRED');
+    return this._queueResinPreparation(id, [`job:${id}`, 'resin:engine'], async controller => {
+      const job = this._job(id);
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint || !/\.(step|stp)$/i.test(job.fileName)) throw error(409, 'Select an imported resin STEP/STP ticket for CAD conversion.', 'RESIN_CAD_SOURCE_REQUIRED');
+      if (['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState)) throw error(409, 'Resolve the pending or committed preparation approval before converting CAD again.', 'RESIN_APPROVAL_LOCKED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before CAD conversion.', 'JOB_BUSY');
+      const settings = resinEngineConfiguration(this.state.settings.resinEngine || {});
+      if (!settings.freecadExecutable || !settings.cadAuditPath) throw error(400, 'Configure FreeCAD and the isolated CAD audit runtime in Settings.', 'RESIN_CAD_CONFIGURATION');
+      try {
+        const source = await this._readResinGeometrySource(job);
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id); delete current.resinCad; delete current.resinSlice; delete current.error;
+          this._invalidateResinPermits(id);
+          this._transition(current, 'preparing', 'Auditing STEP transfer and tessellating every solid in millimetres; the original CAD file is preserved.');
+        });
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-cad');
+        await fs.mkdir(outputDir, { recursive: true }); await this._resinCadDirectory(job);
+        const implementation = this.resinCad || require('../slicing/resin-cad');
+        controller.signal.throwIfAborted();
+        const record = await implementation.prepareResinCad({ inputPath: job.inputPath, outputDir, freecadExecutable: settings.freecadExecutable, cadAuditPath: settings.cadAuditPath, timeoutMs: settings.timeoutMs, linearDeflectionMm: settings.cadLinearDeflectionMm, angularDeflectionRad: settings.cadAngularDeflectionRad, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        await this._resinCadDirectory(job);
+        await require('../slicing/resin-cad').verifyResinCadGeometry(record, { source, directory: outputDir });
+        await this._readResinGeometrySource(job);
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinCad = { ...record, operatorReview: { embeddedUnits: true, ticketUnits: current.order.units, coordinateUnits: 'mm', reviewedAt: this._now() } };
+          delete current.error;
+          this._transition(current, 'review', 'STEP transfer and all solid meshes validated. Review the millimetre geometry and choose a resin slicing profile.');
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id); delete current.resinCad; delete current.resinSlice;
+          current.error = this._safeMessage(cause?.message || 'CAD preparation failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async _resinCadDirectory(job) {
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-cad');
+    let current = this.dataDir;
+    const rootInfo = await fs.lstat(current);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw error(409, 'CAD evidence root cannot use symbolic links.', 'RESIN_CAD_CHANGED');
+    for (const segment of path.relative(this.dataDir, directory).split(path.sep)) {
+      current = path.join(current, segment);
+      const info = await fs.lstat(current);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw error(409, 'CAD evidence directories cannot use symbolic links.', 'RESIN_CAD_CHANGED');
+    }
+    if (path.relative(await fs.realpath(this.dataDir), await fs.realpath(directory)) !== path.relative(this.dataDir, directory)) throw error(409, 'CAD evidence resolves outside its managed job directory.', 'RESIN_CAD_CHANGED');
+    return directory;
+  }
+
+  async prepareResinRepairJob(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Object.keys(request).some(key => key !== 'confirmedExactRepair') || request.confirmedExactRepair !== true) throw error(400, 'Confirm exact duplicate removal and winding repair after normalization to millimetres; this operation cannot fill holes or weld nearby coordinates.', 'RESIN_REPAIR_REVIEW_REQUIRED');
+    return this._queueResinPreparation(id, [`job:${id}`, 'resin:engine'], async controller => {
+      const job = this._job(id), format = path.extname(job.fileName).slice(1).toLowerCase();
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint || !['stl', 'obj'].includes(format)) throw error(409, 'Select an imported resin STL or triangulated OBJ ticket for exact repair.', 'RESIN_REPAIR_SOURCE_REQUIRED');
+      if (['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState)) throw error(409, 'Resolve the pending or committed preparation approval before repairing its source.', 'RESIN_APPROVAL_LOCKED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before exact repair.', 'JOB_BUSY');
+      if (job.resinCad) throw error(409, 'Mesh repair cannot adopt unrelated CAD conversion evidence.', 'RESIN_REPAIR_CHANGED');
+      try {
+        const source = await this._readResinGeometrySource(job);
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id); delete current.resinRepair; delete current.resinSlice; delete current.error;
+          this._invalidateResinPermits(id);
+          this._transition(current, 'preparing', 'Normalizing declared units and repairing exact mesh duplicates and winding; the original model is preserved.');
+        });
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-repair');
+        await fs.mkdir(outputDir, { recursive: true }); await this._resinRepairDirectory(job);
+        const implementation = this.resinRepair || require('../slicing/resin-repair');
+        controller.signal.throwIfAborted();
+        const record = await implementation.prepareResinRepair({ source: Buffer.from(source), format, units: job.order.units, outputDir, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (digest(source) !== job.sha256 || record?.sourceSha256 !== job.sha256) throw error(409, 'The repair did not preserve the frozen original source identity.', 'ORIGINAL_CHANGED');
+        await this._resinRepairDirectory(job);
+        await require('../slicing/resin-repair').verifyResinRepairGeometry(record, { source, format, units: job.order.units, directory: outputDir, signal: controller.signal });
+        await this._readResinGeometrySource(job);
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          current.resinRepair = { ...record, operatorReview: { exactRepair: true, ticketUnits: current.order.units, coordinateUnits: 'mm', reviewedAt: this._now() } };
+          delete current.error;
+          this._transition(current, 'review', 'Exact mesh repair validated. Review the repaired millimetre geometry before sizing and slicing.');
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id); delete current.resinRepair; delete current.resinSlice;
+          current.error = this._safeMessage(cause?.message || 'Exact mesh repair failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async _resinRepairDirectory(job) {
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-repair');
+    let current = this.dataDir;
+    const rootInfo = await fs.lstat(current);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw error(409, 'Repair evidence root cannot use symbolic links.', 'RESIN_REPAIR_CHANGED');
+    for (const segment of path.relative(this.dataDir, directory).split(path.sep)) {
+      current = path.join(current, segment);
+      const info = await fs.lstat(current);
+      if (!info.isDirectory() || info.isSymbolicLink()) throw error(409, 'Repair evidence directories cannot use symbolic links.', 'RESIN_REPAIR_CHANGED');
+    }
+    if (path.relative(await fs.realpath(this.dataDir), await fs.realpath(directory)) !== path.relative(this.dataDir, directory)) throw error(409, 'Repair evidence resolves outside its managed job directory.', 'RESIN_REPAIR_CHANGED');
+    return directory;
+  }
+
+  async _resinSliceFile(job, result = job.resinSlice) {
+    if (!result || result.format !== 'goo' || typeof result.filePath !== 'string' || !path.isAbsolute(result.filePath) || !/^[a-f0-9]{64}$/.test(result.sha256 || '')) throw error(409, 'No captured resin slice is available.', 'RESIN_SLICE_UNAVAILABLE');
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
+    let managed;
+    try { managed = await require('./resin-managed-path').resolveManagedResinFile(directory, result.filePath); } catch { throw error(502, 'Resin output is outside its ordinary managed job directory.', 'INVALID_RESIN_OUTPUT'); }
+    const stat = await fs.lstat(managed.filePath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 512 * 1024 * 1024 || stat.size !== result.bytes) throw error(502, 'Resin output size or file type is invalid.', 'INVALID_RESIN_OUTPUT');
+    const bytes = await fs.readFile(managed.filePath);
+    if (digest(bytes) !== result.sha256) throw error(409, 'The captured resin file changed. Slice this ticket again.', 'RESIN_ARTIFACT_CHANGED');
+    return bytes;
+  }
+
+  async sliceResinJob(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || Reflect.ownKeys(request).some(key => !['confirmedRequirements', 'confirmedOriginalSize', 'confirmedSizing', 'sizing', 'profileSlotId', 'expectedGeometrySha256', 'plate', 'hollow', 'confirmedHollowPreparation'].includes(key))) throw error(400, 'Resin slicing accepts reviewed geometry, preparation and plate choices, confirmations and a configured slot ID only; local paths come from Settings.', 'INVALID_RESIN_SLICE_REQUEST');
+    const hollow = request.hollow === undefined ? undefined : require('./resin-hollow-review').normalizeResinHollowReview(request.hollow);
+    if (hollow ? request.confirmedHollowPreparation !== true : request.confirmedHollowPreparation !== undefined) throw error(400, 'Review the sized source, exact hollow recipe, support regions, profile and resolution policy before hollow preparation.', 'RESIN_HOLLOW_REVIEW_REQUIRED');
+    if (request.expectedGeometrySha256 !== undefined && (typeof request.expectedGeometrySha256 !== 'string' || !SHA256.test(request.expectedGeometrySha256))) throw error(400, 'The reviewed geometry hash must be a SHA-256 value.', 'INVALID_RESIN_SLICE_REQUEST');
+    const plate = request.plate === undefined ? undefined : resinPlateRequest(request.plate);
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    const originalSize = sizing?.mode === 'original';
+    if (request.confirmedRequirements !== true || (originalSize ? request.confirmedOriginalSize !== true && request.confirmedSizing !== true : request.confirmedSizing !== true)) throw error(400, 'Confirm the ticket requirements, selected profile and explicit sizing plan before slicing.', 'RESIN_REVIEW_REQUIRED');
+    return this._queueResinPreparation(id, [`job:${id}`, 'resin:engine'], async controller => {
+      const job = this._job(id);
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint) throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+      if (['pending', 'approved'].includes(job.resinProduction?.plan?.approvalState)) throw error(409, 'Preparation approval is pending or committed. Resolve that approval before replacing its artifact.', 'RESIN_APPROVAL_LOCKED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'This resin ticket must be in review before slicing.', 'JOB_BUSY');
+      if (plate) { const quantities = clone(job); this._quantities(quantities); if (plate.copies > quantities.resinProduction.remainingParts) throw error(409, 'Requested plate copies exceed the current production target remainder.', 'QUANTITY_EXCEEDED'); }
+      const settings = resinEngineConfiguration(this.state.settings.resinEngine || {});
+      const slots = settings.slots || [];
+      let slot;
+      if (slots.length) {
+        slot = request.profileSlotId === undefined && slots.length === 1 ? slots[0] : slots.find(item => item.id === request.profileSlotId);
+        if (!slot) throw error(400, 'Choose a configured resin profile slot for this ticket.', 'RESIN_PROFILE_SLOT_REQUIRED');
+        settings.profilePath = slot.profilePath;
+      } else if (request.profileSlotId !== undefined) throw error(400, 'The selected resin profile slot no longer exists. Review the current Settings.', 'RESIN_PROFILE_SLOT_REQUIRED');
+      if (!['prusaExecutable', 'uvtoolsExecutable', 'profilePath'].every(key => settings[key])) throw error(400, 'Configure the resin engine executable and profile paths in Settings.', 'RESIN_ENGINE_CONFIGURATION');
+      try {
+        await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id); delete current.resinSlice; delete current.error;
+          this._transition(current, 'preparing', 'Slicing the resin model with the reviewed local profile; no printer command is sent.');
+        });
+        const expectedGeometry = await this._expectedResinGeometry(job, sizing);
+        if (/\.(step|stp)$/i.test(job.fileName) && request.expectedGeometrySha256 !== job.resinCad?.sha256) throw error(409, 'The CAD geometry changed or has not been reviewed. Refresh its measurements and confirm sizing again.', 'RESIN_CAD_REVIEW_STALE');
+        if (expectedGeometry.repairPreparation && request.expectedGeometrySha256 !== expectedGeometry.engineSourceSha256) throw error(409, 'The repaired geometry changed or has not been reviewed. Refresh its measurements and confirm sizing again.', 'RESIN_REPAIR_REVIEW_STALE');
+        const module = require('../slicing/resin-engine');
+        const loaded = await module.loadProfile(settings.profilePath);
+        if (hollow && (hollow.geometrySha256 !== expectedGeometry.inputGeometry.sha256 || hollow.profileSha256 !== loaded.profileSha256)) throw error(409, 'The sized geometry or selected profile changed after hollow review. Refresh both before preparing.', 'RESIN_HOLLOW_REVIEW_STALE');
+        const outputDir = path.join(this.dataDir, 'jobs', id, 'resin-slicing');
+        const implementation = hollow ? this.resinEngine?.prepareControlledResinHollow ? this.resinEngine : require('../slicing/resin-hollow-engine') : this.resinEngine || module;
+        controller.signal.throwIfAborted();
+        const nativeOptions = { ...settings, inputPath: expectedGeometry.inputPath, outputDir, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, signal: controller.signal };
+        // Settings may contain slots/dispatch toggles. The controlled native
+        // boundary accepts only explicit paths and preparation fields.
+        let result = hollow ? await implementation.prepareControlledResinHollow({ inputPath: nativeOptions.inputPath, outputDir, profilePath: settings.profilePath, prusaExecutable: settings.prusaExecutable, uvtoolsExecutable: settings.uvtoolsExecutable, unitScale: expectedGeometry.unitScale, sizing: expectedGeometry.sizingPlan.requestedSizing, timeoutMs: settings.timeoutMs,
+          hollowRequest: hollow.recipe, supportRequest: hollow.supportRequest, resolutionRequest: hollow.resolutionRequest, boundaryPolicy: hollow.boundaryPolicy, signal: controller.signal }) : await implementation.prepareResin({ ...nativeOptions, ...(plate ? { plate } : {}) });
+        let referenceCapability;
+        if (hollow && plate) {
+          const input = await this._resinGeometryInput(job);
+          const { hollowReferenceCapability, ...packed } = await require('../slicing/resin-hollow-plate').prepareResinHollowPlate({ source: input.source, hollowPreparation: result.hollowPreparation, profile: loaded.profile, ini: loaded.ini, preset: loaded.preset, requested: plate, directory: outputDir, signal: controller.signal });
+          referenceCapability = hollowReferenceCapability;
+          result = { ...result, ...packed };
+        }
+        controller.signal.throwIfAborted();
+        if (result && ['cadPreparation', 'meshSourceSha256', 'rawSliceTool', 'repairPreparation', 'repairedSourceSha256', 'repairSliceTool'].some(key => result[key] !== undefined)) throw error(502, 'The slicing engine cannot supply unrelated source preparation evidence.', 'INVALID_RESIN_OUTPUT');
+        if (!result || !result.analysis || !Number.isSafeInteger(result.analysis.count) || result.analysis.count < 0 || result.analysis.passed !== (result.analysis.count === 0) || !Array.isArray(result.analysis.issues) || result.analysis.issues.length !== result.analysis.count || result.analysis.issues.some(issue => typeof issue !== 'string') || !Array.isArray(result.analysis.checks) || result.analysis.checks.length !== RESIN_ANALYSIS_CHECKS.length || RESIN_ANALYSIS_CHECKS.some(check => !result.analysis.checks.includes(check)) || result.sourceSha256 !== expectedGeometry.engineSourceSha256 || result.profileSha256 !== loaded.profileSha256 || result.printerId !== loaded.profile.printerId || result.printerModel !== loaded.profile.printerModel || result.material !== loaded.profile.material || !result.tool || !/^[a-f0-9]{64}$/.test(result.tool.executableSha256 || '')) throw error(502, 'Resin slicing returned incomplete or mismatched evidence.', 'INVALID_RESIN_OUTPUT');
+        const inputGeometry = await this._verifyResinInputGeometry(job, result, expectedGeometry);
+        const bytes = await this._resinSliceFile(job, result);
+        const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
+        module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
+        if (inspection.perLayerSettings) throw error(502, 'Per-layer resin parameters require separate qualification.', 'RESIN_PER_LAYER_PROFILE_UNSUPPORTED');
+        const reviewedSlice = { ...result, inputGeometry, operatorReview: { ...(hollow ? { hollow, confirmedHollowPreparation: true } : {}) } };
+        const hollowEvidence = await this._verifyResinHollowEvidence(job, reviewedSlice, { loaded, allowFreshEngineRecord: true, signal: controller.signal });
+        if (hollowEvidence && referenceCapability) hollowEvidence.cacheEntry.referenceCapability = referenceCapability;
+        await this._verifyResinPlateEvidence(job, reviewedSlice, { loaded, artifactBytes: bytes, requested: plate, hollowEvidence, signal: controller.signal });
+        await this._readResinGeometrySource(job);
+        if (expectedGeometry.cadPreparation) {
+          const checked = await this._expectedResinGeometry(job, sizing);
+          if (!require('node:util').isDeepStrictEqual(checked.cadPreparation, expectedGeometry.cadPreparation)) throw error(409, 'CAD preparation changed during resin slicing.', 'RESIN_CAD_CHANGED');
+        }
+        if (expectedGeometry.repairPreparation) {
+          const checked = await this._expectedResinGeometry(job, sizing);
+          if (!require('node:util').isDeepStrictEqual(checked.repairPreparation, expectedGeometry.repairPreparation)) throw error(409, 'Exact repair preparation changed during resin slicing.', 'RESIN_REPAIR_CHANGED');
+        }
+        controller.signal.throwIfAborted();
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          const current = this._job(id);
+          const cad = expectedGeometry.cadPreparation;
+          const repair = expectedGeometry.repairPreparation;
+          current.resinSlice = { ...result, sourceSha256: job.sha256, ...(cad ? { meshSourceSha256: expectedGeometry.engineSourceSha256, cadPreparation: cad, rawSliceTool: result.tool, tool: this._resinCadSliceTool(result.tool, cad) } : {}), ...(repair ? { repairedSourceSha256: expectedGeometry.engineSourceSha256, repairPreparation: repair, repairSliceTool: result.tool, tool: this._resinRepairSliceTool(result.tool, repair) } : {}), sizingPlan: expectedGeometry.sizingPlan, inputGeometry, inspection, status: result.analysis.passed ? 'sliced_pending_qualification' : 'analysis_failed', printReady: false, printerCompatible: false, operatorReview: { confirmedRequirements: true, confirmedOriginalSize: originalSize, confirmedSizing: true, sizing: expectedGeometry.sizingPlan.requestedSizing, ...(plate ? { plate } : {}), ...(hollow ? { hollow: clone(hollow), confirmedHollowPreparation: true } : {}), ...(slot ? { profileSlotId: slot.id, profileSlotName: slot.name } : {}), unitScale: expectedGeometry.unitScale, units: cad || repair ? 'mm' : current.order.units, ...(cad ? { embeddedUnits: true } : {}), ...(repair ? { exactRepair: true } : {}), ...(cad || repair ? { ticketUnits: current.order.units } : {}), ticketFingerprint: current.order.ticketFingerprint, reviewedAt: this._now() }, finishedAt: this._now() };
+          if (result.analysis.passed) delete current.error;
+          else current.error = `${result.analysis.count} resin print issue(s) require review. Inspect the captured file and change the model or profile before retrying.`;
+          this._transition(current, 'review', result.analysis.passed ? 'Resin slice captured. Printer/material qualification is still required.' : current.error);
+          return publicValue(current);
+        });
+      } catch (failure) {
+        const cause = controller.signal.aborted ? controller.signal.reason : failure;
+        await this._mutate(() => {
+          const current = this._job(id); delete current.resinSlice;
+          current.error = this._safeMessage(cause?.message || 'Resin slicing failed.');
+          this._transition(current, controller.signal.reason?.code === 'PREPARATION_CANCELLED' ? 'cancelled' : 'review', current.error);
+        });
+        throw this._publicError(cause);
+      }
+    });
+  }
+
+  async _readResinGeometrySource(job) {
+    if (job.technology !== 'resin' || !job.order?.ticketFingerprint) throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+    const stat = await fs.lstat(job.inputPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 100 * 1024 * 1024) throw error(409, 'The original model size or file type changed. Import it again.', 'ORIGINAL_CHANGED');
+    const file = await fs.open(job.inputPath, 'r');
+    try {
+      const pinned = await file.stat();
+      if (!pinned.isFile() || pinned.size !== stat.size || pinned.size < 1 || pinned.size > 100 * 1024 * 1024) throw error(409, 'The original model size or file type changed. Import it again.', 'ORIGINAL_CHANGED');
+      const source = Buffer.alloc(pinned.size); let offset = 0;
+      while (offset < source.length) { const read = await file.read(source, offset, source.length - offset, offset); if (!read.bytesRead) break; offset += read.bytesRead; }
+      if (offset !== source.length || (await file.read(Buffer.alloc(1), 0, 1, offset)).bytesRead || digest(source) !== job.sha256) throw error(409, 'The original model changed. Import it again.', 'ORIGINAL_CHANGED');
+      return source;
+    } finally { await file.close(); }
+  }
+
+  async _expectedResinGeometry(job, sizing, { includeSource = false } = {}) {
+    const input = await this._resinGeometryInput(job);
+    const prepared = require('../slicing/resin-geometry').prepareResinGeometry(input.source, { format: input.format, units: input.units, sizing });
+    const meshAudit = this._auditResinSlicingSource(prepared.stl);
+    // Do not retain the potentially 100 MiB normalized Buffer during providers.
+    return { sizingPlan: prepared.plan, inputPath: input.inputPath, unitScale: input.unitScale, engineSourceSha256: input.engineSourceSha256, ...(input.cadPreparation ? { cadPreparation: input.cadPreparation } : {}), ...(input.repairPreparation ? { repairPreparation: input.repairPreparation } : {}), inputGeometry: { sha256: prepared.transformedSha256, bytes: prepared.stl.length, bounds: prepared.transformedBounds, meshAudit }, ...(includeSource ? { preparedSource: prepared.stl } : {}) };
+  }
+
+  _auditResinSlicingSource(bytes) {
+    const audit = require('../slicing/resin-mesh').auditResinMesh(bytes, { format: 'stl', units: 'mm' });
+    if (audit.components.some(component => component.winding !== 'positive')) throw error(422, 'Source shells need explicit winding or cavity repair before slicing; native automatic repair cannot establish source preservation.', 'RESIN_MESH_NEGATIVE_COMPONENT');
+    return audit;
+  }
+
+  async _resinGeometryInput(job) {
+    const source = await this._readResinGeometrySource(job), format = path.extname(job.fileName).slice(1).toLowerCase();
+    if (!['step', 'stp'].includes(format)) {
+      if (job.resinCad) throw error(409, 'Mesh-only sources cannot carry unrelated CAD preparation.', 'RESIN_CAD_CHANGED');
+      const unitScale = { mm: 1, in: 25.4, m: 1000 }[job.order.units];
+      if (!unitScale) throw error(400, 'Resolve the model units before slicing.', 'RESIN_MODEL_UNITS');
+      if (job.resinRepair) {
+        const { operatorReview, ...record } = job.resinRepair;
+        if (!['stl', 'obj'].includes(format) || operatorReview?.exactRepair !== true || operatorReview.ticketUnits !== job.order.units || operatorReview.coordinateUnits !== 'mm') throw error(409, 'Exact mesh repair requires its declared-unit operator review.', 'RESIN_REPAIR_CHANGED');
+        const directory = await this._resinRepairDirectory(job);
+        const checked = await require('../slicing/resin-repair').verifyResinRepairGeometry(record, { source, format, units: job.order.units, directory });
+        return { source: checked.bytes, format: 'stl', inputPath: record.filePath, units: 'mm', unitScale: 1, engineSourceSha256: record.sha256,
+          repairPreparation: { schemaVersion: 1, method: record.method, sourceSha256: job.sha256, meshSha256: record.sha256, normalizedSourceSha256: record.normalizedSource.sha256, normalizationSha256: record.normalizationPlan.sizingSha256, proofSha256: record.proofSha256, reportSha256: record.reportSha256, repairToolSha256: record.tool.executableSha256 } };
+      }
+      return { source, format, inputPath: job.inputPath, units: job.order.units, unitScale, engineSourceSha256: job.sha256 };
+    }
+    if (job.resinRepair) throw error(409, 'STEP sources cannot carry unrelated mesh repair preparation.', 'RESIN_REPAIR_CHANGED');
+    if (!job.resinCad || job.resinCad.operatorReview?.embeddedUnits !== true) throw error(409, 'Audit and convert this STEP model before measuring or slicing its geometry.', 'RESIN_CAD_REQUIRED');
+    const directory = await this._resinCadDirectory(job);
+    await require('../slicing/resin-cad').verifyResinCadGeometry(job.resinCad, { source, directory });
+    const record = job.resinCad;
+    const mesh = await this._readResinGeometrySource({ ...job, inputPath: record.filePath, sha256: record.sha256 });
+    return { source: mesh, format: 'stl', inputPath: record.filePath, units: 'mm', unitScale: 1, engineSourceSha256: record.sha256,
+      cadPreparation: { sourceSha256: job.sha256, meshSha256: record.sha256, reportSha256: record.reportSha256, auditReportSha256: record.auditReportSha256, cadToolSha256: record.tool.executableSha256, tolerance: clone(record.tolerance), originMm: clone(record.originMm) } };
+  }
+
+  _resinCadSliceTool(rawTool, cad) {
+    if (!SHA256.test(rawTool?.executableSha256 || '') || !SHA256.test(cad?.cadToolSha256 || '')) throw error(409, 'CAD and slicing provider fingerprints are required.', 'RESIN_CAD_CHANGED');
+    return { ...rawTool, executableSha256: digest(JSON.stringify({ engineSha256: rawTool.executableSha256, cadToolSha256: cad.cadToolSha256, tolerance: cad.tolerance })) };
+  }
+
+  _resinRepairSliceTool(rawTool, repair) {
+    if (!SHA256.test(rawTool?.executableSha256 || '') || !SHA256.test(repair?.repairToolSha256 || '') || repair.method !== 'normalized-exact-mesh-repair-v1') throw error(409, 'Exact repair and slicing provider fingerprints are required.', 'RESIN_REPAIR_CHANGED');
+    return { ...rawTool, executableSha256: digest(JSON.stringify({ engineSha256: rawTool.executableSha256, repairToolSha256: repair.repairToolSha256, method: repair.method })) };
+  }
+
+  async inspectResinGeometry(id) {
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), input = await this._resinGeometryInput(job);
+      const measured = require('../slicing/resin-geometry').measureResinGeometry(input.source, { format: input.format, units: input.units });
+      if (input.repairPreparation) return Object.freeze({ ...measured, sourceSha256: job.sha256, geometrySha256: input.engineSourceSha256, repaired: true, ticketUnits: job.order.units, repairPreparation: input.repairPreparation, repairSummary: clone(job.resinRepair.summary) });
+      return input.cadPreparation ? Object.freeze({ ...measured, sourceSha256: job.sha256, geometrySha256: input.engineSourceSha256, embeddedUnits: true, ticketUnits: job.order.units, cadPreparation: input.cadPreparation }) : measured;
+    });
+  }
+
+  async planResinGeometry(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => key !== 'sizing')) throw error(400, 'Geometry review accepts an explicit numeric sizing plan only.', 'RESIN_SIZING_INVALID');
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), expected = await this._expectedResinGeometry(job, sizing);
+      return { schemaVersion: 1, sourceSha256: job.sha256, engineSourceSha256: expected.engineSourceSha256, geometrySha256: expected.inputGeometry.sha256,
+        sizingSha256: expected.sizingPlan.sizingSha256, coordinateUnits: 'mm', sizingPlan: expected.sizingPlan, dimensionsMm: expected.sizingPlan.dimensionsMm,
+        sourceBounds: expected.inputGeometry.bounds, triangleCount: expected.sizingPlan.triangleCount, meshAudit: expected.inputGeometry.meshAudit };
+    });
+  }
+
+  async reviewResinHollowPreparation(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => !['hollow', 'sizing', 'profileSlotId'].includes(key))) throw error(400, 'Hollow review accepts the current sizing, selected slot and explicit recipe only.', 'RESIN_HOLLOW_REVIEW_INVALID');
+    const hollow = require('./resin-hollow-review').normalizeResinHollowReview(request.hollow);
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), expected = await this._expectedResinGeometry(job, sizing, { includeSource: true }), settings = resinEngineConfiguration(this.state.settings.resinEngine || {}), slots = settings.slots || [];
+      let slot;
+      if (slots.length) { slot = request.profileSlotId === undefined && slots.length === 1 ? slots[0] : slots.find(item => item.id === request.profileSlotId); if (!slot) throw error(400, 'Choose a configured resin profile slot for this review.', 'RESIN_PROFILE_SLOT_REQUIRED'); }
+      else if (request.profileSlotId !== undefined) throw error(400, 'The selected resin slot is no longer configured.', 'RESIN_PROFILE_SLOT_REQUIRED');
+      const profilePath = slot?.profilePath || settings.profilePath;
+      if (!profilePath) throw error(400, 'Configure a resin profile before reviewing hollow preparation.', 'RESIN_ENGINE_CONFIGURATION');
+      const loaded = await require('../slicing/resin-engine').loadProfile(profilePath);
+      if (hollow.geometrySha256 !== expected.inputGeometry.sha256 || hollow.profileSha256 !== loaded.profileSha256) throw error(409, 'This recipe belongs to different sized geometry or profile. Regenerate it for the current choices.', 'RESIN_HOLLOW_REVIEW_STALE');
+      if ((hollow.supportRequest.mode === 'none') !== (loaded.ini.supports_enable === '0')) throw error(400, 'The reviewed support mode must match the selected profile.', 'RESIN_HOLLOW_REVIEW_INVALID');
+      if (hollow.supportRequest.points.some(point => point.sourceFaceIndex >= expected.sizingPlan.triangleCount || ['x', 'y', 'z'].some(axis => point.positionMm[axis] > expected.sizingPlan.dimensionsMm[axis]))) throw error(400, 'Authored contacts must address faces and coordinates in this exact sized source.', 'RESIN_HOLLOW_REVIEW_INVALID');
+      require('../slicing/resin-hollow-plan').prepareResinHollowPlan(expected.preparedSource, { binding: { sourceSha256: expected.engineSourceSha256, geometrySha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256 }, ...hollow.recipe });
+      return { hollow, geometry: { geometrySha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256, dimensionsMm: expected.sizingPlan.dimensionsMm, coordinateUnits: 'mm', triangleCount: expected.sizingPlan.triangleCount },
+        profile: require('../slicing/resin-profiles').profileView(loaded), profileSha256: loaded.profileSha256, digitalValidationPending: true, printReady: false, ...(slot ? { profileSlot: { id: slot.id, name: slot.name } } : {}) };
+    });
+  }
+
+  async getResinGeometrySource(id, request = {}) {
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).some(key => key !== 'sizing')) throw error(400, 'Geometry review accepts an explicit numeric sizing plan only.', 'RESIN_SIZING_INVALID');
+    let sizing;
+    try { sizing = request.sizing === undefined ? { mode: 'original' } : structuredClone(request.sizing); } catch { throw error(400, 'Use an explicit numeric sizing plan.', 'RESIN_SIZING_INVALID'); }
+    return this._withLocks([`job:${id}`], async () => {
+      const expected = await this._expectedResinGeometry(this._job(id), sizing, { includeSource: true });
+      return { fileName: 'reviewed-sized-source.stl', bytes: expected.preparedSource, sha256: expected.inputGeometry.sha256, sizingSha256: expected.sizingPlan.sizingSha256 };
+    });
+  }
+
+  async _verifyResinInputGeometry(job, result, expected) {
+    const descriptor = result.inputGeometry, anticipated = expected.inputGeometry;
+    const same = require('node:util').isDeepStrictEqual;
+    if (result.sizingPlan?.sizingSha256 !== expected.sizingPlan.sizingSha256 || !same(result.sizingPlan, expected.sizingPlan) || !descriptor || typeof descriptor.filePath !== 'string' || descriptor.filePath.length > 4000 || /[\0\r\n]/.test(descriptor.filePath) || !path.isAbsolute(descriptor.filePath) || descriptor.sha256 !== anticipated.sha256 || descriptor.bytes !== anticipated.bytes || !same(descriptor.bounds, anticipated.bounds)) throw error(502, 'The engine did not return the independently verified sizing plan and normalized input.', 'INVALID_RESIN_GEOMETRY');
+    const directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
+    if (path.extname(descriptor.filePath).toLowerCase() !== '.stl') throw error(502, 'Normalized resin input must be a managed STL.', 'INVALID_RESIN_GEOMETRY');
+    let managed;
+    try { managed = await require('./resin-managed-path').resolveManagedResinFile(directory, descriptor.filePath); } catch { throw error(502, 'Normalized resin input is outside its ordinary managed job directory.', 'INVALID_RESIN_GEOMETRY'); }
+    const file = await fs.open(managed.filePath, 'r');
+    let bytes;
+    try {
+      const stat = await file.stat();
+      if (!stat.isFile() || stat.size < 1 || stat.size > 100 * 1024 * 1024 || stat.size !== anticipated.bytes) throw error(502, 'Normalized resin input size or file type changed.', 'INVALID_RESIN_GEOMETRY');
+      bytes = Buffer.alloc(stat.size); let offset = 0;
+      while (offset < bytes.length) { const read = await file.read(bytes, offset, bytes.length - offset, offset); if (!read.bytesRead) break; offset += read.bytesRead; }
+      if (offset !== bytes.length || (await file.read(Buffer.alloc(1), 0, 1, offset)).bytesRead || digest(bytes) !== anticipated.sha256) throw error(409, 'The normalized resin input changed after sizing.', 'RESIN_INPUT_GEOMETRY_CHANGED');
+    } finally { await file.close(); }
+    const measured = require('../slicing/resin-geometry').measureResinGeometry(bytes, { format: 'stl', units: 'mm' });
+    if (measured.triangleCount !== expected.sizingPlan.triangleCount || !same(measured.sourceBounds, anticipated.bounds)) throw error(409, 'The normalized resin input does not match the reviewed bounds.', 'RESIN_INPUT_GEOMETRY_CHANGED');
+    const meshAudit = this._auditResinSlicingSource(bytes);
+    if (!same(meshAudit, anticipated.meshAudit) || (descriptor.meshAudit !== undefined && !same(descriptor.meshAudit, meshAudit))) throw error(409, 'The normalized source topology no longer matches its independently audited mesh.', 'RESIN_INPUT_GEOMETRY_CHANGED');
+    return { filePath: descriptor.filePath, sha256: anticipated.sha256, bytes: anticipated.bytes, bounds: measured.sourceBounds, meshAudit };
+  }
+
+  async _loadResinSliceProfile(slice) {
+    const settings = this.state.settings.resinEngine || {}, slotId = slice.operatorReview?.profileSlotId;
+    const profilePath = slotId ? settings.slots?.find(slot => slot.id === slotId)?.profilePath : settings.profilePath;
+    if (!profilePath) throw error(409, 'The reviewed resin profile is no longer configured.', 'RESIN_PROFILE_CHANGED');
+    const loaded = await require('../slicing/resin-engine').loadProfile(profilePath);
+    if (loaded.profileSha256 !== slice.profileSha256 || loaded.profile.printerId !== slice.printerId || loaded.profile.printerModel !== slice.printerModel || loaded.profile.material !== slice.material) throw error(409, 'The resin profile changed after this slice was captured.', 'RESIN_PROFILE_CHANGED');
+    return loaded;
+  }
+
+  async _verifyResinHollowEvidence(job, slice, { loaded, allowFreshEngineRecord = false, signal } = {}) {
+    signal?.throwIfAborted();
+    const reviewed = slice.operatorReview?.hollow, record = slice.hollowPreparation;
+    if (!reviewed && !record) return null;
+    if (!reviewed || !record || slice.operatorReview?.confirmedHollowPreparation !== true) throw error(409, 'Hollowed output requires its reviewed recipe and controlled native evidence.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
+    const review = require('./resin-hollow-review').normalizeResinHollowReview(reviewed), same = require('node:util').isDeepStrictEqual;
+    const profile = loaded || await this._loadResinSliceProfile(slice);
+    if (review.geometrySha256 !== slice.inputGeometry?.sha256 || review.profileSha256 !== profile.profileSha256 || record.profileSha256 !== profile.profileSha256 || record.inputs?.sourceBinding?.geometrySha256 !== review.geometrySha256 ||
+        !same(record.request?.hollowRequest, review.recipe) || !same(record.request?.supportRequest, review.supportRequest) || !same(record.request?.resolutionRequest, review.resolutionRequest) || record.request?.boundaryPolicy !== review.boundaryPolicy || record.request?.placement !== undefined) throw error(409, 'The hollow recipe, sized source, support authority or reviewed profile changed.', 'RESIN_HOLLOW_REVIEW_STALE');
+    const input = await this._resinGeometryInput(job), directory = path.join(this.dataDir, 'jobs', job.id, 'resin-slicing');
+    if (record.source?.sha256 !== input.engineSourceSha256) throw error(409, 'The hollow source no longer matches the reviewed original or derivative.', 'RESIN_HOLLOW_SOURCE_CHANGED');
+    const module = require('../slicing/resin-hollow-engine'), options = { source: input.source, directory, signal };
+    const binding = await module.inspectControlledResinHollowBindings(record, options);
+    let cacheEntry = this._resinHollowVerifications.get(job.id);
+    if (!cacheEntry || cacheEntry.bindingHash !== binding.bindingHash) {
+      if (!(allowFreshEngineRecord && module.isVerifiedControlledHollowPreparation?.(record, binding.bindingHash))) {
+        const checked = await module.verifyControlledResinHollowPreparation(record, options);
+        if (checked.bindingHash !== binding.bindingHash || checked.hollowPreparationSha256 !== record.sha256 || checked.sha256 !== record.roles?.final?.artifact?.sha256) throw error(409, 'Hollow verification did not confirm the complete current artifact bindings.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+      }
+      cacheEntry = { bindingHash: binding.bindingHash, preparationSha256: record.sha256 };
+      this._resinHollowVerifications.delete(job.id);
+      this._resinHollowVerifications.set(job.id, cacheEntry);
+      while (this._resinHollowVerifications.size > 128) this._resinHollowVerifications.delete(this._resinHollowVerifications.keys().next().value);
+    }
+    if (!slice.platePreparation) {
+      const pipelineTool = slice.rawSliceTool || slice.repairSliceTool || slice.tool;
+      if (binding.sha256 !== slice.sha256 || binding.bytes !== slice.bytes || !same(record.tool, pipelineTool)) throw error(409, 'The slice no longer matches its verified one-unit hollow artifact or tool.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+    } else if (slice.platePreparation.method !== 'controlled-hollow-reference-raster-replication-v1') throw error(409, 'Hollowed copies require the verified hollow reference replication method.', 'RESIN_HOLLOW_EVIDENCE_INVALID');
+    return { bindingHash: binding.bindingHash, source: input.source, directory, cacheEntry };
+  }
+
+  async _verifyResinPlateEvidence(job, slice, { loaded, artifactBytes, requested = slice.operatorReview?.plate, hollowEvidence, signal } = {}) {
+    signal?.throwIfAborted();
+    const copies = slice.modelCopiesPerRun;
+    if (!Number.isSafeInteger(copies) || copies < 1 || copies > 500) throw error(409, 'The slice must identify its actual bounded source-instance count.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    if (!requested && !slice.platePreparation && copies === 1) return 1;
+    if (!requested || !slice.platePreparation || !slice.sizingPlan || !slice.inputGeometry) throw error(409, 'Packed slices require the reviewed plate policy and independent placement evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    const policy = resinPlateRequest(requested);
+    if (copies > policy.copies) throw error(409, 'The artifact contains more source instances than requested.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    const profile = loaded || await this._loadResinSliceProfile(slice);
+    const bytes = artifactBytes || await this._resinSliceFile(job,slice);
+    if (slice.hollowPreparation || slice.platePreparation.method === 'controlled-hollow-reference-raster-replication-v1') {
+      const evidence = hollowEvidence || await this._verifyResinHollowEvidence(job, slice, { loaded: profile, signal });
+      if (!evidence || !slice.hollowPreparation || slice.platePreparation.method !== 'controlled-hollow-reference-raster-replication-v1') throw error(409, 'Hollowed plates require their exact controlled reference.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
+      const module = require('../slicing/resin-hollow-plate');
+      if (!evidence.cacheEntry.referenceCapability) evidence.cacheEntry.referenceCapability = await module.verifyResinHollowPlateReference(slice.hollowPreparation, { source: evidence.source, directory: evidence.directory, signal });
+      const checked = await module.verifyResinHollowPlatePreparation(evidence.source, slice.platePreparation, { hollowPreparation: slice.hollowPreparation, profile: profile.profile, ini: profile.ini, preset: profile.preset, artifactBytes: bytes, directory: evidence.directory, referenceCapability: evidence.cacheEntry.referenceCapability, signal });
+      const pipelineTool = slice.rawSliceTool || slice.repairSliceTool || slice.tool;
+      if (!checked || checked.modelCopiesPerRun !== copies || checked.layout?.copiesPlaced !== copies || checked.rasterProof?.copiesPerRun !== copies || checked.artifactSha256 !== slice.sha256 || checked.sourceSha256 !== slice.inputGeometry.sha256 || !require('node:util').isDeepStrictEqual(checked.requested, policy) || !require('node:util').isDeepStrictEqual(slice.platePreparation.tool, pipelineTool)) throw error(409, 'Hollow plate count, layout, exact raster proof or controlled tool changed.', 'RESIN_PLATE_EVIDENCE_INVALID');
+      return copies;
+    }
+    const normalized = await this._readResinGeometrySource({ ...job, inputPath: slice.inputGeometry.filePath, sha256: slice.inputGeometry.sha256 });
+    const checked = await require('../slicing/resin-plate-engine').verifyResinPlatePreparation(normalized,slice.platePreparation,{ profile: profile.profile, ini: profile.ini, preset: profile.preset, artifactBytes: bytes, directory: path.join(this.dataDir,'jobs',job.id,'resin-slicing') });
+    if (!checked || checked.modelCopiesPerRun !== copies || checked.layout?.copiesPlaced !== copies || checked.rasterProof?.copiesPerRun !== copies || checked.artifactSha256 !== slice.sha256 || checked.sourceSha256 !== slice.inputGeometry.sha256 || !require('node:util').isDeepStrictEqual(checked.requested,policy)) throw error(409, 'The layout, exact raster proof, reviewed request and artifact count disagree.', 'RESIN_PLATE_EVIDENCE_INVALID');
+    return copies;
+  }
+
+  async _verifyResinSizingEvidence(job, slice, options = {}) {
+    const isCad = /\.(step|stp)$/i.test(job.fileName);
+    const isRepair = !isCad && Boolean(job.resinRepair);
+    if (!isCad && (slice.cadPreparation || slice.meshSourceSha256 || slice.rawSliceTool)) throw error(409, 'Mesh-only slices cannot carry unrelated CAD evidence.', 'RESIN_CAD_CHANGED');
+    if (!isRepair && (slice.repairPreparation || slice.repairedSourceSha256 || slice.repairSliceTool || slice.operatorReview?.exactRepair)) throw error(409, 'This source cannot carry unrelated exact mesh repair evidence.', 'RESIN_REPAIR_CHANGED');
+    if (!slice.sizingPlan) {
+      if (slice.hollowPreparation || slice.operatorReview?.hollow || slice.operatorReview?.confirmedHollowPreparation !== undefined) throw error(409, 'Hollowed output requires its complete sized source and controlled preparation evidence.', 'RESIN_HOLLOW_EVIDENCE_REQUIRED');
+      if (isCad) throw error(409, 'STEP resin slices require source-bound CAD and sizing evidence.', 'RESIN_CAD_REQUIRED');
+      if (isRepair) throw error(409, 'Repaired resin slices require source-bound exact repair and sizing evidence.', 'RESIN_REPAIR_REQUIRED');
+      if (slice.platePreparation || slice.operatorReview?.plate || slice.modelCopiesPerRun > 1) throw error(409, 'Packed slices require normalized source sizing evidence.', 'RESIN_PLATE_EVIDENCE_INVALID');
+      if (slice.operatorReview?.confirmedOriginalSize !== true || (slice.operatorReview.sizing && slice.operatorReview.sizing.mode !== 'original')) throw error(409, 'Legacy resin slices require original-size review; resized slices need geometry evidence.', 'RESIN_SIZING_UNQUALIFIED');
+      await this._expectedResinGeometry(job, { mode: 'original' });
+      return;
+    }
+    if (slice.operatorReview?.confirmedSizing !== true) throw error(409, 'Confirm the exact geometry sizing plan before production.', 'RESIN_SIZING_UNQUALIFIED');
+    const expected = await this._expectedResinGeometry(job, slice.operatorReview.sizing);
+    if (isCad && (slice.sourceSha256 !== job.sha256 || slice.meshSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.embeddedUnits !== true || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.cadPreparation, expected.cadPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinCadSliceTool(slice.rawSliceTool, expected.cadPreparation)))) throw error(409, 'CAD source, conversion, slicing provider or reviewed units changed.', 'RESIN_CAD_CHANGED');
+    if (isRepair && (slice.sourceSha256 !== job.sha256 || slice.repairedSourceSha256 !== expected.engineSourceSha256 || slice.operatorReview.exactRepair !== true || slice.operatorReview.ticketUnits !== job.order.units || slice.operatorReview.units !== 'mm' || slice.operatorReview.unitScale !== 1 || !require('node:util').isDeepStrictEqual(slice.repairPreparation, expected.repairPreparation) || !require('node:util').isDeepStrictEqual(slice.tool, this._resinRepairSliceTool(slice.repairSliceTool, expected.repairPreparation)))) throw error(409, 'Original source, exact repair, slicing provider or reviewed units changed.', 'RESIN_REPAIR_CHANGED');
+    await this._verifyResinInputGeometry(job, slice, expected);
+    const hollowEvidence = await this._verifyResinHollowEvidence(job, slice, options);
+    await this._verifyResinPlateEvidence(job, slice, { ...options, hollowEvidence });
+  }
+
+  async getResinSliceDownload(id) {
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (job.technology !== 'resin') throw error(409, 'Select a resin ticket.', 'RESIN_TICKET_REQUIRED');
+      const bytes = await this._resinSliceFile(job);
+      await this._verifyResinSizingEvidence(job, job.resinSlice,{ artifactBytes: bytes });
+      if (digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed. Slice this ticket again.', 'ORIGINAL_CHANGED');
+      return { filePath: job.resinSlice.filePath, fileName: 'prepared-unqualified.goo', sha256: job.resinSlice.sha256, bytes: job.resinSlice.bytes };
+    });
+  }
+
+  async getResinRepairDownload(id) {
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (!job.resinRepair) throw error(409, 'No explicitly repaired mesh is available.', 'RESIN_REPAIR_REQUIRED');
+      const input = await this._resinGeometryInput(job);
+      if (!input.repairPreparation) throw error(409, 'This source has no verified exact mesh repair.', 'RESIN_REPAIR_REQUIRED');
+      return { filePath: input.inputPath, fileName: 'repaired-unqualified.stl', sha256: input.engineSourceSha256, bytes: input.source.length };
+    });
+  }
+
+  createResinPermitIssuer({ reauthorize } = {}) {
+    this._assertReady();
+    if (typeof reauthorize !== 'function') throw error(400, 'A trusted pre-start authorization reader is required.', 'RESIN_AUTHORITY_REQUIRED');
+    const issuer = Object.freeze({});
+    this._resinPermitIssuers.set(issuer, { reauthorize });
+    return issuer;
+  }
+
+  _resinIssuer(issuer) {
+    const authority = this._resinPermitIssuers.get(issuer);
+    if (!authority) throw error(403, 'Only the connected production authority can authorize a resin run.', 'RESIN_AUTHORITY_REQUIRED');
+    return authority;
+  }
+
+  _invalidateResinPermits(id) {
+    for (const [key, permit] of this._resinDispatchPermits) if (permit.id === id) this._resinDispatchPermits.delete(key);
+  }
+
+  async inspectResinPrinter(printerId) {
+    return this._withLocks([`printer:${printerId}`], async () => {
+      const printer = this._printer(printerId);
+      const adapter = await this._adapter(printer);
+      if (printer.type !== 'sdcp' || typeof adapter.attributes !== 'function') throw error(409, 'Select an SDCP resin printer with readable identity attributes.', 'RESIN_PRINTER_REQUIRED');
+      const attributes = await adapter.attributes();
+      const { canonicalSDCPDevice, fingerprintSDCPDevice } = require('../adapters/sdcp-identity');
+      return { deviceFingerprint: fingerprintSDCPDevice(printer, attributes), device: canonicalSDCPDevice(printer, attributes), printerFingerprint: configurationFingerprint(printer) };
+    });
+  }
+
+  async _resinDispatchBindings(job, receipt, deviceFingerprint) {
+    const slice = job.resinSlice;
+    const copies = slice?.modelCopiesPerRun;
+    if (job.technology !== 'resin' || !job.order || !SHA256.test(job.order.ticketFingerprint || '') || !slice || slice.format !== 'goo' || !Number.isSafeInteger(copies) || copies < 1 || copies > 500 || (copies > 1 && (!slice.platePreparation || !slice.operatorReview?.plate)) || slice.inspection?.validatedLayerData !== true || slice.operatorReview?.confirmedRequirements !== true || (slice.sizingPlan ? slice.operatorReview.confirmedSizing !== true : slice.operatorReview.confirmedOriginalSize !== true) || slice.operatorReview.ticketFingerprint !== job.order.ticketFingerprint || slice.analysis?.passed !== true || slice.analysis.count !== 0 || !Array.isArray(slice.analysis.issues) || slice.analysis.issues.length !== 0 || !Array.isArray(slice.analysis.checks) || RESIN_ANALYSIS_CHECKS.some(check => !slice.analysis.checks.includes(check)) || !SHA256.test(slice.tool?.executableSha256 || '')) throw error(409, 'A validated issue-free slice with verified source-instance count is required.', 'RESIN_SLICE_UNQUALIFIED');
+    if (!SHA256.test(deviceFingerprint || '') || !receipt || receipt.kind !== 'slice' || !UUID.test(receipt.id || '') || receipt.jobId !== job.order.portalJobId || receipt.ticketFingerprint !== job.order.ticketFingerprint || receipt.sourceSha256 !== job.sha256 || receipt.profileSha256 !== slice.profileSha256 || receipt.tool?.executableSha256 !== slice.tool.executableSha256 || receipt.printerId !== slice.printerId || receipt.printerModel !== slice.printerModel || receipt.material !== slice.material || receipt.artifact?.sha256 !== slice.sha256 || receipt.artifact?.sizeBytes !== slice.bytes || receipt.artifact?.format !== 'goo' || receipt.partsPerRun !== copies || receipt.deviceFingerprint !== deviceFingerprint || receipt.printReady !== false) throw error(409, 'The portal receipt does not identify this exact slice, profile, plate count and printer.', 'RESIN_RECEIPT_MISMATCH');
+    if (slice.sourceSha256 !== job.sha256 || job.order.modelSha256 !== job.sha256 || digest(await fs.readFile(job.inputPath)) !== job.sha256) throw error(409, 'The original model changed after resin preparation.', 'ORIGINAL_CHANGED');
+    const bytes = await this._resinSliceFile(job), loaded = await this._loadResinSliceProfile(slice);
+    await this._verifyResinSizingEvidence(job, slice,{ loaded,artifactBytes: bytes });
+    const module = require('../slicing/resin-engine');
+    const inspection = require('../slicing/goo').inspectGoo(bytes, { limits: { maxFileBytes: 512 * 1024 * 1024 }, expected: { ...loaded.profile.expected, machineZMm: Number(loaded.ini.max_print_height), machineName: loaded.profile.printerModel, exposureTimeSeconds: loaded.profile.uvtoolsProperties.ExposureTime, bottomExposureTimeSeconds: loaded.profile.uvtoolsProperties.BottomExposureTime, bottomLayerCount: loaded.profile.uvtoolsProperties.BottomLayerCount } });
+    module.assertTargetProperties(inspection, loaded.profile.uvtoolsProperties);
+    if (inspection.perLayerSettings || inspection.sha256 !== slice.sha256) throw error(409, 'The resin artifact does not match its reviewed global profile.', 'RESIN_SLICE_UNQUALIFIED');
+    return { receiptId: receipt.id, sourceSha256: job.sha256, artifactSha256: slice.sha256, profileSha256: slice.profileSha256, engineSha256: slice.tool.executableSha256, printerId: slice.printerId, printerModel: slice.printerModel, material: slice.material, format: 'goo', deviceFingerprint, partsPerRun: copies };
+  }
+
+  async adoptResinPreparationTarget(issuer, id, { ticket, confirmedTarget, observedAt } = {}) {
+    this._resinIssuer(issuer);
+    if (confirmedTarget !== true) throw error(400, 'Confirm the current studio-authorized replacement target before reopening preparation.', 'RESIN_TARGET_REVIEW_REQUIRED');
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (job.technology !== 'resin' || !job.order?.ticketFingerprint) throw error(409, 'Select an imported resin production ticket.', 'RESIN_TICKET_REQUIRED');
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'Resolve the active or uncertain run before adopting a replacement target.', 'JOB_BUSY');
+      if (!fresh(observedAt)) throw error(409, 'Refresh the studio production target before adopting it.', 'RESIN_AUTHORIZATION_STALE');
+      if (!ticket?.production?.target || ticket.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint ||
+          !Number.isSafeInteger(ticket.version) || ticket.version < 1 || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.ticket?.specifications?.production?.printType !== 'resin') throw error(409, 'The current production target does not belong to this frozen resin ticket.', 'RESIN_TARGET_INVALID');
+      const target = resinTarget(job, ticket), previousTarget = job.resinProduction?.target || resinTarget(job);
+      if (ticket.status !== (target.requiredParts > 0 ? 'preparing' : 'post_processing') || ticket.production.approvedReceiptId || ticket.production.approvedTargetId || ticket.production.run?.status === 'printing') throw error(409, 'Adopt an unapproved, stopped studio replacement target in preparation or finishing.', 'RESIN_TARGET_INVALID');
+      if (target.id === previousTarget.id) {
+        if (!sameTarget(target, previousTarget)) throw error(409, 'The immutable production target details changed under the same identity.', 'RESIN_TARGET_MISMATCH');
+        // A delayed repeat must not clear the current target's newer approval.
+        return publicValue(clone(job));
+      }
+      if (target.kind !== 'replacement' || target.cycle <= previousTarget.cycle) throw error(409, 'A replacement target requires a newer studio-authorized QC cycle.', 'RESIN_TARGET_INVALID');
+      if ((job.resinProduction?.targetHistory || []).some(item => item.target?.id === target.id) || job.runs.some(run => run.targetId === target.id)) throw error(409, 'An earlier production target identity cannot be reused.', 'RESIN_TARGET_MISMATCH');
+      return this._mutate(() => {
+        const current = this._job(id);
+        this._quantities(current);
+        const production = current.resinProduction;
+        production.targetHistory ||= [];
+        production.targetHistory.push({ target: clone(previousTarget), printedParts: production.printedParts, localPrintedParts: production.localPrintedParts, baselinePrintedParts: production.baselinePrintedParts || 0 });
+        delete production.baselinePrintedParts;
+        delete production.authorization;
+        delete production.portalProgress;
+        delete production.plan;
+        production.target = target;
+        production.targetVerified = true;
+        this._quantities(current);
+        this._invalidateResinPermits(id);
+        this._transition(current, 'review', 'Adopted the studio replacement target. Source, captured slice and prior production remain available; preparation can now be revised.');
+        return publicValue(current);
+      });
+    });
+  }
+
+  async applyResinPlateRemainder(issuer, id, { ticket, runId, observedAt } = {}) {
+    this._resinIssuer(issuer);
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id), production = job.resinProduction, run = job.runs.find(item => item.id === runId && item.technology === 'resin');
+      if (!fresh(observedAt)) throw error(409, 'Refresh the confirmed portal plate result before reopening preparation.', 'RESIN_AUTHORIZATION_STALE');
+      const target = production?.target || resinTarget(job), remote = ticket?.production?.run;
+      if (job.technology !== 'resin' || !run || !run.resolvedAt || run.outcome !== 'completed' || run.reconciliation?.outcome !== 'completed' || run.reconciliation.printedParts !== run.printedParts || !Number.isSafeInteger(run.printedParts) || run.printedParts < 1 || !Number.isSafeInteger(run.plannedParts) || run.plannedParts < 2 || run.plannedParts > 500 || run.printedParts > run.plannedParts || !Number.isSafeInteger(run.portalVersion) || run.portalVersion < 1 || !run.startEvidence || run.terminalEvidence?.outcome !== 'completed' || !this._matchesRun(run.startEvidence,run) || !this._matchesRun(run.terminalEvidence,run) ||
+          (run.targetId || job.order.portalJobId) !== target.id || ticket?.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.ticket?.specifications?.production?.printType !== 'resin' || !ticket.production?.target || !sameTarget(resinTarget(job,ticket),target) || !Number.isSafeInteger(ticket.version) || ticket.version < 1 || remote?.status !== 'completed') throw error(409, 'The portal did not confirm this identified completed plate and immutable production target.', 'RESIN_REMAINDER_UNCONFIRMED');
+      const expected = { runId: run.id, targetId: target.id, receiptId: run.receiptId, artifactSha256: run.artifactSha256, remoteId: run.startEvidence.remoteId, printerId: run.printerId, deviceFingerprint: run.deviceFingerprint, plannedParts: run.plannedParts, printedParts: run.printedParts };
+      if (Object.entries(expected).some(([key,value]) => remote[key] !== value)) throw error(409, 'The portal plate result identifies different physical production evidence.', 'RESIN_REMAINDER_UNCONFIRMED');
+      const previous = production.remainderRelease;
+      if (previous?.runId === run.id && previous.version === ticket.version && previous.receiptId === run.receiptId) return publicValue(clone(job));
+      const plan = production.plan, quantities = clone(job); this._quantities(quantities);
+      const local = quantities.resinProduction, progress = ticket.production.progress;
+      if (!['review','cancelled'].includes(job.status) || this._currentRun(job) || ticket.status !== 'preparing' || ticket.production.approvedReceiptId || ticket.production.approvedTargetId || !progress || progress.requestedParts !== target.requiredParts || progress.printedParts !== local.printedParts || progress.remainingParts !== local.remainingParts || !Number.isSafeInteger(progress.remainingParts) || progress.remainingParts < 1 || progress.remainingParts >= run.plannedParts ||
+          !plan || plan.receiptId !== run.receiptId || plan.artifactSha256 !== run.artifactSha256 || plan.deviceFingerprint !== run.deviceFingerprint || plan.printerId !== run.printerId || plan.partsPerRun !== run.plannedParts || plan.targetId !== target.id) throw error(409, 'A smaller remainder requires this exact stopped plate, confirmed counts and its previous preparation plan.', 'RESIN_REMAINDER_UNCONFIRMED');
+      if (ticket.version <= Math.max(plan.approvalVersion || 0,plan.approvalExpectedVersion || 0,run.portalVersion,previous?.version || 0)) throw error(409, 'An older portal result cannot release a newer preparation generation.', 'RESIN_REMAINDER_STALE');
+      return this._mutate(() => {
+        const current = this._job(id), currentProduction = current.resinProduction, currentPlan = currentProduction.plan;
+        currentProduction.remainderRelease = { id: crypto.randomUUID(), runId: run.id, version: ticket.version, receiptId: run.receiptId, artifactSha256: run.artifactSha256, targetId: target.id, observedAt, releasedAt: this._now() };
+        for (const field of ['approvalState','approvalRequestedAt','approvedAt','approvalVersion','approvalExpectedVersion','approvalOperationId']) delete currentPlan[field];
+        delete currentProduction.authorization;
+        currentProduction.portalProgress = clone(progress);
+        this._invalidateResinPermits(id);
+        this._transition(current,'review','The portal confirmed a smaller production remainder. Prepare a newly reviewed plate for the remaining units.');
+        return publicValue(current);
+      });
+    });
+  }
+
+  async reviewResinProductionPlan(issuer, id, { receipt, deviceFingerprint, confirmedWholeModel, ticket } = {}) {
+    this._resinIssuer(issuer);
+    if (confirmedWholeModel !== true) throw error(400, 'Confirm that the entire imported source model represents one ordered production unit.', 'RESIN_UNIT_PLAN_REQUIRED');
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (!['review', 'cancelled'].includes(job.status) || this._currentRun(job)) throw error(409, 'Resolve this job before reviewing its production plan.', 'JOB_BUSY');
+      const bindings = await this._resinDispatchBindings(job, receipt, deviceFingerprint);
+      const target = resinTarget(job, ticket), previousTarget = job.resinProduction?.target || resinTarget(job);
+      if (ticket && (ticket.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.status !== 'preparing')) throw error(409, 'Review a current preparing ticket before changing its production plan.', 'RESIN_TARGET_INVALID');
+      const changedTarget = target.id !== previousTarget.id;
+      if (!changedTarget && job.resinProduction?.targetVerified && (!ticket?.production?.target || !sameTarget(target, previousTarget))) throw error(409, 'The immutable production target details changed under the same identity.', 'RESIN_TARGET_MISMATCH');
+      if (changedTarget && (!ticket || target.kind !== 'replacement' || target.cycle <= previousTarget.cycle)) throw error(409, 'A new replacement target requires an explicit studio-authorized QC cycle.', 'RESIN_TARGET_INVALID');
+      if (changedTarget && ((job.resinProduction?.targetHistory || []).some(item => item.target?.id === target.id) || job.runs.some(run => run.targetId === target.id))) throw error(409, 'An earlier production target identity cannot be reused.', 'RESIN_TARGET_MISMATCH');
+      if (target.requiredParts < 1) throw error(409, 'This correction target authorizes finishing work without another physical print.', 'RESIN_TARGET_COMPLETE');
+      const quantityView = clone(job); this._quantities(quantityView);
+      if (bindings.partsPerRun > (changedTarget ? target.requiredParts : quantityView.resinProduction.remainingParts)) throw error(409, 'This plate contains more instances than the current production target needs.', 'QUANTITY_EXCEEDED');
+      const previousPlan = job.resinProduction?.plan;
+      if (!changedTarget && ['pending', 'approved'].includes(previousPlan?.approvalState) && Object.entries(bindings).some(([key, value]) => previousPlan[key] !== value)) throw error(409, 'Resolve the current preparation approval before replacing its production plan.', 'RESIN_APPROVAL_LOCKED');
+      return this._mutate(() => {
+        const current = this._job(id);
+        current.resinProduction ||= {};
+        if (changedTarget) {
+          current.resinProduction.targetHistory ||= [];
+          current.resinProduction.targetHistory.push({ target: clone(previousTarget), printedParts: current.resinProduction.printedParts || 0 });
+          delete current.resinProduction.baselinePrintedParts;
+          delete current.resinProduction.authorization;
+        }
+        current.resinProduction.target = target;
+        current.resinProduction.targetVerified = Boolean(ticket?.production?.target);
+        this._quantities(current);
+        current.resinProduction.plan = { ...(changedTarget ? {} : previousPlan), ...bindings, ...targetFields(target), confirmedWholeModel: true, reviewedAt: this._now() };
+        this._invalidateResinPermits(id);
+        this._transition(current, 'review', 'One source instance represents one ordered unit. Authoritative qualification and per-run printer readiness are still required.');
+        return publicValue(current);
+      });
+    });
+  }
+
+  async withResinPreparationEvidence(issuer, id, { receipt, deviceFingerprint, operationId, expectedVersion } = {}, operation) {
+    this._resinIssuer(issuer);
+    if (typeof operation !== 'function') throw error(400, 'A trusted preparation approval operation is required.', 'RESIN_APPROVAL_OPERATION_REQUIRED');
+    return this._withLocks([`job:${id}`], async () => {
+      const job = this._job(id);
+      if (job.status !== 'review' || this._currentRun(job)) throw error(409, 'Resolve this job before sending preparation approval.', 'JOB_BUSY');
+      const bindings = await this._resinDispatchBindings(job, receipt, deviceFingerprint);
+      const plan = job.resinProduction?.plan;
+      if (!plan || plan.confirmedWholeModel !== true || Object.entries(bindings).some(([key, value]) => plan[key] !== value)) throw error(409, 'The preparation evidence no longer matches the reviewed production plan.', 'RESIN_APPROVAL_PLAN_MISMATCH');
+      if (plan.approvalState === 'approved') throw error(409, 'This preparation approval is already committed. Replay its saved operation instead of issuing another approval.', 'RESIN_APPROVAL_LOCKED');
+      if (plan.approvalState === 'pending' && plan.approvalOperationId && plan.approvalOperationId !== operationId) throw error(409, 'A pending approval belongs to another saved operation.', 'RESIN_APPROVAL_LOCKED');
+      const releasedVersion = Math.max(plan.withdrawalVersion || 0,job.resinProduction?.remainderRelease?.version || 0);
+      if (releasedVersion && (!Number.isSafeInteger(expectedVersion) || expectedVersion < releasedVersion)) throw error(409, 'Refresh the reopened preparation before sending another approval.', 'RESIN_AUTHORIZATION_STALE');
+      if (expectedVersion !== undefined && (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1 || (plan.approvalState === 'pending' && plan.approvalExpectedVersion && plan.approvalExpectedVersion !== expectedVersion))) throw error(409, 'The approval operation must retain its expected portal version.', 'RESIN_APPROVAL_PLAN_MISMATCH');
+      await this._mutate(() => {
+        const current = this._job(id);
+        current.resinProduction.plan.approvalState = 'pending';
+        if (operationId !== undefined) {
+          if (!UUID.test(operationId)) throw error(409, 'Preparation approval requires its saved operation identity.', 'RESIN_APPROVAL_OPERATION_REQUIRED');
+          current.resinProduction.plan.approvalOperationId = operationId;
+        }
+        if (expectedVersion !== undefined) current.resinProduction.plan.approvalExpectedVersion = expectedVersion;
+        current.resinProduction.plan.approvalRequestedAt = this._now();
+      });
+      // Keep the job lock until both RPC and local acknowledgement persist.
+      // Any error after invocation leaves the durable pending state intact;
+      // the same remote operation must be replayed, never assumed unsent.
+      const result = await operation();
+      const ticket = result?.ticket;
+      if (!ticket || ticket.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.status !== 'queued' || !Number.isSafeInteger(ticket.version) || ticket.version < 1 || ticket.production?.approvedReceiptId !== bindings.receiptId || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity) throw error(409, 'The portal did not confirm this exact queued preparation approval. Replay its saved operation.', 'RESIN_APPROVAL_UNCONFIRMED');
+      if (resinTarget(job, ticket).id !== plan.targetId || (ticket.production?.target && (ticket.production.approvedTargetId !== plan.targetId || (job.resinProduction.targetVerified && !sameTarget(resinTarget(job, ticket), job.resinProduction.target))))) throw error(409, 'The portal approval refers to another production target.', 'RESIN_TARGET_MISMATCH');
+      await this._mutate(() => {
+        const current = this._job(id);
+        current.resinProduction.plan.approvalState = 'approved';
+        current.resinProduction.plan.approvedAt = this._now();
+        current.resinProduction.plan.approvalVersion = ticket.version;
+      });
+      return result;
+    });
+  }
+
+  async releaseResinPreparationApproval(issuer, id, { receiptId, operationId } = {}) {
+    this._resinIssuer(issuer);
+    return this._withLocks([`job:${id}`], () => this._mutate(() => {
+      const job = this._job(id), plan = job.resinProduction?.plan;
+      if (!UUID.test(receiptId || '') || !plan || plan.receiptId !== receiptId || this._currentRun(job)) throw error(409, 'The dismissed operation does not match this pending preparation approval.', 'RESIN_APPROVAL_PLAN_MISMATCH');
+      if (plan.approvalOperationId && operationId !== plan.approvalOperationId) throw error(409, 'This dismissal refers to an older preparation generation.', 'RESIN_APPROVAL_PLAN_MISMATCH');
+      if (plan.approvalState === 'approved') throw error(409, 'A confirmed portal approval cannot be released as an unsent operation.', 'RESIN_APPROVAL_RELEASE_FORBIDDEN');
+      this._invalidateResinPermits(id);
+      delete plan.approvalState;
+      delete plan.approvalRequestedAt;
+      delete plan.approvedAt;
+      delete plan.approvalVersion;
+      delete plan.approvalExpectedVersion;
+      delete plan.approvalOperationId;
+      plan.approvalReleasedAt = this._now();
+      return publicValue(job);
+    }));
+  }
+
+  async applyResinPreparationWithdrawal(issuer, id, { ticket, receiptId, operationId, withdrawalVersion } = {}) {
+    this._resinIssuer(issuer);
+    return this._withLocks([`job:${id}`], () => this._mutate(() => {
+      const job = this._job(id), plan = job.resinProduction?.plan;
+      if (!plan || !UUID.test(operationId || '') || plan.receiptId !== receiptId || this._currentRun(job) || ticket?.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint ||
+          ticket.status !== 'preparing' || !Number.isSafeInteger(ticket.version) || ticket.production?.approvedReceiptId || ticket.production?.approvedTargetId || ticket.production?.run?.status === 'printing' || resinTarget(job, ticket).id !== plan.targetId ||
+          (job.resinProduction.targetVerified && (!ticket.production?.target || !sameTarget(resinTarget(job, ticket), job.resinProduction.target)))) throw error(409, 'The portal did not confirm withdrawal of this stopped preparation target.', 'RESIN_WITHDRAWAL_UNCONFIRMED');
+      if (plan.withdrawalOperationId === operationId) return publicValue(job);
+      const confirmedVersion = withdrawalVersion ?? ticket.version;
+      if (!Number.isSafeInteger(confirmedVersion) || confirmedVersion > ticket.version || confirmedVersion <= Math.max(plan.approvalVersion || 0, plan.approvalExpectedVersion || 0, plan.withdrawalVersion || 0)) throw error(409, 'An older withdrawal cannot clear a newer preparation approval.', 'RESIN_WITHDRAWAL_STALE');
+      this._invalidateResinPermits(id);
+      plan.approvalState = 'withdrawn'; plan.withdrawalOperationId = operationId; plan.withdrawalVersion = confirmedVersion; plan.withdrawnAt = this._now();
+      delete plan.approvalRequestedAt; delete plan.approvedAt; delete plan.approvalVersion; delete plan.approvalOperationId; delete plan.approvalExpectedVersion;
+      delete job.resinProduction.authorization;
+      this._transition(job, 'review', 'Portal preparation withdrawn. The original ticket and production history are preserved.');
+      return publicValue(job);
+    }));
+  }
+
+  _validateResinAuthorization(job, bindings, proof, previous) {
+    const { authorization, receipt, ticket } = proof || {};
+    const progress = ticket?.production?.progress;
+    const target = resinTarget(job, ticket);
+    if (job.resinProduction?.targetVerified && (!ticket?.production?.target || !sameTarget(target, job.resinProduction.target))) throw error(409, 'The fresh proof changed immutable production target details.', 'RESIN_TARGET_MISMATCH');
+    const checked = Date.parse(authorization?.checkedAt);
+    const expires = Date.parse(authorization?.expiresAt);
+    if (!authorization || authorization.qualified !== true || !fresh(authorization.checkedAt) || !Number.isFinite(expires) || expires <= Date.now() || expires - checked > 35000 || expires <= checked || !SHA256.test(authorization.qualificationFingerprint || '') || !ticket || ticket.id !== job.order.portalJobId || ticket.ticketFingerprint !== job.order.ticketFingerprint || ticket.status !== 'queued' || !Number.isSafeInteger(ticket.version) || ticket.version < 1 || ticket.production?.approvedReceiptId !== bindings.receiptId || ticket.ticket?.specifications?.project?.quantity !== job.order.requestedQuantity || ticket.ticket?.specifications?.production?.printType !== 'resin' || !progress || progress.requestedParts !== target.requiredParts || !Number.isSafeInteger(progress.printedParts) || progress.printedParts < 0 || !Number.isSafeInteger(progress.remainingParts) || progress.remainingParts < 1 || progress.printedParts + progress.remainingParts !== progress.requestedParts) throw error(409, 'The portal did not provide current qualified authorization for a queued resin unit.', 'RESIN_AUTHORIZATION_REQUIRED');
+    if (bindings.partsPerRun > progress.remainingParts) throw error(409, 'The qualified plate exceeds the authoritative production remainder.', 'RESIN_AUTHORIZATION_MISMATCH');
+    const expected = { jobVersion: ticket.version, ticketFingerprint: job.order.ticketFingerprint, receiptId: bindings.receiptId, sourceSha256: bindings.sourceSha256, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, engineSha256: bindings.engineSha256, deviceFingerprint: bindings.deviceFingerprint, printerId: bindings.printerId, printerModel: bindings.printerModel, material: bindings.material, format: bindings.format, partsPerRun: bindings.partsPerRun, plannedParts: bindings.partsPerRun, remainingParts: progress.remainingParts };
+    if (ticket.production?.target || authorization.targetId !== undefined) Object.assign(expected, targetFields(target));
+    if (ticket.production?.target && ticket.production.approvedTargetId !== target.id) throw error(409, 'The approved receipt belongs to another production target.', 'RESIN_TARGET_MISMATCH');
+    if (Object.entries(expected).some(([key, value]) => authorization[key] !== value) || !receipt || receipt.id !== bindings.receiptId) throw error(409, 'The fresh authorization does not match this production plan.', 'RESIN_AUTHORIZATION_MISMATCH');
+    if (previous && (authorization.qualificationFingerprint !== previous.qualificationFingerprint || authorization.jobVersion !== previous.jobVersion || (previous.targetId && previous.targetId !== target.id))) throw error(409, 'Production qualification, target or portal version changed before start.', 'RESIN_AUTHORIZATION_CHANGED');
+    return { authorization: { ...clone(authorization), ...targetFields(target) }, progress: clone(progress), target };
+  }
+
+  async issueResinDispatchPermit(issuer, id, { printerId, authorization, receipt, ticket, deviceFingerprint, observedAt } = {}) {
+    this._resinIssuer(issuer);
+    return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
+      if (this.state.settings.resinEngine?.dispatchEnabled !== true) throw error(409, 'Qualified resin dispatch is disabled in local Settings.', 'RESIN_DISPATCH_DISABLED');
+      const job = this._job(id), printer = this._printer(printerId);
+      if (job.status !== 'review' || this._currentRun(job) || printer.type !== 'sdcp') throw error(409, 'The resin ticket and SDCP printer are not available for a new run.', 'JOB_NOT_READY');
+      if (!fresh(observedAt)) throw error(409, 'Refresh production authorization before requesting a start permit.', 'RESIN_AUTHORIZATION_STALE');
+      const bindings = await this._resinDispatchBindings(job, receipt, deviceFingerprint);
+      if (bindings.printerId !== printer.id) throw error(409, 'The qualified slice is bound to a different local printer. Bind the profile to this printer and prepare it again.', 'RESIN_PRINTER_BINDING_MISMATCH');
+      const plan = job.resinProduction?.plan;
+      if (!plan || plan.confirmedWholeModel !== true || Object.entries(bindings).some(([key, value]) => plan[key] !== value)) throw error(409, 'Review the exact single-unit production plan before authorizing a run.', 'RESIN_UNIT_PLAN_REQUIRED');
+      const checked = this._validateResinAuthorization(job, bindings, { authorization, receipt, ticket });
+      if (ticket.version <= Math.max(plan.withdrawalVersion || 0,job.resinProduction?.remainderRelease?.version || 0) || ticket.version < (plan.approvalVersion || 0)) throw error(409, 'Refresh production authorization after the latest preparation change.', 'RESIN_AUTHORIZATION_STALE');
+      if ((plan.targetId || job.order.portalJobId) !== checked.target.id || (job.resinProduction?.target?.id || job.order.portalJobId) !== checked.target.id) throw error(409, 'Review this exact current production target before another run.', 'RESIN_TARGET_MISMATCH');
+      const adapter = await this._adapter(printer);
+      if (typeof adapter.attributes !== 'function') throw error(409, 'The printer cannot provide qualified SDCP identity.', 'RESIN_PRINTER_REQUIRED');
+      const actual = require('../adapters/sdcp-identity').fingerprintSDCPDevice(printer, await adapter.attributes());
+      if (actual !== deviceFingerprint) throw error(409, 'The actual SDCP printer identity differs from the qualified device.', 'RESIN_DEVICE_MISMATCH');
+      const quantityView = clone(job);
+      this._quantities(quantityView);
+      const local = quantityView.resinProduction;
+      const baseline = local.baselinePrintedParts ?? checked.progress.printedParts - local.localPrintedParts;
+      if (!Number.isSafeInteger(baseline) || baseline < 0 || baseline + local.localPrintedParts !== checked.progress.printedParts) throw error(409, 'The portal has not confirmed the local printed-unit progress.', 'RESIN_PORTAL_PROGRESS_UNCONFIRMED');
+      await this._mutate(() => {
+        const current = this._job(id);
+        current.resinProduction.baselinePrintedParts = baseline;
+        current.resinProduction.target = checked.target;
+        current.resinProduction.targetVerified = Boolean(ticket.production?.target);
+        current.resinProduction.plan.approvalState = 'approved';
+        current.resinProduction.plan.approvalVersion = Math.max(current.resinProduction.plan.approvalVersion || 0, ticket.version);
+        current.resinProduction.portalProgress = checked.progress;
+        current.resinProduction.authorization = { ...checked.authorization, observedAt };
+        this._quantities(current);
+      });
+      for (const [key, value] of this._resinDispatchPermits) if (value.expires <= Date.now()) this._resinDispatchPermits.delete(key);
+      if (this._resinDispatchPermits.size >= 100) throw error(429, 'Too many unconsumed resin permits. Wait for them to expire.', 'RESIN_PERMIT_LIMIT');
+      const permitId = crypto.randomUUID(), expires = Math.min(Date.now() + 30000, Date.parse(authorization.expiresAt));
+      this._resinDispatchPermits.set(permitId, { id, printerId, issuer, receipt: clone(receipt), authorization: checked.authorization, target: checked.target, bindings, printerFingerprint: configurationFingerprint(printer), expires });
+      return { permitId, expiresAt: new Date(expires).toISOString(), jobId: id, printerId };
+    });
+  }
+
+  async dispatchQualifiedResinJob(id, { permitId, confirmedReady } = {}) {
+    if (confirmedReady !== true) throw error(400, 'Explicitly confirm physical printer readiness for this individual run.', 'CONFIRMATION_REQUIRED');
+    const initial = this._resinDispatchPermits.get(permitId);
+    if (!initial || initial.id !== id) throw error(409, 'A fresh one-use production permit is required.', 'RESIN_PERMIT_REQUIRED');
+    return this._withLocks([`job:${id}`, `printer:${initial.printerId}`], async () => {
+      const permit = this._resinDispatchPermits.get(permitId);
+      this._resinDispatchPermits.delete(permitId);
+      if (!permit || permit.id !== id || permit.expires <= Date.now()) throw error(409, 'The one-use resin permit expired or was consumed.', 'RESIN_PERMIT_EXPIRED');
+      const authority = this._resinIssuer(permit.issuer);
+      const job = this._job(id), printer = this._printer(permit.printerId);
+      if (!sameTarget(job.resinProduction?.target || resinTarget(job), permit.target) || (job.resinProduction?.plan?.targetId || job.order.portalJobId) !== permit.target.id ||
+          Object.entries(targetFields(permit.target)).some(([key, value]) => job.resinProduction?.plan?.[key] !== undefined && job.resinProduction.plan[key] !== value)) throw error(409, 'The production target changed after this permit was issued.', 'RESIN_TARGET_MISMATCH');
+      if (this.state.settings.resinEngine?.dispatchEnabled !== true) throw error(409, 'Qualified resin dispatch is disabled.', 'RESIN_DISPATCH_DISABLED');
+      if (job.resinProduction?.plan?.approvalState !== 'approved') throw error(409, 'The local preparation has been withdrawn or is no longer approved.', 'RESIN_APPROVAL_LOCKED');
+      if (job.status !== 'review' || this._currentRun(job) || this.state.jobs.some(other => other.id !== id && other.printerId === printer.id && this._currentRun(other))) throw error(409, 'Resolve this printer’s active or uncertain job before starting another unit.', 'PRINTER_BUSY');
+      if (configurationFingerprint(printer) !== permit.printerFingerprint) throw error(409, 'Printer configuration changed after authorization.', 'PRINTER_MISMATCH');
+      const bindings = await this._resinDispatchBindings(job, permit.receipt, permit.bindings.deviceFingerprint);
+      if (JSON.stringify(bindings) !== JSON.stringify(permit.bindings)) throw error(409, 'The approved production artifact changed.', 'RESIN_RECEIPT_MISMATCH');
+      const adapter = await this._adapter(printer);
+      const identity = require('../adapters/sdcp-identity');
+      const inspectDevice = async () => {
+        const attributes = await adapter.attributes();
+        if (identity.fingerprintSDCPDevice(printer, attributes) !== permit.bindings.deviceFingerprint || !attributes.Capabilities?.includes('PRINT_CONTROL') || !attributes.Capabilities?.includes('FILE_TRANSFER') || !attributes.SupportFileType?.some(format => String(format).toLowerCase() === 'goo')) throw error(409, 'Printer identity, firmware or GOO capabilities changed.', 'RESIN_DEVICE_MISMATCH');
+        const status = this._status(await adapter.status(), true);
+        if (status.state !== 'idle' || !fresh(status.observedAt)) throw error(409, 'The printer must report fresh idle telemetry.', 'PRINTER_NOT_READY');
+      };
+      if (adapter.capabilities?.upload !== true || adapter.capabilities?.start !== true || typeof adapter.attributes !== 'function') throw error(409, 'The SDCP adapter cannot upload and start qualified resin files.', 'CAPABILITY_UNSUPPORTED');
+      await inspectDevice();
+      if (permit.expires <= Date.now()) throw error(409, 'Refresh the resin permit before transfer.', 'RESIN_PERMIT_EXPIRED');
+      const runId = crypto.randomUUID(), remoteName = `qp-${id.slice(0, 8)}-${runId.slice(0, 8)}-prepared.goo`;
+      await this._mutate(() => {
+        const current = this._job(id);
+        current.printerId = printer.id;
+        current.runs.push({ id: runId, technology: 'resin', ...targetFields(permit.target), printerId: printer.id, printerType: 'sdcp', printerFingerprint: permit.printerFingerprint, phase: 'uploading', createdAt: this._now(), artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, receiptId: bindings.receiptId, deviceFingerprint: bindings.deviceFingerprint, qualificationFingerprint: permit.authorization.qualificationFingerprint, plannedParts: bindings.partsPerRun, portalVersion: permit.authorization.jobVersion, fileName: remoteName });
+        current.currentRunId = runId;
+        delete current.error;
+          this._transition(current, 'dispatching', 'Qualified plate dispatch intent saved before transfer.', { runId });
+      });
+      let startRequested = false;
+      try {
+        const upload = await adapter.upload({ filePath: job.resinSlice.filePath, fileName: remoteName });
+        if (!upload?.remotePath || basename(upload.remotePath) !== remoteName) throw error(502, 'Upload did not return this run’s exact remote filename.', 'UPLOAD_IDENTITY');
+        await this._mutate(() => { const run = this._currentRun(this._job(id)); run.remotePath = upload.remotePath; run.phase = 'uploaded'; });
+        const context = { jobId: id, ...targetFields(permit.target), portalJobId: job.order.portalJobId, portalUrl: job.order.portalUrl, printerId: printer.id, receiptId: bindings.receiptId, runId, deviceFingerprint: bindings.deviceFingerprint, artifactSha256: bindings.artifactSha256, profileSha256: bindings.profileSha256, sourceSha256: bindings.sourceSha256, engineSha256: bindings.engineSha256, plannedParts: bindings.partsPerRun, authorization: clone(permit.authorization) };
+        await this._resinDispatchBindings(job, permit.receipt, bindings.deviceFingerprint);
+        const proof = await authority.reauthorize(clone(context));
+        await this._resinDispatchBindings(job, proof?.receipt, bindings.deviceFingerprint);
+        const refreshed = this._validateResinAuthorization(job, bindings, proof, permit.authorization);
+        await inspectDevice();
+        this._assertReady();
+        if (this.state.settings.resinEngine?.dispatchEnabled !== true || configurationFingerprint(this._printer(printer.id)) !== permit.printerFingerprint || !fresh(refreshed.authorization.checkedAt) || Date.parse(refreshed.authorization.expiresAt) <= Date.now()) throw error(409, 'Production authorization or local dispatch readiness changed before start.', 'RESIN_AUTHORIZATION_CHANGED');
+        await this._mutate(() => {
+          const run = this._currentRun(this._job(id));
+          run.phase = 'starting'; run.startRequestedAt = this._now(); run.authorization = refreshed.authorization;
+        });
+        this._assertReady();
+        if (this.state.settings.resinEngine?.dispatchEnabled !== true || !fresh(refreshed.authorization.checkedAt) || Date.parse(refreshed.authorization.expiresAt) <= Date.now()) throw error(409, 'Production authorization expired or dispatch was disabled while saving the start intent.', 'RESIN_AUTHORIZATION_CHANGED');
+        startRequested = true;
+        const started = await adapter.start({ remotePath: upload.remotePath, jobId: runId });
+        const requestedAt = this._currentRun(this._job(id)).startRequestedAt;
+        if (started?.acknowledged !== true || typeof started.remoteId !== 'string' || !started.remoteId || started.currentFile !== remoteName || !fresh(started.observedAt) || Date.parse(started.observedAt) < Date.parse(requestedAt)) throw error(502, 'The printer did not identify a fresh new task for this exact file. Inspect the printer.', 'RESIN_START_UNCERTAIN');
+        return await this._mutate(() => {
+          const current = this._job(id), run = this._currentRun(current);
+          run.remoteId = started.remoteId; run.phase = 'observed'; run.startedAt = this._now(); run.observedPrintingAt = started.observedAt;
+          run.startEvidence = { remoteId: started.remoteId, currentFile: started.currentFile, observedAt: started.observedAt };
+          this._transition(current, 'printing', 'SDCP identified this qualified plate print. No production or QC credit has been applied.', { runId });
+          return publicValue(current);
+        });
+      } catch (failure) {
+        await this._mutate(() => {
+          const current = this._job(id), run = this._currentRun(current);
+          current.error = this._safeMessage(failure.message);
+          if (startRequested) { run.phase = 'result_unknown'; this._transition(current, 'needs_attention', 'Start result is uncertain. Do not retry until this run is reconciled.', { runId }); }
+          else { run.phase = 'resolved'; run.outcome = 'not_started'; run.printedParts = 0; run.resolvedAt = this._now(); current.currentRunId = null; this._quantities(current); this._transition(current, 'review', 'Transfer or renewed qualification failed before any print start.', { runId }); }
+        });
+        throw this._publicError(failure);
+      }
+    });
+  }
+
+  async reconcileResinRun(id, { runId, outcome, printedParts = 0, notes = '' } = {}) {
+    if (!OUTCOMES.has(outcome) || !Number.isSafeInteger(printedParts) || printedParts < 0 || printedParts > 500 || (outcome !== 'completed' && printedParts !== 0)) throw error(400, 'Record a bounded printed count; only a completed run can contribute production.', 'RESIN_RECONCILIATION_INVALID');
+    const printerId = this._job(id).printerId;
+    return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
+      const existingJob = this._job(id);
+      if (existingJob.technology !== 'resin') throw error(409, 'Select a resin production run.', 'RESIN_TICKET_REQUIRED');
+      const existingRun = existingJob.runs.find(item => item.id === runId && item.technology === 'resin');
+      if (!existingRun) throw error(409, 'Choose the exact resin run to reconcile.', 'STALE_RECONCILIATION');
+      const planned = Number.isSafeInteger(existingRun.plannedParts) && existingRun.plannedParts >= 1 && existingRun.plannedParts <= 500 ? existingRun.plannedParts : 1;
+      if (printedParts > planned) throw error(400, 'Printed units cannot exceed this exact run’s planned plate count.', 'RESIN_RECONCILIATION_INVALID');
+      if (!existingRun.resolvedAt && printedParts === 0) {
+        try {
+          const adapter = await this._adapter(this._printer(printerId));
+          const status = this._status(await adapter.status(), true);
+          if (['printing', 'paused'].includes(status.state)) throw error(409, 'The printer still reports an active run. Confirm it has stopped before releasing this run.', 'RESIN_RUN_ACTIVE');
+        } catch (failure) { if (failure.code === 'RESIN_RUN_ACTIVE') throw failure; }
+      }
+      return this._mutate(() => {
+      const job = this._job(id);
+      if (job.technology !== 'resin') throw error(409, 'Select a resin production run.', 'RESIN_TICKET_REQUIRED');
+      const run = job.runs.find(item => item.id === runId && item.technology === 'resin');
+      if (!run) throw error(409, 'Choose the exact resin run to reconcile.', 'STALE_RECONCILIATION');
+      if (run.resolvedAt) {
+        if (run.reconciliation?.outcome === outcome && run.reconciliation.printedParts === printedParts) return publicValue(job);
+        throw error(409, 'This resin run already has a different reconciliation.', 'STALE_RECONCILIATION');
+      }
+      if (job.currentRunId !== runId || job.status !== 'needs_attention') throw error(409, 'Wait for a terminal result or reconcile an uncertain run after inspection.', 'RUN_NOT_REVIEWABLE');
+      if (printedParts > 0 && (outcome !== 'completed' || run.terminalEvidence?.outcome !== 'completed' || !run.startEvidence || !this._matchesRun(run.terminalEvidence, run))) throw error(409, 'Positive production requires the service’s identified start and completed terminal evidence.', 'RESIN_TERMINAL_EVIDENCE_REQUIRED');
+      this._quantities(job);
+      if (job.resinProduction.printedParts + printedParts > job.resinProduction.requestedParts) throw error(409, 'Printed units exceed the ordered production quantity.', 'QUANTITY_EXCEEDED');
+      const reviewedAt = this._now();
+      run.outcome = outcome; run.printedParts = printedParts; run.resolvedAt = reviewedAt; run.phase = 'resolved';
+      run.reconciliation = { outcome, printedParts, reviewedAt, notes: text(notes, 5000) };
+      this._invalidateResinPermits(id);
+      if (printedParts === 0 && job.resinProduction?.plan) {
+        delete job.resinProduction.plan.approvalState;
+        delete job.resinProduction.plan.approvalRequestedAt;
+        delete job.resinProduction.plan.approvedAt;
+        delete job.resinProduction.plan.approvalVersion;
+      }
+      job.currentRunId = null;
+      delete job.error; delete job.progress;
+      this._quantities(job);
+      this._transition(job, 'review', 'Resin run reviewed. Portal production confirmation, further units and QC remain separate.', { runId });
+      return publicValue(job);
+      });
+    });
+  }
+
+  _resinProfileSlot(id) {
+    if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(id)) throw error(400, 'Choose a valid resin profile slot.', 'RESIN_PROFILE_SLOT_INVALID');
+    const slot = this.state.settings.resinEngine?.slots?.find(item => item.id === id);
+    if (!slot) throw error(404, 'Resin profile slot not found. Save the slot in Settings first.', 'RESIN_PROFILE_SLOT_NOT_FOUND');
+    return clone(slot);
+  }
+
+  async getResinProfileSlot(id) {
+    return this._withLocks([`resin:profile:${id}`], async () => {
+      const slot = this._resinProfileSlot(id);
+      const loaded = await require('../slicing/resin-engine').loadProfile(slot.profilePath);
+      if (JSON.stringify(this._resinProfileSlot(id)) !== JSON.stringify(slot)) throw error(409, 'This resin profile slot changed while loading. Refresh it before editing.', 'RESIN_PROFILE_SLOT_CHANGED');
+      return { slot, profile: require('../slicing/resin-profiles').profileView(loaded), profileSha256: loaded.profileSha256 };
+    });
+  }
+
+  async customizeResinProfileSlot(id, patch) {
+    return this._withLocks([`resin:profile:${id}`], async () => {
+      const slot = this._resinProfileSlot(id);
+      const { loadProfile } = require('../slicing/resin-engine');
+      const { customizeProfile, profileView } = require('../slicing/resin-profiles');
+      const loaded = await loadProfile(slot.profilePath);
+      let customization = patch;
+      if (patch && typeof patch === 'object' && !Array.isArray(patch) && Object.hasOwn(patch, 'expectedProfileSha256')) {
+        const { expectedProfileSha256, ...edits } = patch;
+        if (typeof expectedProfileSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(expectedProfileSha256) || expectedProfileSha256 !== loaded.profileSha256) throw error(409, 'This resin profile changed since the editor loaded. Reload it before saving.', 'RESIN_PROFILE_SOURCE_CHANGED');
+        customization = edits;
+      }
+      const customized = customizeProfile(loaded, customization);
+      const selectedPrinterId = customization && Object.hasOwn(customization, 'printerId') ? customization.printerId : null;
+      const validatePrinterBinding = () => {
+        if (!selectedPrinterId) return;
+        const selected = this.state.printers.find(item => item.id === selectedPrinterId);
+        if (!selected || selected.type !== 'sdcp') throw error(409, 'Choose an existing configured SDCP printer for this resin profile.', 'RESIN_PROFILE_PRINTER_INVALID');
+      };
+      validatePrinterBinding();
+      const managedRoot = path.resolve(this.dataDir, 'profiles', 'resin');
+      await fs.mkdir(managedRoot, { recursive: true, mode: 0o700 });
+      const rootRelative = path.relative(await fs.realpath(this.dataDir), await fs.realpath(managedRoot));
+      if (!rootRelative || rootRelative === '..' || rootRelative.startsWith(`..${path.sep}`) || path.isAbsolute(rootRelative)) throw error(409, 'Managed resin profiles must remain inside this workspace.', 'RESIN_PROFILE_PATH_INVALID');
+      const directory = await fs.mkdtemp(path.join(managedRoot, 'profile-'));
+      let saved = false;
+      try {
+        const profilePath = path.join(directory, 'profile.json');
+        await fs.writeFile(path.join(directory, 'preset.ini'), customized.preset, { flag: 'wx', mode: 0o600 });
+        await fs.writeFile(profilePath, JSON.stringify(customized.profile, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        // Validate the actual files that will be selected, not only the patch.
+        const snapshot = await loadProfile(profilePath);
+        if ((await loadProfile(slot.profilePath)).profileSha256 !== loaded.profileSha256) throw error(409, 'The source resin profile changed while editing. Reload it and retry.', 'RESIN_PROFILE_SOURCE_CHANGED');
+        const result = await this._mutate(() => {
+          this._assertReady();
+          validatePrinterBinding();
+          let current;
+          try { current = this._resinProfileSlot(id); }
+          catch { throw error(409, 'This resin profile slot was removed while editing. Refresh Settings.', 'RESIN_PROFILE_SLOT_CHANGED'); }
+          if (JSON.stringify(current) !== JSON.stringify(slot)) throw error(409, 'This resin profile slot changed while editing. Reload it and retry.', 'RESIN_PROFILE_SLOT_CHANGED');
+          // Read current settings here so unrelated concurrent edits survive.
+          const selected = { ...current, profilePath };
+          this.state.settings.resinEngine.slots = this.state.settings.resinEngine.slots.map(item => item.id === id ? selected : item);
+          this._event({ type: 'settings', message: `Customized resin profile slot ${selected.name}; existing artifacts retain their recorded profile hashes.` });
+          return { slot: selected, profile: profileView(snapshot), profileSha256: snapshot.profileSha256 };
+        });
+        saved = true;
+        return result;
+      } finally {
+        if (!saved) {
+          // Only remove the uniquely created managed directory, never a source
+          // profile or a path supplied by an API request.
+          const relative = path.relative(managedRoot, path.resolve(directory));
+          if (relative && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) await fs.rm(directory, { recursive: true, force: true });
+        }
+      }
+    });
+  }
+
   async prepareJob(id, printerId) {
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
+      if (job.technology === 'resin' || job.order?.production?.printType === 'resin') throw error(409, 'Use Slice resin model with a reviewed resin engine profile for this ticket. Generic printer preparation is unavailable for resin.', 'RESIN_SLICING_UNAVAILABLE');
       const printer = this._printer(printerId);
       if (ACTIVE.has(job.status) || this._currentRun(job)) throw error(409, 'Resolve the current print run before preparing another artifact.', 'JOB_BUSY');
       if (job.acceptedQuantity >= job.quantity) throw error(409, 'This order already has its requested accepted quantity.', 'JOB_COMPLETE');
@@ -531,6 +1693,7 @@ class QuickPrintService extends EventEmitter {
     if (confirmed !== true) throw error(400, 'Confirm the physical printer is ready before starting a print.', 'CONFIRMATION_REQUIRED');
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
+      if (job.technology === 'resin') throw error(409, 'Resin printer dispatch has not been qualified.', 'RESIN_DISPATCH_UNAVAILABLE');
       const printer = this._printer(printerId);
       if (job.status !== 'ready' || this._currentRun(job) || job.acceptedQuantity >= job.quantity) throw error(409, 'The job is not ready for another confirmed run.', 'JOB_NOT_READY');
       if (!job.artifact || job.printerId !== printerId || job.artifact.printerFingerprint !== configurationFingerprint(printer)) throw error(409, 'Prepare the file for this printer before dispatch.', 'PRINTER_MISMATCH');
@@ -547,14 +1710,14 @@ class QuickPrintService extends EventEmitter {
           throw error(409, 'This prepared artifact format is not supported by the printer adapter.', 'ARTIFACT_FORMAT');
         }
       }
-      const status = this._status(await adapter.status());
+      const status = this._status(await adapter.status(), printer.type === 'sdcp');
       await this._mutate(() => { this._printer(printerId).status = status; });
       if (status.state !== 'idle' || Math.abs(Date.now() - Date.parse(status.observedAt)) > 30000) throw error(409, 'The printer must report a fresh idle state before dispatch.', 'PRINTER_NOT_READY');
       const runId = crypto.randomUUID();
       const remoteName = `qp-${id.slice(0, 8)}-${runId.slice(0, 8)}-${fileName(artifact.fileName)}`;
       await this._mutate(() => {
         const current = this._job(id);
-        current.runs.push({ id: runId, printerId, phase: 'uploading', createdAt: this._now(), artifactSha256: artifact.sha256, fileName: remoteName });
+        current.runs.push({ id: runId, printerId, printerType: printer.type, phase: 'uploading', createdAt: this._now(), artifactSha256: artifact.sha256, fileName: remoteName });
         current.currentRunId = runId;
         delete current.error;
         this._transition(current, 'dispatching', 'Dispatch intent saved; uploading one file-copy.', { runId });
@@ -614,6 +1777,18 @@ class QuickPrintService extends EventEmitter {
     const printerId = this._job(id).printerId;
     const preparation = action === 'cancel' ? this._preparations.get(id) : null;
     if (preparation) preparation.abort(error(409, 'Preparation cancelled by the operator.', 'PREPARATION_CANCELLED'));
+    if (preparation && this._pendingPreparations.has(id)) {
+      // Pending resin work owns a queue gate but has not entered the engine.
+      // Persist cancellation now; its aborted callback will consume that gate
+      // only after its predecessors finish, preserving lock ordering.
+      return this._mutate(() => {
+        const job = this._job(id);
+        if (this._currentRun(job) || ACTIVE.has(job.status)) throw error(409, 'An active printer run must be controlled separately.', 'JOB_BUSY');
+        delete job.resinPreparation; delete job.resinSlice; delete job.error;
+        if (job.status !== 'cancelled') this._transition(job, 'cancelled', 'Queued resin preparation cancelled; the engine was not started.');
+        return publicValue(job);
+      });
+    }
     return this._withLocks([`job:${id}`, `printer:${printerId}`], async () => {
       const job = this._job(id);
       const run = this._currentRun(job);
@@ -628,7 +1803,7 @@ class QuickPrintService extends EventEmitter {
       }
       const adapter = await this._adapter(this._printer(printerId));
       if (adapter.capabilities?.[action] !== true || typeof adapter[action] !== 'function') throw error(409, `This printer does not support ${action}.`, 'CAPABILITY_UNSUPPORTED');
-      const status = this._status(await adapter.status());
+      const status = this._status(await adapter.status(), run.printerType === 'sdcp');
       if (Math.abs(Date.now() - Date.parse(status.observedAt)) > 30000) throw error(409, 'Refresh printer telemetry before sending controls.', 'PRINTER_STATUS_STALE');
       if (!this._matchesRun(status, run)) throw error(409, 'Printer telemetry does not identify this job. Use the printer controls directly, then reconcile in QuickPrint.', 'PRINT_IDENTITY_UNKNOWN');
       if (action === 'pause' && status.state !== 'printing') throw error(409, 'Only a printing job can be paused.');
@@ -662,6 +1837,7 @@ class QuickPrintService extends EventEmitter {
 
   async reconcileJob(id, { outcome, acceptedQuantity = 0, notes = '', runId } = {}) {
     this._assertReady();
+    if (this._job(id).technology === 'resin') throw error(409, 'Use resin run reconciliation; file-copy acceptance cannot grant resin production or QC credit.', 'RESIN_RECONCILIATION_REQUIRED');
     if (!OUTCOMES.has(outcome)) throw error(400, 'Choose completed, failed, cancelled, or not_started.', 'RECONCILIATION_OUTCOME');
     const accepted = integer(acceptedQuantity, 0, 0, 1);
     if (outcome !== 'completed' && accepted !== 0) throw error(400, 'Only a completed run can contribute an accepted file-copy.', 'RECONCILIATION_QUANTITY');
@@ -697,6 +1873,62 @@ class QuickPrintService extends EventEmitter {
     }));
   }
 
+  async setupResinCadRuntime(request = {}) {
+    this._assertReady();
+    if (!request || typeof request !== 'object' || Array.isArray(request) || ![Object.prototype, null].includes(Object.getPrototypeOf(request)) || Reflect.ownKeys(request).length) throw error(400, 'Managed CAD runtime setup accepts an empty request only.', 'RESIN_CAD_RUNTIME_REQUEST_INVALID');
+    return this._withLocks(['resin:runtime', 'resin:engine'], async () => {
+      const controller = new AbortController(), key = 'cad-runtime';
+      this._preparations.set(key, controller);
+      try {
+        const distributionVersion = '8.0.1.1.0';
+        const outputDir = path.join(this.dataDir, '.providers', 'cad-transfer', distributionVersion);
+        const cadAuditPath = path.join(outputDir, 'site-packages');
+        const managedDirectory = async (candidate, create = false) => {
+          const relative = path.relative(this.dataDir, candidate);
+          if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) throw error(409, 'CAD runtime setup must remain inside its managed data directory.', 'RESIN_CAD_RUNTIME_PATH_INVALID');
+          let component = this.dataDir;
+          for (const name of relative.split(path.sep)) {
+            controller.signal.throwIfAborted();
+            component = path.join(component, name);
+            let stat;
+            try { stat = await fs.lstat(component); } catch (failure) { if (failure.code !== 'ENOENT') throw failure; }
+            if (!stat) {
+              if (!create) return false;
+              try { await fs.mkdir(component); } catch (failure) { if (failure.code !== 'EEXIST') throw failure; }
+              stat = await fs.lstat(component);
+            }
+            if (!stat.isDirectory() || stat.isSymbolicLink()) throw error(409, 'CAD runtime managed directories cannot be files or symbolic links.', 'RESIN_CAD_RUNTIME_PATH_INVALID');
+          }
+          const actual = path.relative(await fs.realpath(this.dataDir), await fs.realpath(candidate));
+          if (actual === '..' || actual.startsWith(`..${path.sep}`) || path.isAbsolute(actual)) throw error(409, 'CAD runtime path resolves outside the managed data directory.', 'RESIN_CAD_RUNTIME_PATH_INVALID');
+          return true;
+        };
+        // The final target stays absent for the installer's atomic staging and
+        // rename. Existing targets are inspected, never removed or overwritten.
+        await managedDirectory(path.dirname(outputDir), true);
+        await managedDirectory(outputDir);
+        controller.signal.throwIfAborted();
+        const implementation = this.cadRuntime || require('../slicing/resin-cad-runtime');
+        if (typeof implementation.provisionResinCadRuntime !== 'function') throw error(500, 'The CAD runtime provisioner is unavailable.', 'RESIN_CAD_RUNTIME_CONFIGURATION');
+        const result = await implementation.provisionResinCadRuntime({ outputDir, signal: controller.signal });
+        controller.signal.throwIfAborted();
+        if (!result || typeof result.cadAuditPath !== 'string' || !path.isAbsolute(result.cadAuditPath) || path.relative(outputDir, result.cadAuditPath) !== 'site-packages' || result.distributionVersion !== distributionVersion || typeof result.reused !== 'boolean' || !await managedDirectory(cadAuditPath)) throw error(502, 'The CAD runtime provisioner did not return its exact managed installation.', 'RESIN_CAD_RUNTIME_RESULT_INVALID');
+        controller.signal.throwIfAborted();
+        return await this._mutate(() => {
+          controller.signal.throwIfAborted();
+          this.state.settings.resinEngine ||= {};
+          this.state.settings.resinEngine.cadAuditPath = cadAuditPath;
+          this._event({ type: 'settings', message: 'Configured the managed STEP transfer audit runtime.' });
+          return { cadAuditPath, distributionVersion, reused: result.reused };
+        });
+      } catch (failure) {
+        throw this._publicError(controller.signal.aborted ? controller.signal.reason : failure);
+      } finally {
+        if (this._preparations.get(key) === controller) this._preparations.delete(key);
+      }
+    });
+  }
+
   async updateSettings(patch = {}) {
     this._assertReady();
     return this._mutate(() => {
@@ -706,6 +1938,7 @@ class QuickPrintService extends EventEmitter {
       if (patch.slicer !== undefined) {
         next.slicer = slicerConfiguration(patch.slicer, next.slicer);
       }
+      if (patch.resinEngine !== undefined) next.resinEngine = resinEngineConfiguration(patch.resinEngine, next.resinEngine);
       if (patch.intake !== undefined) {
         if (!patch.intake || typeof patch.intake !== 'object' || Array.isArray(patch.intake)) throw error(400, 'Intake settings must be an object.');
         if (patch.intake.enabled !== undefined) next.intake.enabled = patch.intake.enabled === true;
@@ -727,12 +1960,20 @@ class QuickPrintService extends EventEmitter {
       const id = config.id || crypto.randomUUID();
       const previous = this.state.connectors.find((item) => item.id === id);
       if (config.id && !previous) throw error(404, 'Input connector not found.', 'CONNECTOR_NOT_FOUND');
-      if (!['folder', 'email'].includes(config.type || previous?.type)) throw error(400, 'Connector type must be folder or email.', 'CONNECTOR_TYPE');
+      if (!['folder', 'email', 'layr'].includes(config.type || previous?.type)) throw error(400, 'Connector type must be folder, email or layr.', 'CONNECTOR_TYPE');
       if (previous && config.type && config.type !== previous.type) throw error(409, 'A connector’s type cannot change. Create another connector.', 'CONNECTOR_TYPE_IMMUTABLE');
       const next = { ...(previous || {}), id, type: config.type || previous.type };
-      for (const key of ['name', 'path', 'host', 'username', 'mailbox']) if (config[key] !== undefined) next[key] = text(config[key], 4000);
+      for (const key of ['name', 'path', 'host', 'username', 'mailbox', 'portalUrl', 'clientId', 'expiresAt', 'apiMode']) if (config[key] !== undefined) next[key] = text(config[key], 4000);
       if (typeof config.password === 'string' && config.password.trim()) next.password = config.password;
-      for (const key of ['enabled', 'secure']) if (config[key] !== undefined) next[key] = config[key] === true;
+      for (const key of ['token', 'refreshToken']) if (typeof config[key] === 'string' && config[key].trim()) next[key] = config[key];
+      if (next.type === 'layr' && next.apiMode === 'production') {
+        delete next.refreshToken; delete next.expiresAt; delete next.clientId;
+      }
+      if (next.type === 'layr') {
+        require('../connectors/validation').validateConnector(next);
+        next.portalUrl = new URL(next.portalUrl).origin;
+      }
+      for (const key of ['enabled', 'secure', 'autoSyncPreparation']) if (config[key] !== undefined) next[key] = config[key] === true;
       for (const key of ['port', 'settleMs', 'pollIntervalMs']) if (config[key] !== undefined) next[key] = integer(config[key], undefined, key === 'settleMs' ? 0 : 1, key === 'port' ? 65535 : 86400000);
       if (config.defaults !== undefined) {
         if (!config.defaults || typeof config.defaults !== 'object' || Array.isArray(config.defaults)) throw error(400, 'Connector defaults must be an object.');
@@ -773,12 +2014,17 @@ class QuickPrintService extends EventEmitter {
     } while (this._operations.size);
   }
 
-  async close() {
-    if (this._closing) return this._closePromise;
-    this._closing = true;
+  cancelPreparationsForShutdown() {
     for (const controller of this._preparations.values()) {
       controller.abort(error(503, 'Preparation stopped because QuickPrint is closing. Prepare this file again after restart.', 'PREPARATION_SHUTDOWN'));
     }
+  }
+
+  async close() {
+    if (this._closing) return this._closePromise;
+    this._closing = true;
+    this._resinDispatchPermits.clear();
+    this.cancelPreparationsForShutdown();
     this._closePromise = (async () => {
       await this.waitForIdle();
       await Promise.allSettled([...this._adapterCache.keys()].map((id) => this._closeAdapter(id)));

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "printerId": "preview-only",
+  "printerModel": "QuickPrint Test",
+  "material": "Synthetic test only",
+  "presetPath": "verification.ini",
+  "expected": {
+    "resolutionX": 512,
+    "resolutionY": 256,
+    "displayWidthMm": 40,
+    "displayHeightMm": 20,
+    "layerHeightMm": 0.05,
+    "mirrorX": false,
+    "mirrorY": false
+  },
+  "orientationCandidates": [
+    {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    },
+    {
+      "x": 30,
+      "y": 15,
+      "z": 0
+    }
+  ],
+  "uvtoolsProperties": {
+    "MachineName": "QuickPrint Test",
+    "LayerHeight": 0.05,
+    "ExposureTime": 2,
+    "BottomExposureTime": 20,
+    "BottomLayerCount": 5,
+    "BottomLiftHeight": 5,
+    "LiftHeight": 5,
+    "BottomLiftSpeed": 100,
+    "LiftSpeed": 100,
+    "RetractSpeed": 100,
+    "LightPWM": 255,
+    "BottomLightPWM": 255
+  }
+}

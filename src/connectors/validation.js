@@ -13,7 +13,7 @@ function invalid(message) {
 
 function validateConnector(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw invalid('A connector configuration is required.');
-  if (!['folder', 'email'].includes(config.type)) throw invalid('Choose a folder or email connector.');
+  if (!['folder', 'email', 'layr'].includes(config.type)) throw invalid('Choose a folder, email or PrintByLayr connector.');
   if (config.name !== undefined && (typeof config.name !== 'string' || config.name.length > 120)) throw invalid('Connector names must be at most 120 characters.');
   if (config.enabled !== undefined && typeof config.enabled !== 'boolean') throw invalid('Connector enabled must be true or false.');
   if (config.defaults !== undefined) {
@@ -24,7 +24,12 @@ function validateConnector(config) {
       if (config.defaults[field] !== undefined && (typeof config.defaults[field] !== 'string' || config.defaults[field].length > limit)) throw invalid(`Default ${field} must be text of at most ${limit} characters.`);
     }
   }
-  if (config.type === 'folder') {
+  if (config.type === 'layr') {
+    if (config.autoSyncPreparation !== undefined && typeof config.autoSyncPreparation !== 'boolean') throw invalid('Automatic preparation evidence sync must be true or false.');
+    if (config.apiMode !== undefined && !['mcp', 'production'].includes(config.apiMode)) throw invalid('Choose the MCP or scoped production API.');
+    require(config.apiMode === 'production' ? './layr-production-client' : './layr-client').validateLayrConfig(config);
+    if (config.pollIntervalMs !== undefined && (!Number.isInteger(config.pollIntervalMs) || config.pollIntervalMs < 15000 || config.pollIntervalMs > 86400000)) throw invalid('Portal polling must be between 15 seconds and 24 hours.');
+  } else if (config.type === 'folder') {
     if (typeof config.path !== 'string' || !config.path.trim() || config.path.includes('\0') || !path.isAbsolute(config.path)) throw invalid('Choose an absolute path to an existing local or network folder.');
     if (config.settleMs !== undefined && (!Number.isInteger(config.settleMs) || config.settleMs < 1000 || config.settleMs > 300000)) throw invalid('File settling time must be between 1000 and 300000 milliseconds.');
   } else {

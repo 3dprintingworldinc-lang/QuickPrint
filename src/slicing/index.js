@@ -49,8 +49,9 @@ function inspectArtifact(buffer, filename) {
   throw failure('Supported inputs: STEP, STP, STL, OBJ, 3MF, G-code.', 'UNSUPPORTED_FORMAT');
 }
 
-function runProcess(executable, args, { timeoutMs = 15 * 60 * 1000, signal } = {}) {
+function runProcess(executable, args, { timeoutMs = 15 * 60 * 1000, signal, acceptedExitCodes = [0] } = {}) {
   return new Promise((resolve, reject) => {
+    if (!Array.isArray(acceptedExitCodes) || !acceptedExitCodes.length || acceptedExitCodes.some(code => !Number.isInteger(code) || code < 0 || code > 255)) return reject(failure('Invalid process exit-code policy.', 'PROCESS_EXIT_POLICY'));
     if (signal?.aborted) return reject(failure('Preparation cancelled.', 'ABORTED'));
     const child = spawn(executable, args, { shell: false, windowsHide: true, detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '', settled = false, stopReason = null, timer, forceTimer, deadline;
@@ -89,7 +90,7 @@ function runProcess(executable, args, { timeoutMs = 15 * 60 * 1000, signal } = {
     child.on('error', error => finish(failure(`Could not start the slicer: ${error.code || error.message}. Check the executable path in Settings.`, 'SLICER_START_FAILED')));
     child.on('close', code => {
       if (stopReason) return finish(stopReason);
-      if (code !== 0) return finish(failure(`Slicer exited with code ${code}. ${output.slice(-2000)}`, 'SLICER_FAILED'));
+      if (!acceptedExitCodes.includes(code)) return finish(failure(`Slicer exited with code ${code}. ${output.slice(-2000)}`, 'SLICER_FAILED'));
       finish();
     });
   });
